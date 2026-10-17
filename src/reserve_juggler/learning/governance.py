@@ -246,7 +246,13 @@ class VersionRegistry:
                     "justification": entry.justification,
                 })
             except Exception as e:
+                self._active_versions[comp] = prev
+                if self._version_history.get(comp) and self._version_history[comp][-1] == new_version:
+                    self._version_history[comp].pop()
+                if self._audit_trail and self._audit_trail[-1] == entry:
+                    self._audit_trail.pop()
                 logger.error("Failed to persist version audit: %s", str(e))
+                raise
 
     def rollback(
         self,
@@ -297,7 +303,11 @@ class VersionRegistry:
                     "justification": entry.justification,
                 })
             except Exception as e:
+                self._active_versions[comp] = prev
+                if self._audit_trail and self._audit_trail[-1] == entry:
+                    self._audit_trail.pop()
                 logger.error("Failed to persist version audit: %s", str(e))
+                return (False, f"Rollback aborted: version audit persistence failed: {e}")
 
         return (True, f"Successfully rolled back {comp} from {prev} to {target_version}.")
 

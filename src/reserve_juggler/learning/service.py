@@ -48,7 +48,7 @@ class LearningService:
         self.evaluator = SystemPerformanceEvaluator(self.store)
         self.validator = SafetyInvariantValidator()
         self.registry = VersionRegistry(persistence_store=self.store)
-        self.runtime_registry = RuntimeComponentRegistry()
+        self.runtime_registry = RuntimeComponentRegistry(persistence_store=self.store)
         self.evaluation_engine = CandidateEvaluationEngine(
             validator=self.validator,
             runtime_registry=self.runtime_registry,
@@ -136,7 +136,7 @@ class LearningService:
             candidate.rejection_reason = "; ".join(violations)
             logger.warning("Candidate %s rejected at proposal: %s", cid, candidate.rejection_reason)
         else:
-            candidate.status = CandidateStatus.SHADOW_MODE
+            candidate.status = CandidateStatus.PROPOSED
 
         self._candidates[cid] = candidate
         
@@ -338,7 +338,22 @@ class LearningService:
             return (False, f"Promotion aborted: durable event persistence failed: {e}")
 
         # Durably associate version tag with runtime config (Part B2)
-        self.runtime_registry.record_promoted_version(candidate.component, version_tag)
+        try:
+            self.runtime_registry.record_promoted_version(candidate.component, version_tag)
+        except Exception as e:
+            self.runtime_registry.restore_runtime_state(candidate.component, prev_version)
+            self.registry._active_versions[candidate.component] = prev_version
+            candidate.status = prev_status
+            candidate.promoted_at = None
+            candidate.promoted_by = None
+            candidate.promotion_role = None
+            if hasattr(self.store, "sqlite_store"):
+                try:
+                    self.store.sqlite_store.save_candidate(candidate)
+                except Exception:
+                    pass
+            logger.error("Failed to durably record promoted version: %s", e)
+            return (False, f"Promotion aborted: durable runtime version configuration persistence failed: {e}")
 
         return (True, f"Candidate {candidate_id} successfully promoted to active version {version_tag}. Runtime state updated.")
 
@@ -355,6 +370,7 @@ class LearningService:
         Fails closed if target_version does not have a restorable runtime configuration (Part E4).
         """
         comp = component.upper()
+        prev_version = self.registry.get_active_versions().get(comp, "v1.0.0")
 
         # Check target-specific restorable configuration exists before mutating state
         if not self.runtime_registry.has_version_config(comp, target_version):
@@ -379,7 +395,7 @@ class LearningService:
 
         if not success:
             # Revert runtime state if version governance rejected
-            self.runtime_registry.restore_runtime_state(comp)
+            self.runtime_registry.restore_runtime_state(comp, prev_version)
             return (False, f"Version rollback failed: {msg}")
 
         try:
@@ -401,7 +417,11 @@ class LearningService:
                 )
             )
         except Exception as e:
-            logger.error("Audit logging failed during rollback: %s", e)
+            # Revert runtime state and version registry state on audit failure
+            self.runtime_registry.restore_runtime_state(comp, prev_version)
+            self.registry._active_versions[comp] = prev_version
+            logger.error("Audit logging failed during rollback: %s. Rolling back to %s.", e, prev_version)
+            return (False, f"Rollback aborted: durable audit persistence failed: {e}")
 
         return (True, f"Component {comp} successfully rolled back to {target_version}. Runtime parameters restored.")
 

@@ -1205,3 +1205,403 @@ def test_40_hedge_recommendations_not_fabricated_when_optimizer_unintegrated():
     assert result["recommended_hedge"] == "NO_RECOMMENDATION_OPTIMIZER_UNINTEGRATED"
 
 
+def test_41_unchanged_candidate_not_reported_as_improved():
+    """Prove that an unchanged candidate with identical metrics is not falsely claimed as improved."""
+    service = LearningService()
+    provider = GenericRuntimeProvider("FORECASTING", {"ensemble_combining_weights": {"lstm_weight": 0.5, "arimax_weight": 0.5}})
+    service.runtime_registry.register_provider("FORECASTING", provider)
+
+    cand = service.propose_update(
+        component="FORECASTING",
+        parameter_key="ensemble_combining_weights",
+        proposed_value={"lstm_weight": 0.50, "arimax_weight": 0.50},
+        current_value={"lstm_weight": 0.50, "arimax_weight": 0.50},
+        description="Identical weights.",
+        author="Tester",
+        holdout_sample_size=30,
+        stress_shortfall_count=0,
+    )
+    evaluated = service.evaluate_in_shadow_mode(
+        cand.candidate_id,
+        sample_size=10,
+        evaluation_records=[{"actual": 100.0, "lstm_pred": 110.0, "arimax_pred": 90.0} for _ in range(10)],
+    )
+    assert not evaluated.validation_report.metric_improved
+    assert not evaluated.validation_report.is_promotable
+    assert evaluated.status == CandidateStatus.REJECTED
+    assert any("did not improve" in v for v in evaluated.validation_report.violations)
+
+
+def test_42_candidate_worsening_financial_outcomes_rejected():
+    """Prove that a candidate worsening stress outcomes or increasing costs is rejected."""
+    service = LearningService()
+    provider = GenericRuntimeProvider("DECISION_OPTIMIZER", {"liquidity_buffer_multiplier": 1.25})
+    service.runtime_registry.register_provider("DECISION_OPTIMIZER", provider)
+
+    cand = service.propose_update(
+        component="DECISION_OPTIMIZER",
+        parameter_key="liquidity_buffer_multiplier",
+        proposed_value=0.2,
+        current_value=1.25,
+        description="Dangerous buffer cut.",
+        author="Tester",
+        holdout_sample_size=3,
+        stress_shortfall_count=0,
+    )
+    evaluated = service.evaluate_in_shadow_mode(cand.candidate_id)
+    assert not evaluated.validation_report.is_promotable
+    assert evaluated.status == CandidateStatus.REJECTED
+
+
+def test_43_candidate_parameters_genuinely_affect_evaluator_simulation():
+    """Prove that candidate parameters genuinely affect the simulation outcomes."""
+    from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+    from reserve_juggler.integration.fixtures import create_mock_treasury_state
+
+    engine = StressLabSimulationEngine()
+    state = create_mock_treasury_state()
+    state.protected_reserve_floor = 25_000_000.0
+
+    res_baseline = engine.run_simulation(state, deposit_shock_pct=50.0, repo_delay_days=1, strategy_overrides=None)
+    res_high_buffer = engine.run_simulation(state, deposit_shock_pct=50.0, repo_delay_days=1, strategy_overrides={"liquidity_buffer_multiplier": 1.6})
+    res_low_buffer = engine.run_simulation(state, deposit_shock_pct=50.0, repo_delay_days=1, strategy_overrides={"liquidity_buffer_multiplier": 0.5})
+
+    assert res_baseline["strategies"]["reserve_juggler"].starting_cash != res_high_buffer["strategies"]["reserve_juggler"].starting_cash
+    assert res_baseline["strategies"]["reserve_juggler"].starting_cash != res_low_buffer["strategies"]["reserve_juggler"].starting_cash
+
+
+def test_44_runtime_persistence_and_active_version_survives_reinstantiation(tmp_path):
+    """Prove that promoted configuration and active version survive persistence reload."""
+    db_file = str(tmp_path / "durable_runtime.db")
+    service1 = LearningService(persistence_file=db_file)
+    provider1 = GenericRuntimeProvider("FORECASTING", {"model_threshold": 0.65})
+    service1.runtime_registry.register_provider("FORECASTING", provider1)
+
+    cand = service1.propose_update(
+        component="FORECASTING",
+        parameter_key="model_threshold",
+        proposed_value=0.88,
+        description="Promote 0.88 threshold",
+        author="Quant",
+        holdout_sample_size=30,
+        stress_shortfall_count=0,
+    )
+    service1.evaluate_in_shadow_mode(cand.candidate_id, sample_size=30)
+    cand.validation_report.is_promotable = True
+    cand.status = CandidateStatus.SHADOW_MODE
+
+    prom_ok, msg = service1.promote_candidate(
+        candidate_id=cand.candidate_id,
+        approver="Chief Treasurer",
+        approver_role="HEAD_OF_TREASURY",
+        justification="Verified threshold",
+        new_version_tag="v2.0.0",
+    )
+    assert prom_ok, msg
+    assert service1.runtime_registry.get_parameter("FORECASTING", "model_threshold") == 0.88
+    assert service1.registry.get_active_version("FORECASTING") == "v2.0.0"
+
+    service2 = LearningService(persistence_file=db_file)
+    provider2 = GenericRuntimeProvider("FORECASTING", {"model_threshold": 0.65})
+    service2.runtime_registry.register_provider("FORECASTING", provider2)
+
+    assert service2.registry.get_active_version("FORECASTING") == "v2.0.0"
+    assert service2.runtime_registry.get_parameter("FORECASTING", "model_threshold") == 0.88
+    assert provider2.get_parameter("model_threshold") == 0.88
+
+
+def test_45_rollback_restores_exact_historical_version(tmp_path):
+    """Prove that rolling back restores the exact historical version settings, not most recent snapshot."""
+    db_file = str(tmp_path / "rollback_exact.db")
+    service = LearningService(persistence_file=db_file)
+    provider = GenericRuntimeProvider("FORECASTING", {"alpha": 10.0})
+    service.runtime_registry.register_provider("FORECASTING", provider)
+
+    # Step 1: Promote v1.1.0 with alpha=20.0
+    cand1 = service.propose_update("FORECASTING", "alpha", 20.0, "v1.1", "Quant", holdout_sample_size=30)
+    service.evaluate_in_shadow_mode(cand1.candidate_id)
+    cand1.validation_report.is_promotable = True
+    cand1.status = CandidateStatus.SHADOW_MODE
+    service.promote_candidate(cand1.candidate_id, "Chief", "HEAD_OF_TREASURY", "v1.1", "v1.1.0")
+
+    # Step 2: Promote v1.2.0 with alpha=30.0
+    cand2 = service.propose_update("FORECASTING", "alpha", 30.0, "v1.2", "Quant", holdout_sample_size=30)
+    service.evaluate_in_shadow_mode(cand2.candidate_id)
+    cand2.validation_report.is_promotable = True
+    cand2.status = CandidateStatus.SHADOW_MODE
+    service.promote_candidate(cand2.candidate_id, "Chief", "HEAD_OF_TREASURY", "v1.2", "v1.2.0")
+
+    assert service.runtime_registry.get_parameter("FORECASTING", "alpha") == 30.0
+
+    # Step 3: Rollback specifically to v1.1.0 (not v1.0.0 and not v1.2.0)
+    rb_ok, rb_msg = service.rollback_component(
+        component="FORECASTING",
+        target_version="v1.1.0",
+        author="Risk Officer",
+        approver_role="RISK_OFFICER",
+        justification="Revert to v1.1.0",
+    )
+    assert rb_ok, rb_msg
+    assert service.registry.get_active_version("FORECASTING") == "v1.1.0"
+    assert service.runtime_registry.get_parameter("FORECASTING", "alpha") == 20.0
+    assert provider.get_parameter("alpha") == 20.0
+
+
+def test_46_failed_audit_or_persistence_write_aborts_rollback_and_promotion(tmp_path):
+    """Prove that failed audit writes prevent false success responses and revert runtime state."""
+    db_file = str(tmp_path / "failure_inject.db")
+    service = LearningService(persistence_file=db_file)
+    provider = GenericRuntimeProvider("FORECASTING", {"rate": 5.0})
+    service.runtime_registry.register_provider("FORECASTING", provider)
+
+    cand = service.propose_update("FORECASTING", "rate", 10.0, "v1.1", "Quant", holdout_sample_size=30)
+    service.evaluate_in_shadow_mode(cand.candidate_id)
+    cand.validation_report.is_promotable = True
+    cand.status = CandidateStatus.SHADOW_MODE
+    service.promote_candidate(cand.candidate_id, "Chief", "HEAD_OF_TREASURY", "v1.1", "v1.1.0")
+
+    assert service.runtime_registry.get_parameter("FORECASTING", "rate") == 10.0
+
+    def failing_record(event, ignore_duplicates=False):
+        raise RuntimeError("Disk write failure during audit logging")
+    service.record = failing_record
+
+    rb_ok, rb_msg = service.rollback_component(
+        component="FORECASTING",
+        target_version="v1.4.0",
+        author="Auditor",
+        approver_role="AUDITOR",
+        justification="Emergency rollback",
+    )
+    assert not rb_ok
+    assert "durable audit persistence failed" in rb_msg
+    assert service.runtime_registry.get_parameter("FORECASTING", "rate") == 10.0
+    assert provider.get_parameter("rate") == 10.0
+    assert service.registry.get_active_version("FORECASTING") == "v1.1.0"
+
+
+def test_47_severe_stress_scenario_reconciles_for_all_strategies():
+    """Prove that severe stress scenario reconciles for every strategy, resolving the $1,584,000 error."""
+    from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+    from reserve_juggler.integration.fixtures import create_mock_treasury_state
+
+    engine = StressLabSimulationEngine()
+    state = create_mock_treasury_state()
+    state.protected_reserve_floor = 25_000_000.0
+
+    sim = engine.run_simulation(
+        base_treasury_state=state,
+        deposit_shock_pct=60.0,
+        rate_shock_bps=150.0,
+        repo_delay_days=2,
+        credit_unavailable=True,
+    )
+    all_cash = sim["strategies"]["all_cash"]
+    greedy_yield = sim["strategies"]["greedy_yield"]
+    reserve_juggler = sim["strategies"]["reserve_juggler"]
+
+    assert all_cash.is_reconciled
+    assert all_cash.reconciliation_error == 0.0
+
+    assert greedy_yield.is_reconciled
+    assert greedy_yield.reconciliation_error == 0.0
+
+    assert reserve_juggler.is_reconciled
+    assert reserve_juggler.reconciliation_error == 0.0
+
+    assert sim["all_strategies_reconciled"] is True
+
+
+def test_48_reserve_deficit_and_unpaid_payouts_remain_distinct():
+    """Prove that reserve deficit and unpaid customer payouts are reported separately."""
+    from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+    from reserve_juggler.integration.fixtures import create_mock_treasury_state
+
+    engine = StressLabSimulationEngine()
+    state = create_mock_treasury_state()
+    state.protected_reserve_floor = 25_000_000.0
+
+    sim = engine.run_simulation(
+        base_treasury_state=state,
+        deposit_shock_pct=25.0,
+        rate_shock_bps=50.0,
+    )
+    rj = sim["strategies"]["reserve_juggler"]
+    assert rj.customer_payouts_paid > 0
+    assert rj.unpaid_payout_amount == 0.0
+    assert hasattr(rj, "reserve_deficit")
+    assert hasattr(rj, "unpaid_payout_amount")
+
+
+def test_49_missing_prediction_values_do_not_become_zero():
+    """Prove that missing prediction values remain None and do not default to 0.0."""
+    from reserve_juggler.learning.matcher import OutcomeMatcher
+    from reserve_juggler.learning.store import EventStore
+
+    store = EventStore()
+    store.record(
+        LearningEvent(
+            event_id="EV-FC-MISS",
+            versioned_event_type="FORECAST_INFERENCE_RECORDED",
+            module="FORECASTING",
+            timestamp="2026-10-18T10:00:00Z",
+            correlation_id="FC-MISS",
+            payload={
+                "point_forecasts": {
+                    "1h": {
+                        "target_timestamp": "2026-10-18T11:00:00Z",
+                    }
+                }
+            },
+        )
+    )
+    matcher = OutcomeMatcher(store)
+    matched = matcher.match_forecasts()
+    assert len(matched) == 1
+    m = matched[0]
+    assert m.predicted_net_flow is None
+    assert not m.is_eligible
+    assert "Missing forecast prediction value" in m.ineligibility_reason
+
+
+def test_50_ambiguous_and_duplicate_actual_events_handled_explicitly():
+    """Prove that duplicate/ambiguous actual observations are not reused or wrongly paired."""
+    from reserve_juggler.learning.matcher import OutcomeMatcher
+    from reserve_juggler.learning.store import EventStore
+
+    store = EventStore()
+    target = "2026-10-18T12:00:00Z"
+    store.record(
+        LearningEvent(
+            event_id="EV-ACT-1",
+            versioned_event_type="ACTUAL_FLOWS_OBSERVED",
+            module="LEDGER",
+            timestamp=target,
+            correlation_id="",
+            payload={"target_timestamp": target, "actual_net_flow": 1_000_000.0},
+        )
+    )
+    store.record(
+        LearningEvent(
+            event_id="EV-ACT-2",
+            versioned_event_type="ACTUAL_FLOWS_OBSERVED",
+            module="LEDGER",
+            timestamp=target,
+            correlation_id="",
+            payload={"target_timestamp": target, "actual_net_flow": 2_000_000.0},
+        )
+    )
+    store.record(
+        LearningEvent(
+            event_id="EV-FC-AMB",
+            versioned_event_type="FORECAST_INFERENCE_RECORDED",
+            module="FORECASTING",
+            timestamp="2026-10-18T11:00:00Z",
+            correlation_id="FC-AMB",
+            payload={
+                "point_forecasts": {
+                    "1h": {
+                        "target_timestamp": target,
+                        "expected_net_flow": 1_500_000.0,
+                    }
+                }
+            },
+        )
+    )
+    matcher = OutcomeMatcher(store)
+    matched = matcher.match_forecasts()
+    assert len(matched) == 1
+    assert not matched[0].is_eligible
+    assert "Ambiguous match" in matched[0].ineligibility_reason
+
+
+def test_51_empty_metric_samples_do_not_produce_false_zero_error():
+    """Prove that empty metric samples do not report 0.0 error or 0.0 coverage."""
+    from reserve_juggler.learning.metrics import calculate_forecast_metrics
+
+    metrics = calculate_forecast_metrics([])
+    assert metrics.wape is None
+    assert metrics.mae is None
+    assert metrics.rmse is None
+    assert metrics.interval_coverage_pct is None
+    assert metrics.status == "INCONCLUSIVE"
+
+
+def test_52_inconclusive_health_does_not_conceal_missing_data():
+    """Prove that insufficient decision or forecast evidence produces INCONCLUSIVE health."""
+    evaluator = SystemPerformanceEvaluator(EventStore())
+    rep = evaluator.evaluate(matched_decisions=[], matched_forecasts=[])
+    assert rep.overall_system_health == "INCONCLUSIVE"
+    assert "below minimal statistical threshold" in rep.inconclusive_reason
+
+
+def test_53_pending_unresolved_decisions_distinguished_from_cancelled_rejected():
+    """Prove that pending and unresolved decisions are not counted as cancelled/rejected."""
+    evaluator = SystemPerformanceEvaluator(EventStore())
+    decisions = [
+        MatchedDecisionOutcome("C1", "D1", "2026-10-18T10:00:00Z", "DRAW_REPO", "REPO", 1e6, "APPROVED", True, "SETTLED", 100, 100),
+        MatchedDecisionOutcome("C2", "D2", "2026-10-18T10:00:00Z", "DRAW_REPO", "REPO", 1e6, "CANCELLED", False, "CANCELLED", 100, 0),
+        MatchedDecisionOutcome("C3", "D3", "2026-10-18T10:00:00Z", "DRAW_REPO", "REPO", 1e6, "REJECTED", False, "REJECTED", 100, 0),
+        MatchedDecisionOutcome("C4", "D4", "2026-10-18T10:00:00Z", "DRAW_REPO", "REPO", 1e6, "PENDING", False, "PENDING", 100, 0),
+        MatchedDecisionOutcome("C5", "D5", "2026-10-18T10:00:00Z", "DRAW_REPO", "REPO", 1e6, "DELAYED", False, "DELAYED", 100, 0),
+    ]
+    rep = evaluator.evaluate(matched_decisions=decisions, matched_forecasts=[])
+    assert rep.decision_metrics.total_decisions == 5
+    assert rep.decision_metrics.executed_decisions == 1
+    assert rep.decision_metrics.cancelled_or_rejected == 2
+    assert rep.decision_metrics.pending_or_unresolved == 2
+
+
+def test_54_shadow_run_counts_and_win_rate_from_actual_execution():
+    """Prove that candidate proposal starts with 0 shadow runs and evaluation records actual executed counts."""
+    service = LearningService()
+    provider = GenericRuntimeProvider("FORECASTING", {"ensemble_combining_weights": {"lstm_weight": 0.5, "arimax_weight": 0.5}})
+    service.runtime_registry.register_provider("FORECASTING", provider)
+
+    cand = service.propose_update(
+        component="FORECASTING",
+        parameter_key="ensemble_combining_weights",
+        proposed_value={"lstm_weight": 0.35, "arimax_weight": 0.65},
+        description="Fine tuned",
+        author="Quant",
+        holdout_sample_size=30,
+        stress_shortfall_count=0,
+    )
+    assert cand.status == CandidateStatus.PROPOSED
+    assert cand.shadow_mode_runs == 0
+    assert cand.shadow_win_rate == 0.0
+
+    evaluated = service.evaluate_in_shadow_mode(
+        cand.candidate_id,
+        sample_size=10,
+        evaluation_records=[
+            {"actual": 100.0, "lstm_pred": 120.0, "arimax_pred": 102.0} for _ in range(10)
+        ],
+    )
+    assert evaluated.validation_report.shadow_runs == 10
+    assert evaluated.shadow_mode_runs == 10
+    assert evaluated.shadow_win_rate > 0.0
+
+
+def test_55_backend_imports_without_streamlit():
+    """Prove that backend modules import cleanly without pulling in Streamlit."""
+    import sys
+    import subprocess
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; "
+        "import reserve_juggler.integration.facade; "
+        "import reserve_juggler.learning.service; "
+        "import reserve_juggler.integration.stress_engine; "
+        "assert 'streamlit' not in sys.modules, 'Streamlit was imported!'; "
+        "print('CLEAN_BACKEND_IMPORT_VERIFIED')",
+    ]
+    env = dict(sys.modules.get("os", __import__("os")).environ)
+    env["PYTHONPATH"] = "src"
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert res.returncode == 0
+    assert "CLEAN_BACKEND_IMPORT_VERIFIED" in res.stdout
+
+
+

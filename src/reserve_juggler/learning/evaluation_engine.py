@@ -334,14 +334,15 @@ class CandidateEvaluationEngine:
                 + cand_sim3["strategies"]["reserve_juggler"].repo_penalty
             )
 
-            # Check financial reconciliation invariants on simulation runs (Part F3)
-            for sim_res in (cand_sim1, cand_sim2, cand_sim3):
-                rj_strat = sim_res["strategies"]["reserve_juggler"]
-                if not rj_strat.is_reconciled:
-                    violations.append(
-                        f"Financial reconciliation violation: Strategy reconciliation error ({rj_strat.reconciliation_error}) exceeds tolerance limit."
-                    )
-                    status = "FAIL"
+            # Check financial reconciliation invariants on simulation runs across all strategies
+            for s_idx, sim_res in enumerate((cand_sim1, cand_sim2, cand_sim3), 1):
+                for strat_key, strat_outcome in sim_res["strategies"].items():
+                    if not strat_outcome.is_reconciled:
+                        violations.append(
+                            f"Financial reconciliation violation in scenario {s_idx} ({strat_key}): "
+                            f"Reconciliation error ({strat_outcome.reconciliation_error}) exceeds tolerance limit."
+                        )
+                        status = "FAIL"
 
             champion_metric = float(champ_shortfalls)
             candidate_metric = float(cand_shortfalls)
@@ -430,7 +431,7 @@ class CandidateEvaluationEngine:
                 shadow_runs = len(records)
                 shadow_win_rate = round(candidate_metric, 2) if candidate_metric is not None else 0.0
 
-                improved = (candidate_metric >= champion_metric) and (len(above_thresh) >= 1)
+                improved = (candidate_metric > champion_metric) and (len(above_thresh) >= 1)
                 if not improved:
                     violations.append(
                         f"Proposed alert threshold {thresh} failed to improve operational corroboration rate ({candidate_metric:.3f} vs champion {champion_metric:.3f})."

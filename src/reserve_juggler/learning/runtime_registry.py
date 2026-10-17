@@ -106,7 +106,12 @@ class RuntimeComponentRegistry:
     and rollback restores prior runtime parameters.
     """
 
-    def __init__(self):
+    def __init__(self, persistence_store: Optional[Any] = None):
+        self.persistence_store = persistence_store
+        self._store = getattr(persistence_store, "sqlite_store", None) if persistence_store else None
+        if self._store is None and hasattr(persistence_store, "save_runtime_version_config"):
+            self._store = persistence_store
+
         # Operational runtime configurations
         self._runtime_configs: Dict[str, Dict[str, Any]] = {
             "FORECASTING": {
@@ -140,6 +145,24 @@ class RuntimeComponentRegistry:
             for k, v in self._runtime_configs.items()
         }
 
+        # Track which components were recovered from durable store
+        self._durable_loaded_components: set = set()
+
+        # Recover from durable persistence if available
+        if self._store:
+            try:
+                all_saved = self._store.get_all_runtime_configs()
+                for comp, v_map in all_saved.items():
+                    self._version_configs.setdefault(comp, {}).update(v_map)
+
+                active_versions = self._store.get_active_runtime_versions()
+                for comp, (ver_tag, active_cfg) in active_versions.items():
+                    self._runtime_configs[comp] = copy.deepcopy(active_cfg)
+                    self._durable_loaded_components.add(comp)
+                    logger.info("Restored active runtime configuration for %s version %s from persistent store.", comp, ver_tag)
+            except Exception as e:
+                logger.error("Failed to recover runtime configs from persistent store: %s", e)
+
         # Snapshot stack for rollback
         self._history_snapshots: Dict[str, list[Dict[str, Any]]] = {
             k: [copy.deepcopy(v)] for k, v in self._runtime_configs.items()
@@ -148,7 +171,14 @@ class RuntimeComponentRegistry:
     def record_promoted_version(self, component: str, version_tag: str) -> None:
         """Durably associates the active runtime configuration with a promoted version."""
         comp = component.upper()
-        self._version_configs.setdefault(comp, {})[version_tag] = copy.deepcopy(self._runtime_configs.get(comp, {}))
+        cfg = copy.deepcopy(self._runtime_configs.get(comp, {}))
+        self._version_configs.setdefault(comp, {})[version_tag] = cfg
+        if self._store:
+            try:
+                self._store.save_runtime_version_config(comp, version_tag, cfg, is_active=True)
+            except Exception as e:
+                logger.error("Failed to persist promoted version config for %s %s: %s", comp, version_tag, e)
+                raise
 
     def has_version_config(self, component: str, version_tag: str) -> bool:
         """Returns True if a specific version has a restorable configuration."""
@@ -168,15 +198,20 @@ class RuntimeComponentRegistry:
         """Registers an active operational component consumer."""
         comp = component.upper()
         self._providers[comp] = provider
-        if hasattr(provider, "_params"):
-            for k, v in provider._params.items():
-                self._runtime_configs.setdefault(comp, {})[k] = copy.deepcopy(v)
-        # Synchronize configuration with provider
+
+        # If component was NOT restored from durable storage, initialize from provider defaults
+        if comp not in self._durable_loaded_components:
+            if hasattr(provider, "_params"):
+                for k, v in provider._params.items():
+                    self._runtime_configs.setdefault(comp, {})[k] = copy.deepcopy(v)
+            if comp in self._version_configs and "v1.0.0" in self._version_configs[comp]:
+                self._version_configs[comp]["v1.0.0"] = copy.deepcopy(self._runtime_configs.get(comp, {}))
+
+        # Always synchronize configuration from active registry to provider
         for k, v in self._runtime_configs.get(comp, {}).items():
             provider.set_parameter(k, v)
+
         self._history_snapshots[comp] = [copy.deepcopy(self._runtime_configs.get(comp, {}))]
-        if comp in self._version_configs and "v1.0.0" in self._version_configs[comp]:
-            self._version_configs[comp]["v1.0.0"] = copy.deepcopy(self._runtime_configs.get(comp, {}))
         logger.info("Registered active runtime provider for subsystem %s.", comp)
 
     def unregister_provider(self, component: str) -> None:
@@ -284,6 +319,12 @@ class RuntimeComponentRegistry:
                     return (False, f"Live runtime consumer failed to apply parameter '{k}' on rollback: {p_msg}")
 
         self._runtime_configs[comp] = copy.deepcopy(target_snapshot)
+        if target_version and self._store:
+            try:
+                self._store.set_active_runtime_version(comp, target_version)
+            except Exception as e:
+                logger.error("Failed to update active version in persistent store on rollback: %s", e)
+
         version_str = f"to version {target_version}" if target_version else "to previous snapshot"
         logger.info("Runtime state restored for %s %s.", comp, version_str)
         return (True, f"Runtime configuration restored for {comp} {version_str}.")

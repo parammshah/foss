@@ -34,7 +34,7 @@ class OutcomeMatcher:
         """
         all_events = self.store.get_all()
         forecast_events: List[LearningEvent] = []
-        actual_flow_events: Dict[str, Dict[str, Any]] = {}  # target_timestamp or corr_id -> payload
+        actual_events_list: List[Dict[str, Any]] = []
         used_actual_event_ids: set = set()
 
         for ev in all_events:
@@ -44,10 +44,9 @@ class OutcomeMatcher:
                 p = dict(ev.payload)
                 p["_event_id"] = ev.event_id
                 p["_event_timestamp"] = ev.timestamp
-                ts = p.get("target_timestamp") or ev.timestamp
-                actual_flow_events[ts] = p
-                if ev.correlation_id:
-                    actual_flow_events[ev.correlation_id] = p
+                p["_correlation_id"] = ev.correlation_id
+                p["_target_ts"] = p.get("target_timestamp") or ev.timestamp
+                actual_events_list.append(p)
 
         matched: List[MatchedForecastOutcome] = []
 
@@ -58,11 +57,15 @@ class OutcomeMatcher:
             model_ver = f_ev.associated_versions.get("forecasting_model", "v1.4.0")
 
             for horizon, pt_data in points.items():
-                pred_net = float(pt_data.get("expected_net_flow", 0.0))
-                pred_in = float(pt_data.get("expected_inflow", 0.0))
-                pred_out = float(pt_data.get("expected_outflow", 0.0))
+                pred_net = float(pt_data["expected_net_flow"]) if pt_data.get("expected_net_flow") is not None else None
+                pred_in = float(pt_data["expected_inflow"]) if pt_data.get("expected_inflow") is not None else None
+                pred_out = float(pt_data["expected_outflow"]) if pt_data.get("expected_outflow") is not None else None
 
-                # Part C2: Do NOT fabricate uncertainty intervals with arbitrary million dollar offsets!
+                # Derive net flow from actual inflows and outflows only when both required values are valid and available
+                if pred_net is None and pred_in is not None and pred_out is not None:
+                    pred_net = pred_in - pred_out
+
+                # Uncertainty intervals
                 p05 = float(pt_data["uncertainty_p05"]) if pt_data.get("uncertainty_p05") is not None else None
                 p50 = float(pt_data["uncertainty_p50"]) if pt_data.get("uncertainty_p50") is not None else None
                 p90 = float(pt_data["uncertainty_p90"]) if pt_data.get("uncertainty_p90") is not None else None
@@ -71,30 +74,91 @@ class OutcomeMatcher:
 
                 target_ts = pt_data.get("target_timestamp") or payload.get("target_timestamp")
                 
-                # If target_ts is missing, allow unambiguous correlation ID match to an actual flow event,
-                # but NEVER silently replace target_ts with forecast creation time (f_ev.timestamp).
+                # If prediction value itself is missing, never silently turn into 0.0
+                if pred_net is None:
+                    matched.append(
+                        MatchedForecastOutcome(
+                            correlation_id=corr_id,
+                            forecast_id=f"{corr_id}_{horizon}",
+                            target_timestamp=target_ts or "",
+                            horizon=horizon,
+                            predicted_net_flow=None,
+                            predicted_inflow=pred_in,
+                            predicted_outflow=pred_out,
+                            uncertainty_p05=p05,
+                            uncertainty_p50=p50,
+                            uncertainty_p90=p90,
+                            uncertainty_p95=p95,
+                            uncertainty_p99=p99,
+                            model_version=model_ver,
+                            actual_net_flow=None,
+                            is_eligible=False,
+                            ineligibility_reason="Missing forecast prediction value (expected_net_flow); missing forecast data cannot default to 0.0.",
+                        )
+                    )
+                    continue
+
                 actual_data = None
+                ambiguous = False
                 if target_ts:
-                    cand = actual_flow_events.get(target_ts)
-                    if cand and cand.get("_event_id") not in used_actual_event_ids:
-                        actual_data = cand
-                elif corr_id in actual_flow_events:
-                    cand = actual_flow_events[corr_id]
-                    if cand and cand.get("_event_id") not in used_actual_event_ids:
-                        target_ts = cand.get("target_timestamp") or cand.get("_event_timestamp")
-                        actual_data = cand
+                    cands = [
+                        a for a in actual_events_list
+                        if a.get("_event_id") not in used_actual_event_ids
+                        and (a.get("_target_ts") == target_ts or a.get("target_timestamp") == target_ts)
+                    ]
+                    if len(cands) == 1:
+                        actual_data = cands[0]
+                    elif len(cands) > 1:
+                        corr_matches = [a for a in cands if a.get("_correlation_id") == corr_id]
+                        if len(corr_matches) == 1:
+                            actual_data = corr_matches[0]
+                        else:
+                            ambiguous = True
+                elif corr_id:
+                    cands = [
+                        a for a in actual_events_list
+                        if a.get("_event_id") not in used_actual_event_ids
+                        and a.get("_correlation_id") == corr_id
+                    ]
+                    if len(cands) == 1:
+                        actual_data = cands[0]
+                        target_ts = actual_data.get("_target_ts")
+                    elif len(cands) > 1:
+                        ambiguous = True
+
+                if ambiguous:
+                    matched.append(
+                        MatchedForecastOutcome(
+                            correlation_id=corr_id,
+                            forecast_id=f"{corr_id}_{horizon}",
+                            target_timestamp=target_ts or "",
+                            horizon=horizon,
+                            predicted_net_flow=pred_net,
+                            predicted_inflow=pred_in,
+                            predicted_outflow=pred_out,
+                            uncertainty_p05=p05,
+                            uncertainty_p50=p50,
+                            uncertainty_p90=p90,
+                            uncertainty_p95=p95,
+                            uncertainty_p99=p99,
+                            model_version=model_ver,
+                            actual_net_flow=None,
+                            is_eligible=False,
+                            ineligibility_reason="Ambiguous match: multiple conflicting actual observations found for target timestamp.",
+                        )
+                    )
+                    continue
 
                 if not target_ts:
-                    # Part C1: Never silently replace missing target timestamp with forecast creation timestamp!
                     matched.append(
                         MatchedForecastOutcome(
                             correlation_id=corr_id,
                             forecast_id=f"{corr_id}_{horizon}",
                             target_timestamp="",
                             horizon=horizon,
-                            predicted_net_flow=float(pt_data.get("expected_net_flow", 0.0)),
-                            predicted_inflow=float(pt_data.get("expected_inflow", 0.0)),
-                            predicted_outflow=float(pt_data.get("expected_outflow", 0.0)),
+                            predicted_net_flow=pred_net,
+                            predicted_inflow=pred_in,
+                            predicted_outflow=pred_out,
                             uncertainty_p05=None,
                             uncertainty_p50=None,
                             uncertainty_p90=None,

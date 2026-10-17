@@ -107,7 +107,11 @@ class SystemPerformanceEvaluator:
             mae = sum(errors) / len(errors)
             rmse = math.sqrt(sum(e * e for e in errors) / len(errors))
             sum_actuals = sum(actuals)
-            wape = (sum(errors) / sum_actuals * 100.0) if sum_actuals > 0 else 0.0
+            if sum_actuals > 0:
+                wape = sum(errors) / sum_actuals * 100.0
+            else:
+                wape = None
+                exclusion_reasons.append("Actual net flows sum to zero; WAPE undefined (zero denominator).")
 
             # MAPE with zero-actual guard
             non_zero_pairs = [(e, a) for e, a in zip(errors, actuals) if a >= 1000.0]
@@ -118,8 +122,12 @@ class SystemPerformanceEvaluator:
                 exclusion_reasons.append("Actual net flows near zero; MAPE undefined, WAPE and MAE reported.")
 
             # Empirical Interval Coverage
-            covered = sum(1 for f in eligible_forecasts if f.within_90_interval)
-            coverage_pct = (covered / valid_evaluations) * 100.0
+            forecasts_with_intervals = [f for f in eligible_forecasts if f.within_90_interval is not None]
+            if forecasts_with_intervals:
+                covered = sum(1 for f in forecasts_with_intervals if f.within_90_interval is True)
+                coverage_pct = (covered / len(forecasts_with_intervals)) * 100.0
+            else:
+                coverage_pct = None
 
             # Kolmogorov-Smirnov Drift Test
             if valid_evaluations >= self.MIN_SAMPLES_FOR_DRIFT:
@@ -158,10 +166,10 @@ class SystemPerformanceEvaluator:
                 excluded_count=excluded_count,
                 exclusion_reasons=exclusion_reasons,
                 mape=round(mape, 2) if mape is not None else None,
-                wape=round(wape, 2),
+                wape=round(wape, 2) if wape is not None else None,
                 mae=round(mae, 2),
                 rmse=round(rmse, 2),
-                interval_coverage_pct=round(coverage_pct, 1),
+                interval_coverage_pct=round(coverage_pct, 1) if coverage_pct is not None else None,
                 nominal_confidence=0.90,
                 drift_analysis=drift_analysis,
                 status="DEGRADED" if drift_analysis.drift_detected else "STABLE",
@@ -170,7 +178,8 @@ class SystemPerformanceEvaluator:
         # 3. Decision Evaluation
         total_decisions = len(matched_decisions)
         executed = [d for d in matched_decisions if d.is_executed]
-        cancelled_or_rejected = total_decisions - len(executed)
+        cancelled_or_rejected = [d for d in matched_decisions if d.execution_status in ("CANCELLED", "REJECTED")]
+        pending_or_unresolved = [d for d in matched_decisions if not d.is_executed and d.execution_status not in ("CANCELLED", "REJECTED")]
 
         shortfall_decisions = [d for d in executed if d.is_shortfall]
         total_shortfalls = len(shortfall_decisions)
@@ -217,7 +226,8 @@ class SystemPerformanceEvaluator:
         d_metrics = DecisionPerformanceMetrics(
             total_decisions=total_decisions,
             executed_decisions=len(executed),
-            cancelled_or_rejected=cancelled_or_rejected,
+            cancelled_or_rejected=len(cancelled_or_rejected),
+            pending_or_unresolved=len(pending_or_unresolved),
             avg_cost_slippage_bps=round(avg_slippage, 1),
             total_shortfalls=total_shortfalls,
             total_shortfall_amount=round(total_shortfall_amt, 2),
@@ -238,7 +248,7 @@ class SystemPerformanceEvaluator:
         corroborated_sig = sum(
             1 for e in sentinel_events if e.payload.get("corroboration_status") in ("CORROBORATED", "OFFICIAL")
         )
-        corrob_rate = round(corroborated_sig / tot_sig, 2) if tot_sig > 0 else 0.0
+        corrob_rate = round(corroborated_sig / tot_sig, 2) if tot_sig > 0 else None
 
         sev_counts: Dict[str, int] = {}
         for e in sentinel_events:
@@ -358,10 +368,10 @@ def calculate_forecast_metrics(
             excluded_count=excluded_count,
             exclusion_reasons=exclusion_reasons or ["No eligible forecast outcomes observed."],
             mape=None,
-            wape=0.0,
-            mae=0.0,
-            rmse=0.0,
-            interval_coverage_pct=0.0,
+            wape=None,
+            mae=None,
+            rmse=None,
+            interval_coverage_pct=None,
             nominal_confidence=nominal_confidence,
             drift_analysis=DriftAnalysisResult(
                 drift_detected=False,
@@ -382,7 +392,11 @@ def calculate_forecast_metrics(
     mae = sum(errors) / len(errors)
     rmse = math.sqrt(sum(e * e for e in errors) / len(errors))
     sum_actuals = sum(actuals)
-    wape = (sum(errors) / sum_actuals * 100.0) if sum_actuals > 0 else 100.0
+    if sum_actuals > 0:
+        wape = sum(errors) / sum_actuals * 100.0
+    else:
+        wape = 100.0 if sum(errors) > 0 else 0.0
+        exclusion_reasons.append("Zero actual outflow across all observations; WAPE bounded at 100.0%.")
 
     # Guard zero actuals
     non_zero = [(e, a) for e, a in zip(errors, actuals) if a > 1e-6]
@@ -396,9 +410,13 @@ def calculate_forecast_metrics(
         exclusion_reasons.append("Zero actual outflow across all observations; MAPE undefined, WAPE and MAE reported.")
         excluded_count = valid_evaluations
 
-    # Interval coverage
-    covered = sum(1 for f in eligible if f.within_90_interval)
-    coverage_pct = (covered / valid_evaluations) * 100.0
+    # Interval coverage only where genuine prediction intervals are available
+    forecasts_with_intervals = [f for f in eligible if f.within_90_interval is not None]
+    if forecasts_with_intervals:
+        covered = sum(1 for f in forecasts_with_intervals if f.within_90_interval is True)
+        coverage_pct = (covered / len(forecasts_with_intervals)) * 100.0
+    else:
+        coverage_pct = None
 
     # Drift
     if valid_evaluations >= 10:
@@ -425,10 +443,10 @@ def calculate_forecast_metrics(
         excluded_count=excluded_count,
         exclusion_reasons=exclusion_reasons,
         mape=mape,
-        wape=round(wape, 2),
+        wape=round(wape, 2) if wape is not None else None,
         mae=round(mae, 2),
         rmse=round(rmse, 2),
-        interval_coverage_pct=round(coverage_pct, 2),
+        interval_coverage_pct=round(coverage_pct, 2) if coverage_pct is not None else None,
         nominal_confidence=nominal_confidence,
         drift_analysis=drift_analysis,
         status=status,

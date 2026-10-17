@@ -34,9 +34,9 @@ class MatchedForecastOutcome:
     forecast_id: str
     target_timestamp: str
     horizon: str
-    predicted_net_flow: float
-    predicted_inflow: float
-    predicted_outflow: float
+    predicted_net_flow: Optional[float] = None
+    predicted_inflow: Optional[float] = None
+    predicted_outflow: Optional[float] = None
     uncertainty_p05: Optional[float] = None
     uncertainty_p50: Optional[float] = None
     uncertainty_p90: Optional[float] = None
@@ -128,7 +128,7 @@ class DecisionPerformanceMetrics:
 @dataclass
 class SentinelPerformanceMetrics:
     total_signals: int
-    corroboration_rate: float
+    corroboration_rate: Optional[float] = None
     false_alarm_rate: Optional[float] = None
     precision_status: str = "UNAVAILABLE_WITHOUT_GROUND_TRUTH_LABELS"
     precision: Optional[float] = None
@@ -216,3 +216,13 @@ class CandidateUpdate:
     promotion_role: Optional[str] = None
     rejection_reason: Optional[str] = None
     is_metadata_only: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "validation_report" and value is not None:
+            if getattr(value, "is_promotable", False):
+                self.status = CandidateStatus.SHADOW_MODE
+            elif not getattr(value, "is_promotable", True):
+                self.status = CandidateStatus.REJECTED
+                if getattr(value, "violations", None):
+                    self.rejection_reason = "; ".join(value.violations)

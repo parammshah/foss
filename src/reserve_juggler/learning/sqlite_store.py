@@ -112,6 +112,20 @@ class SqliteEventStore:
                     );
                     """
                 )
+
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS runtime_version_configs (
+                        component TEXT NOT NULL,
+                        version_tag TEXT NOT NULL,
+                        config_json TEXT NOT NULL,
+                        is_active INTEGER DEFAULT 0,
+                        recorded_at TEXT NOT NULL,
+                        PRIMARY KEY (component, version_tag)
+                    );
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_rt_active ON runtime_version_configs(component, is_active);")
                 conn.commit()
         except sqlite3.Error as e:
             raise PersistenceError(f"Database initialization failed: {e}") from e
@@ -358,12 +372,87 @@ class SqliteEventStore:
         except sqlite3.Error as e:
             raise PersistenceError(f"Failed to query version audits: {e}") from e
 
+    def save_runtime_version_config(
+        self, component: str, version_tag: str, config: Dict[str, Any], is_active: bool = False
+    ) -> None:
+        comp = component.upper()
+        now_ts = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._get_connection() as conn:
+                if is_active:
+                    conn.execute("UPDATE runtime_version_configs SET is_active = 0 WHERE component = ?;", (comp,))
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO runtime_version_configs (
+                        component, version_tag, config_json, is_active, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?);
+                    """,
+                    (comp, version_tag, json.dumps(config), 1 if is_active else 0, now_ts),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            raise PersistenceError(f"Failed to save runtime config for {comp} {version_tag}: {e}") from e
+
+    def get_runtime_version_configs(self, component: str) -> Dict[str, Dict[str, Any]]:
+        comp = component.upper()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT version_tag, config_json FROM runtime_version_configs WHERE component = ?;", (comp,)
+                )
+                res = {}
+                for row in cursor.fetchall():
+                    res[row["version_tag"]] = json.loads(row["config_json"])
+                return res
+        except sqlite3.Error as e:
+            raise PersistenceError(f"Failed to get runtime configs for {comp}: {e}") from e
+
+    def get_all_runtime_configs(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute("SELECT component, version_tag, config_json FROM runtime_version_configs;")
+                res: Dict[str, Dict[str, Dict[str, Any]]] = {}
+                for row in cursor.fetchall():
+                    comp = row["component"]
+                    ver = row["version_tag"]
+                    res.setdefault(comp, {})[ver] = json.loads(row["config_json"])
+                return res
+        except sqlite3.Error as e:
+            raise PersistenceError(f"Failed to query runtime configs: {e}") from e
+
+    def get_active_runtime_versions(self) -> Dict[str, tuple[str, Dict[str, Any]]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT component, version_tag, config_json FROM runtime_version_configs WHERE is_active = 1;"
+                )
+                res = {}
+                for row in cursor.fetchall():
+                    res[row["component"]] = (row["version_tag"], json.loads(row["config_json"]))
+                return res
+        except sqlite3.Error as e:
+            raise PersistenceError(f"Failed to get active runtime versions: {e}") from e
+
+    def set_active_runtime_version(self, component: str, version_tag: str) -> None:
+        comp = component.upper()
+        try:
+            with self._get_connection() as conn:
+                conn.execute("UPDATE runtime_version_configs SET is_active = 0 WHERE component = ?;", (comp,))
+                conn.execute(
+                    "UPDATE runtime_version_configs SET is_active = 1 WHERE component = ? AND version_tag = ?;",
+                    (comp, version_tag),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            raise PersistenceError(f"Failed to set active version for {comp} {version_tag}: {e}") from e
+
     def clear(self) -> None:
         try:
             with self._get_connection() as conn:
                 conn.execute("DELETE FROM learning_events;")
                 conn.execute("DELETE FROM candidate_updates;")
                 conn.execute("DELETE FROM version_audits;")
+                conn.execute("DELETE FROM runtime_version_configs;")
                 conn.commit()
         except sqlite3.Error as e:
             raise PersistenceError(f"Failed to clear database: {e}") from e

@@ -88,14 +88,16 @@ class StressLabSimulationEngine:
         # --- STRATEGY 1: All-Cash Benchmark ---
         # Portfolio is entirely operational cash ($220M), zero duration, zero yield optimization
         cash_start_1 = total_starting_assets
-        final_cash_1 = cash_start_1 + inflows - shocked_outflow
-        deficit_1 = max(0.0, reserve_floor - final_cash_1)
-        shortfall_1 = deficit_1
         payouts_paid_1 = min(shocked_outflow, cash_start_1 + inflows)
         unpaid_payouts_1 = max(0.0, shocked_outflow - payouts_paid_1)
+        final_cash_1 = max(0.0, cash_start_1 + inflows - shocked_outflow)
+        deficit_1 = max(0.0, reserve_floor - final_cash_1)
+        shortfall_1 = deficit_1
         starting_nav_1 = cash_start_1
         expected_ending_nav_1 = starting_nav_1 + (inflows - shocked_outflow)
-        reconcil_err_1 = round(abs(expected_ending_nav_1 - final_cash_1), 2)
+        ending_inv_1 = - unpaid_payouts_1
+        portfolio_val_1 = final_cash_1 + ending_inv_1
+        reconcil_err_1 = round(abs(expected_ending_nav_1 - portfolio_val_1), 2)
         res_1 = StrategyStressOutcome(
             strategy_name="All-Cash Benchmark",
             starting_cash=cash_start_1,
@@ -107,11 +109,11 @@ class StressLabSimulationEngine:
             emergency_credit_drawn=0.0,
             emergency_credit_cost=0.0,
             final_cash=round(final_cash_1, 2),
-            final_portfolio_value=round(final_cash_1, 2),
+            final_portfolio_value=round(portfolio_val_1, 2),
             reserve_breach=(final_cash_1 < reserve_floor),
             liquidity_shortfall=round(shortfall_1, 2),
             strategy_description="Zero term investment; massive cash drag and inflationary erosion.",
-            ending_investments=0.0,
+            ending_investments=round(ending_inv_1, 2),
             reconciliation_error=reconcil_err_1,
             reserve_deficit=round(deficit_1, 2),
             customer_obligations_due=round(shocked_outflow, 2),
@@ -132,6 +134,7 @@ class StressLabSimulationEngine:
         credit_cost_2 = 0.0
         realized_haircut_2 = 0.0
 
+        bonds_sold_2 = 0.0
         if net_need_2 > 0:
             # Standby credit line if available
             if not credit_unavailable:
@@ -141,9 +144,10 @@ class StressLabSimulationEngine:
 
             # Secondary market bond liquidation has T+1 settlement latency and 8% fire-sale haircut
             if net_need_2 > 0:
-                bond_loss_fire = net_need_2 * 0.08
+                bonds_sold_2 = min(net_need_2, rem_bonds_2y_2)
+                bond_loss_fire = bonds_sold_2 * 0.08
                 realized_haircut_2 += bond_loss_fire
-                rem_bonds_2y_2 = max(0.0, rem_bonds_2y_2 - net_need_2)
+                rem_bonds_2y_2 = max(0.0, rem_bonds_2y_2 - bonds_sold_2)
 
         # Intraday operational cash: bond liquidation proceeds cannot settle T+0 intraday
         liquid_cash_2 = cash_start_2 + inflows + credit_drawn_2
@@ -154,14 +158,16 @@ class StressLabSimulationEngine:
         shortfall_2 = deficit_2
         reserve_breach_2 = (final_cash_2 < reserve_floor)
 
+        t1_bond_receivable_2 = bonds_sold_2 * (1.0 - 0.08)
+
         bond_mtm_loss_2 = (rem_bonds_10y_2 * 8.25 * delta_y) + (rem_bonds_2y_2 * 1.92 * delta_y) + realized_haircut_2
         eq_loss_2 = rem_eq_2 * (equity_drawdown_pct / 100.0)
 
-        # Consistent ledger balance sheet: ending investments minus credit debt
+        # Consistent ledger balance sheet: ending investments including T+1 receivable minus credit debt and unpaid obligations
         ending_inv_2 = (
             rem_repo_30d_2 + (rem_bonds_10y_2 * (1.0 - 8.25 * delta_y))
             + (rem_bonds_2y_2 * (1.0 - 1.92 * delta_y)) + (rem_eq_2 * (1.0 - equity_drawdown_pct / 100.0))
-            - credit_drawn_2 - credit_cost_2
+            + t1_bond_receivable_2 - credit_drawn_2 - credit_cost_2 - unpaid_payouts_2
         )
         portfolio_val_2 = final_cash_2 + ending_inv_2
 
@@ -249,7 +255,8 @@ class StressLabSimulationEngine:
                 rem_repo_30d_3 -= break_amt  # Deduct principal: no double-counting!
                 deficit_to_floor -= (break_amt - pen)
 
-        final_cash_3 = net_cash_3
+        final_cash_3 = max(0.0, net_cash_3)
+        unpaid_payouts_3 = max(0.0, -net_cash_3)
         deficit_3 = max(0.0, reserve_floor - final_cash_3)
         shortfall_3 = deficit_3
         liquid_cash_3 = cash_start_3 + inflows + credit_drawn_3 + (30_000_000.0 - rem_repo_ovn_3) + (25_000_000.0 - rem_repo_30d_3 - repo_penalty_3)
@@ -259,13 +266,13 @@ class StressLabSimulationEngine:
         bond_mtm_loss_3 = (rem_bonds_10y_3 * 8.25 * delta_y) + (rem_bonds_2y_3 * 1.92 * delta_y)
         eq_loss_3 = rem_eq_3 * (equity_drawdown_pct / 100.0)
 
-        # Consistent ledger balance sheet: ending investments minus credit debt
+        # Consistent ledger balance sheet: ending investments minus credit debt and unpaid obligations
         ending_inv_3 = (
             rem_repo_ovn_3 + rem_repo_30d_3
             + (rem_bonds_10y_3 * (1.0 - 8.25 * delta_y))
             + (rem_bonds_2y_3 * (1.0 - 1.92 * delta_y))
             + (rem_eq_3 * (1.0 - equity_drawdown_pct / 100.0))
-            - credit_drawn_3 - credit_cost_3
+            - credit_drawn_3 - credit_cost_3 - unpaid_payouts_3
         )
         portfolio_val_3 = final_cash_3 + ending_inv_3
 
@@ -297,6 +304,8 @@ class StressLabSimulationEngine:
             is_reconciled=(reconcil_err_3 < 1.0),
         )
 
+        all_reconciled = res_1.is_reconciled and res_2.is_reconciled and res_3.is_reconciled
+
         return {
             "parameters": {
                 "deposit_shock_pct": deposit_shock_pct,
@@ -315,5 +324,6 @@ class StressLabSimulationEngine:
             "is_shortfall": shortfall_3 > 0,
             "reserve_juggler_shortfall": shortfall_3 > 0,
             "shortfall_amount": shortfall_3,
+            "all_strategies_reconciled": all_reconciled,
             "recommended_hedge": "NO_RECOMMENDATION_OPTIMIZER_UNINTEGRATED",
         }
