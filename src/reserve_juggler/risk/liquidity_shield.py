@@ -1,7 +1,7 @@
 """
 Adaptive Liquidity Shield and Hard Safety Gates.
 
-Implements dynamic reserve sizing, capital protection firewalls, and hard safety gates.
+Implements dynamic reserve sizing, capital protection firewalls, and action-specific hard safety gates.
 Protects customer payouts unconditionally before optimizing investment yields.
 """
 
@@ -31,16 +31,21 @@ def assess_liquidity_reserve(
     operational_safety_buffer: float = 0.10,  # 10% operational margin on obligations
     payout_window_hours: float = 24.0,
     stress_multiplier: float = 1.0,
+    forecast_is_cumulative: bool = False,
+    forecast_horizon_hours: float = 72.0,
 ) -> ReserveAssessment:
     """Assess dynamic liquidity reserves and eligible investable surplus.
 
     Distinguishes:
-    - Protected Capital: cash and buffer strictly needed to meet immediate payout obligations.
+    - Protected Capital: cash and buffer strictly needed to meet immediate payout obligations (0-24h).
     - Future-Obligation Reserve: additional capital required for future forecast deficits
-      before longer-term assets or repos mature and settle.
+      and scheduled obligations (24-72h) before longer-term assets or repos mature and settle.
     - Eligible Investable Surplus: remaining unencumbered funds eligible for deployment.
 
-    Prevents double-counting overlapping horizons or reserves.
+    Enforces invariants:
+    - Increasing scheduled obligations cannot decrease required reserves.
+    - Normal repo maturity does not incur an early-exit penalty.
+    - Horizon semantics prevent double-counting.
     """
     now = state.timestamp
     available_cash = max(0.0, float(state.available_cash))
@@ -55,32 +60,25 @@ def assess_liquidity_reserve(
             signal_stress = max(signal_stress, 1.15)
     effective_stress = stress_multiplier * signal_stress
 
-    # 1. Immediate Payout Obligations (within payout_window_hours, typically 24h)
+    # 1. Scheduled Obligations by Horizon
     immediate_obligations = 0.0
     future_obligations_beyond = 0.0
+    obligations_by_hour: list[tuple[float, float]] = []
+
     for ob in state.future_obligations:
         hours_diff = (ob.due_time - now).total_seconds() / 3600.0
         amt = float(ob.amount)
-        if hours_diff <= payout_window_hours:
-            immediate_obligations += amt
-        else:
-            future_obligations_beyond += amt
+        if hours_diff <= forecast_horizon_hours:
+            obligations_by_hour.append((hours_diff, amt))
+            if hours_diff <= payout_window_hours:
+                immediate_obligations += amt
+            else:
+                future_obligations_beyond += amt
 
     # Operational safety margin on immediate obligations
     op_buffer = immediate_obligations * operational_safety_buffer
 
-    # 2. Cumulative Forecast Deficit Analysis
-    # We analyze cumulative net outflow = max(0, withdrawal_p90 - deposit_p10)
-    # Sorted by forecast horizon
-    sorted_points = sorted(
-        forecast_bundle.point_forecasts or [], key=lambda p: float(p.forecast_horizon)
-    )
-
-    immediate_forecast_deficit = 0.0
-    max_cumulative_future_deficit = 0.0
-    cumulative_forecast_outflow = 0.0
-
-    # Collect repo maturities by horizon
+    # 2. Maturing Repo Cash Availability (Normal maturity does NOT incur early exit fees!)
     repo_maturities_by_hour: list[tuple[float, float]] = []
     total_maturing_repo_liquidity = 0.0
 
@@ -88,39 +86,79 @@ def assess_liquidity_reserve(
         if pos.instrument_type.lower() == "repo" or pos.tier == 1:
             if pos.maturity:
                 hours_to_mat = max(0.0, (pos.maturity - now).total_seconds() / 3600.0)
-                # Repo proceeds net of fees upon maturity
-                net_repo_val = float(pos.market_value) * (1.0 - float(pos.exit_fees))
-                repo_maturities_by_hour.append((hours_to_mat, net_repo_val))
-                total_maturing_repo_liquidity += net_repo_val
+                # Normal maturity proceeds: full nominal value without early redemption penalty
+                full_repo_val = float(pos.market_value)
+                repo_maturities_by_hour.append((hours_to_mat, full_repo_val))
+                total_maturing_repo_liquidity += full_repo_val
+
+    # 3. Forecast Deficit Analysis
+    sorted_points = sorted(
+        forecast_bundle.point_forecasts or [], key=lambda p: float(p.forecast_horizon)
+    )
+
+    immediate_forecast_deficit = 0.0
+    max_future_net_gap = 0.0
+    running_cumulative_outflow = 0.0
 
     for fp in sorted_points:
         horizon = float(fp.forecast_horizon)
-        # Conservative net outflow rate
         pt_deficit = max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10)) * effective_stress
-        cumulative_forecast_outflow += pt_deficit
+
+        if forecast_is_cumulative:
+            # Point value already represents cumulative total through this horizon
+            cum_outflow_at_h = pt_deficit
+        else:
+            # Interval accumulation
+            running_cumulative_outflow += pt_deficit
+            cum_outflow_at_h = running_cumulative_outflow
+
+        # Cumulative scheduled obligations due by this horizon
+        cum_obligations_at_h = sum(
+            amt for h_due, amt in obligations_by_hour if h_due <= horizon
+        )
+
+        # Total repo liquidity available by this horizon
+        matured_repo_at_h = sum(
+            val for h_mat, val in repo_maturities_by_hour if h_mat <= horizon
+        )
+
+        total_demand_at_h = cum_outflow_at_h + cum_obligations_at_h
 
         if horizon <= payout_window_hours:
-            immediate_forecast_deficit += pt_deficit
+            if forecast_is_cumulative:
+                immediate_forecast_deficit = max(immediate_forecast_deficit, pt_deficit)
+            else:
+                immediate_forecast_deficit = cum_outflow_at_h
         else:
-            # Future horizon: check how much repo liquidity has matured by this horizon
-            matured_by_h = sum(
-                val for h_mat, val in repo_maturities_by_hour if h_mat <= horizon
-            )
-            net_gap = max(0.0, cumulative_forecast_outflow - matured_by_h)
-            if net_gap > max_cumulative_future_deficit:
-                max_cumulative_future_deficit = net_gap
+            # Future horizon: check unmet net gap taking into account maturing repo
+            net_gap = max(0.0, total_demand_at_h - matured_repo_at_h)
+            if net_gap > max_future_net_gap:
+                max_future_net_gap = net_gap
 
-    # Protected Capital covers immediate obligations + buffer + immediate forecast deficit
+    # Also check scheduled obligations at 24-72h even if point forecasts are sparse
+    for horizon in [30.0, 48.0, 72.0]:
+        cum_obligations_at_h = sum(
+            amt for h_due, amt in obligations_by_hour if h_due <= horizon
+        )
+        matured_repo_at_h = sum(
+            val for h_mat, val in repo_maturities_by_hour if h_mat <= horizon
+        )
+        net_gap = max(0.0, cum_obligations_at_h - matured_repo_at_h)
+        if net_gap > max_future_net_gap:
+            max_future_net_gap = net_gap
+
+    # Protected Capital covers immediate obligations (0-24h) + buffer + immediate forecast deficit
     protected_capital = immediate_obligations + op_buffer + immediate_forecast_deficit
 
-    # Future-Obligation Reserve covers future deficits not satisfied by maturing assets or protected capital
-    # Avoid double counting: subtracting what's already protected
-    future_obligation_reserve = max(0.0, max_cumulative_future_deficit - immediate_forecast_deficit)
+    # Future-Obligation Reserve covers future obligations and forecast deficits (24-72h)
+    # net of maturing repo liquidity and avoiding double counting what's protected
+    immediate_covered = immediate_obligations + immediate_forecast_deficit
+    future_obligation_reserve = max(0.0, max_future_net_gap - immediate_covered)
 
     # Total required reserves
     total_required_reserve = protected_capital + future_obligation_reserve
 
-    # Eligible Investable Surplus: remaining unencumbered cash
+    # Eligible Investable Surplus: remaining unencumbered cash strictly beyond required reserves
     eligible_surplus = max(0.0, available_cash - total_required_reserve)
 
     # Identify uncovered stress scenarios explicitly
@@ -131,7 +169,7 @@ def assess_liquidity_reserve(
         total_liquidatable_resources += max(0.0, stressed_val)
 
     worst_case_stress_demand = (immediate_obligations + future_obligations_beyond) * 1.5 + (
-        cumulative_forecast_outflow * 2.0
+        (running_cumulative_outflow or immediate_forecast_deficit) * 2.0
     )
 
     if total_liquidatable_resources < worst_case_stress_demand:
@@ -162,11 +200,17 @@ def evaluate_hard_safety_gates(
     proposed_lockup_hours: float = 0.0,
     proposed_bridge_draw: float = 0.0,
     target_tier: int = 1,
+    payment_deadline_hours: Optional[float] = None,
+    availability_delay_hours: Optional[float] = None,
+    repayment_feasibility: bool = True,
+    is_partial_funding: bool = False,
+    residual_unfunded_amount: float = 0.0,
+    action_type: Optional[str] = None,
 ) -> HardGateEvaluation:
     """Evaluate non-negotiable safety gates independently of the Treasury Safety Score.
 
     Hard gates reject any proposed allocation or action that compromises customer payouts,
-    breaches liquidity buffers, or exceeds credit authorization, regardless of expected yield.
+    breaches liquidity buffers, exceeds credit authorization, or proposes an un-repayable loan.
     """
     now = state.timestamp
     available_cash = max(0.0, float(state.available_cash))
@@ -178,16 +222,33 @@ def evaluate_hard_safety_gates(
     reason_codes: list[str] = []
 
     # Hard Gate 1: Immediate Payout Coverage Gate
-    # Total available immediate funding (cash + credit) must be >= immediate mandatory payouts
-    payout_coverage_passed = (available_cash + credit_avail) >= immediate_obligations
+    # For funding actions, evaluate coverage considering the action's net proceeds by deadline.
+    is_funding_action = action_type in (
+        "BREAK_REPO_EARLY",
+        "SELL_BOND",
+        "SELL_EQUITY",
+        "DRAW_BRIDGE_CREDIT",
+    )
+    if is_funding_action:
+        deadline_met = (
+            availability_delay_hours is None
+            or payment_deadline_hours is None
+            or availability_delay_hours <= payment_deadline_hours
+        )
+        payout_coverage_passed = (residual_unfunded_amount == 0.0) and deadline_met
+    else:
+        payout_coverage_passed = (available_cash + credit_avail) >= immediate_obligations
+
     gates["immediate_payout_coverage"] = payout_coverage_passed
     if not payout_coverage_passed:
         violated_gates.append("immediate_payout_coverage")
-        reason_codes.append("BREACH_IMMEDIATE_PAYOUT_COVERAGE: Immediate funding insufficient for payouts.")
+        reason_codes.append(
+            f"BREACH_IMMEDIATE_PAYOUT_COVERAGE: Immediate funding insufficient for payouts "
+            f"(${immediate_obligations:,.2f} required, residual gap: ${residual_unfunded_amount:,.2f})."
+        )
 
-    # Hard Gate 2: Minimum Protected Reserve Gate
-    # Any new investment allocation must NOT deplete cash below protected capital
-    if proposed_investment_amount > 0.0:
+    # Hard Gate 2: Minimum Protected Reserve Gate (for new surplus allocations)
+    if proposed_investment_amount > 0.0 and proposed_bridge_draw == 0.0:
         remaining_cash_after_investment = available_cash - proposed_investment_amount
         reserve_gate_passed = remaining_cash_after_investment >= (
             reserve_assessment.protected_capital + reserve_assessment.future_obligation_reserve
@@ -202,10 +263,8 @@ def evaluate_hard_safety_gates(
     else:
         gates["protected_reserve_intact"] = True
 
-    # Hard Gate 3: Repo / Asset Lockup Timing Gate
-    # A lockup must not trap cash across an obligation due date unless surplus cash covers it
+    # Hard Gate 3: Lockup Timing Gate
     if proposed_lockup_hours > 0.0 and proposed_investment_amount > 0.0:
-        # Check if obligations due before lockup ends exceed remaining uncommitted cash
         obligations_during_lockup = 0.0
         for ob in state.future_obligations:
             h = (ob.due_time - now).total_seconds() / 3600.0
@@ -225,7 +284,6 @@ def evaluate_hard_safety_gates(
         gates["lockup_timing_feasibility"] = True
 
     # Hard Gate 4: Authorized Credit Availability Gate
-    # Proposed credit bridge draw must not exceed currently available authorized limit
     if proposed_bridge_draw > 0.0:
         credit_safe = proposed_bridge_draw <= credit_avail
         gates["credit_availability_limit"] = credit_safe
@@ -237,6 +295,41 @@ def evaluate_hard_safety_gates(
             )
     else:
         gates["credit_availability_limit"] = True
+
+    # Hard Gate 5: Funding Deadline Feasibility Gate (for emergency actions)
+    if payment_deadline_hours is not None and availability_delay_hours is not None:
+        deadline_met = availability_delay_hours <= payment_deadline_hours
+        gates["funding_deadline_satisfied"] = deadline_met
+        if not deadline_met:
+            violated_gates.append("funding_deadline_satisfied")
+            reason_codes.append(
+                f"BREACH_FUNDING_DEADLINE: Proceeds arrive in {availability_delay_hours:.1f}h, "
+                f"which is after payment deadline of {payment_deadline_hours:.1f}h."
+            )
+    else:
+        gates["funding_deadline_satisfied"] = True
+
+    # Hard Gate 6: Valid Bridge Repayment Source Gate
+    if proposed_bridge_draw > 0.0:
+        gates["valid_repayment_source"] = repayment_feasibility
+        if not repayment_feasibility:
+            violated_gates.append("valid_repayment_source")
+            reason_codes.append(
+                "BREACH_REPAYMENT_SOURCE: Bridge facility draw lacks a verified future cash source for repayment."
+            )
+    else:
+        gates["valid_repayment_source"] = True
+
+    # Hard Gate 7: Full Funding vs Residual Gap Gate
+    if is_partial_funding or residual_unfunded_amount > 0.0:
+        # Action only partially funds the required payout
+        gates["full_payout_funding"] = False
+        violated_gates.append("full_payout_funding")
+        reason_codes.append(
+            f"BREACH_PARTIAL_FUNDING: Action leaves residual unfunded shortfall of ${residual_unfunded_amount:,.2f}."
+        )
+    else:
+        gates["full_payout_funding"] = True
 
     all_passed = len(violated_gates) == 0
 

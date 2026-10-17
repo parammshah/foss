@@ -14,6 +14,8 @@ from reserve_juggler.tax.tax_profile import (
     TaxJurisdictionRules,
     TaxProfile,
     create_default_corporate_profile,
+    create_statutory_us_corp_profile,
+    create_synthetic_demo_profile,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "InstrumentTaxClassification",
     "IncomeType",
     "create_default_corporate_profile",
+    "create_statutory_us_corp_profile",
+    "create_synthetic_demo_profile",
 ]

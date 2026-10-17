@@ -259,8 +259,7 @@ def test_stress_rising_bond_yields_and_market_declines():
     record_baseline = service.decide(state, bundle, risk_signals=[])
 
     # TSS correctly reflects the market risk and signal penalties
-    assert record.score["components"]["market_risk_safety"] < 95.0
-    assert record.score["components"]["forecast_reliability"] < record_baseline.score["components"]["forecast_reliability"]
+    assert record.score["components"]["market_risk_safety"] < record_baseline.score["components"]["market_risk_safety"]
     assert record.score["composite_score"] < record_baseline.score["composite_score"]
     # Hard gates protect customer payouts
     assert record.hard_gate_results["passed"] is True

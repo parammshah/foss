@@ -14,12 +14,22 @@ class ActionType(str, Enum):
 
     KEEP_CASH = "KEEP_CASH"
     PLACE_REPO = "PLACE_REPO"
-    WAIT_REPO_MATURITY = "WAIT_REPO_MATURITY"
-    BREAK_REPO_EARLY = "BREAK_REPO_EARLY"
+    BUY_BOND = "BUY_BOND"
+    BUY_EQUITY = "BUY_EQUITY"
     SELL_BOND = "SELL_BOND"
     SELL_EQUITY = "SELL_EQUITY"
+    BREAK_REPO_EARLY = "BREAK_REPO_EARLY"
     DRAW_BRIDGE_CREDIT = "DRAW_BRIDGE_CREDIT"
     REPAY_BRIDGE_CREDIT = "REPAY_BRIDGE_CREDIT"
+    WAIT_REPO_MATURITY = "WAIT_REPO_MATURITY"
+    UNRESOLVED_FUNDING_SHORTFALL = "UNRESOLVED_FUNDING_SHORTFALL"
+
+
+class OptimizationMode(str, Enum):
+    """Optimizer operational mode."""
+
+    EMERGENCY_FUNDING = "EMERGENCY_FUNDING"
+    SURPLUS_ALLOCATION = "SURPLUS_ALLOCATION"
 
 
 @dataclass(frozen=True)
@@ -56,7 +66,7 @@ def get_tier_limits_for_tss(tss_score: float) -> TierExposureLimits:
 
 @dataclass
 class TreasuryAction:
-    """Candidate or selected treasury action with full cost and risk accounting."""
+    """Candidate or selected treasury action with full cost, risk, and funding plan accounting."""
 
     action_type: ActionType
     amount: float
@@ -72,6 +82,31 @@ class TreasuryAction:
     reason_code: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    # Time-indexed funding plan attributes
+    required_payout_amount: float = 0.0
+    existing_cash_applied: float = 0.0
+    gross_proceeds: float = 0.0
+    net_proceeds: float = 0.0
+    transaction_cost: float = 0.0
+    availability_delay_hours: float = 0.0
+    payment_deadline_hours: float = 0.0
+    funded_by_deadline: float = 0.0
+    residual_unfunded_amount: float = 0.0
+    is_partial_funding: bool = False
+    secondary_action_needed: bool = False
+
+    # Bridge-specific audit fields
+    principal_borrowed: float = 0.0
+    apr: float = 0.0
+    annual_day_count_convention: float = 8760.0
+    interest_cost: float = 0.0
+    expected_repayment_time_hours: Optional[float] = None
+    expected_repayment_proceeds: float = 0.0
+    repayment_source_desc: str = ""
+    payouts_due_before_repayment: float = 0.0
+    residual_debt_after_repayment: float = 0.0
+    credit_availability_after_draw: float = 0.0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "action_type": self.action_type.value,
@@ -86,6 +121,30 @@ class TreasuryAction:
             "timing_hours": round(self.timing_hours, 2),
             "repayment_feasibility": self.repayment_feasibility,
             "reason_code": self.reason_code,
+            "required_payout_amount": round(self.required_payout_amount, 2),
+            "existing_cash_applied": round(self.existing_cash_applied, 2),
+            "gross_proceeds": round(self.gross_proceeds, 2),
+            "net_proceeds": round(self.net_proceeds, 2),
+            "transaction_cost": round(self.transaction_cost, 2),
+            "availability_delay_hours": round(self.availability_delay_hours, 2),
+            "payment_deadline_hours": round(self.payment_deadline_hours, 2),
+            "funded_by_deadline": round(self.funded_by_deadline, 2),
+            "residual_unfunded_amount": round(self.residual_unfunded_amount, 2),
+            "is_partial_funding": self.is_partial_funding,
+            "secondary_action_needed": self.secondary_action_needed,
+            "principal_borrowed": round(self.principal_borrowed, 2),
+            "apr": self.apr,
+            "interest_cost": round(self.interest_cost, 4),
+            "expected_repayment_time_hours": (
+                round(self.expected_repayment_time_hours, 2)
+                if self.expected_repayment_time_hours is not None
+                else None
+            ),
+            "expected_repayment_proceeds": round(self.expected_repayment_proceeds, 2),
+            "repayment_source_desc": self.repayment_source_desc,
+            "payouts_due_before_repayment": round(self.payouts_due_before_repayment, 2),
+            "residual_debt_after_repayment": round(self.residual_debt_after_repayment, 2),
+            "credit_availability_after_draw": round(self.credit_availability_after_draw, 2),
             "metadata": self.metadata,
         }
 
@@ -101,6 +160,9 @@ class OptimizationResult:
     tier_caps_applied: TierExposureLimits
     tier_breaches_detected: list[str] = field(default_factory=list)
     remediation_notes: list[str] = field(default_factory=list)
+    optimization_mode: str = "SURPLUS_ALLOCATION"  # 'EMERGENCY_FUNDING' vs 'SURPLUS_ALLOCATION'
+    unresolved_shortfall: float = 0.0
+    is_unresolved_shortfall: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,4 +173,7 @@ class OptimizationResult:
             "tier_caps_applied": self.tier_caps_applied.to_dict(),
             "tier_breaches_detected": list(self.tier_breaches_detected),
             "remediation_notes": list(self.remediation_notes),
+            "optimization_mode": self.optimization_mode,
+            "unresolved_shortfall": round(self.unresolved_shortfall, 2),
+            "is_unresolved_shortfall": self.is_unresolved_shortfall,
         }

@@ -17,6 +17,8 @@ from reserve_juggler.tax.tax_profile import (
     TaxJurisdictionRules,
     TaxProfile,
     create_default_corporate_profile,
+    create_statutory_us_corp_profile,
+    create_synthetic_demo_profile,
 )
 
 
@@ -36,6 +38,7 @@ class TaxAdjustedValueResult:
     marginal_tax_rate: float
     jurisdiction_version: str
     has_missing_classification: bool
+    ranking_is_provisional: bool = False
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +55,7 @@ class TaxAdjustedValueResult:
             "marginal_tax_rate": round(self.marginal_tax_rate, 4),
             "jurisdiction_version": self.jurisdiction_version,
             "has_missing_classification": self.has_missing_classification,
+            "ranking_is_provisional": self.ranking_is_provisional,
             "warnings": list(self.warnings),
         }
 
@@ -110,27 +114,39 @@ def evaluate_tax_adjusted_value(
 ) -> TaxAdjustedValueResult:
     """Evaluate expected after-tax net value after financing costs, fees, and liquidity losses.
 
+    Definitions of gross_revenue:
+    - For INTEREST: gross_revenue is interest/coupon income earned.
+    - For DIVIDEND: gross_revenue is dividend distribution received.
+    - For CAPITAL_GAIN: gross_revenue is gross sale proceeds (or capital gain if cost_basis is None).
+      When cost_basis is provided, capital gain/loss = gross_revenue - cost_basis.
+
     Accounts for:
     - Progressive marginal tax brackets (without flat-rate distortion).
     - Interest vs. dividend vs. capital gain classifications.
     - Short-term (<365 days) vs. long-term (>=365 days) capital gains holding rules.
-    - Loss-offset mechanisms against existing gains.
+    - Loss-offset mechanisms against existing gains and statutory limits.
     - Deductibility of bridge financing costs and transaction fees.
     - Missing classification flagging to prevent unverified rankings.
     """
     warnings: list[str] = []
     has_missing_classification = False
+    ranking_is_provisional = False
 
     # Use default corporate profile if none provided, but flag warning
     if tax_profile is None:
         tax_profile = create_default_corporate_profile()
-        warnings.append("No TaxProfile provided; defaulted to standard US_FED_CORP profile.")
+        warnings.append(
+            "No TaxProfile provided; defaulted to synthetic demo profile. "
+            "For production tax calculations, configure create_statutory_us_corp_profile."
+        )
+        ranking_is_provisional = True
 
     rules = tax_profile.jurisdiction_rules
     classification = tax_profile.get_classification(instrument_id)
 
     if classification is None and explicit_income_type is None:
         has_missing_classification = True
+        ranking_is_provisional = True
         warnings.append(
             f"WARNING: Missing tax classification for asset '{instrument_id}'. "
             f"Assuming ordinary interest income; ranking must be verified by audit."
@@ -148,7 +164,8 @@ def evaluate_tax_adjusted_value(
         is_exempt = classification.is_exempt
         is_qualified = classification.is_qualified_dividend
 
-    # 1. Pre-tax Net Value Calculation
+    # 1. Pre-tax Net Cash Value
+    # Cash generated minus explicit out-of-pocket expenses
     net_pre_tax_value = gross_revenue - financing_costs - transaction_fees - liquidation_losses
 
     # 2. Tax Shields from Deductible Expenses
@@ -161,6 +178,7 @@ def evaluate_tax_adjusted_value(
     tax_liability = 0.0
     tax_shield = 0.0
     marginal_rate = 0.0
+    excess_shield = 0.0
 
     if is_exempt:
         # Fully tax-exempt instrument (e.g. municipal paper)
@@ -266,5 +284,6 @@ def evaluate_tax_adjusted_value(
         marginal_tax_rate=marginal_rate,
         jurisdiction_version=rules.rule_version,
         has_missing_classification=has_missing_classification,
+        ranking_is_provisional=ranking_is_provisional,
         warnings=warnings,
     )
