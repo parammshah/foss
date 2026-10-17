@@ -101,6 +101,13 @@ def main() -> int:
         default="reserve_juggler.db",
         help="Path to SQLite learning telemetry database",
     )
+    parser.add_argument(
+        "--tax-mode",
+        type=str,
+        default="statutory",
+        choices=["statutory", "synthetic", "none"],
+        help="Tax profile configuration: statutory (IRS Form 1120), synthetic (demo progressive), or none (unconfigured gross yield provisional)",
+    )
     args = parser.parse_args()
 
     print("=" * 80)
@@ -267,9 +274,16 @@ def main() -> int:
     )
 
     # 7. Execute Decision Cycle
-    print(f"\n[7/10] Executing Full 10-Step Decision Cycle...")
-    from reserve_juggler.tax.tax_profile import create_statutory_us_corp_profile
-    tax_profile = create_statutory_us_corp_profile(entity_id="DIGITAL_BANK_TREASURY_01")
+    print(f"\n[7/10] Executing Full 10-Step Decision Cycle (Tax Mode: {args.tax_mode.upper()})...")
+    if args.tax_mode == "statutory":
+        from reserve_juggler.tax.tax_profile import create_statutory_us_corp_profile
+        tax_profile = create_statutory_us_corp_profile(entity_id="DIGITAL_BANK_TREASURY_01")
+    elif args.tax_mode == "synthetic":
+        from reserve_juggler.tax.tax_profile import create_synthetic_demo_profile
+        tax_profile = create_synthetic_demo_profile(entity_id="DEMO_CORP_01")
+    else:
+        tax_profile = None
+
     res = orchestrator.run_cycle(
         current_state=state,
         as_of_timestamp=as_of_time,

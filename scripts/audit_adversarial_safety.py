@@ -235,12 +235,22 @@ def run_all_adversarial_tests() -> int:
         instrument_id="UNCLASSIFIED_TOKEN",
         tax_profile=None,  # Missing profile
     )
-    c9_pass = tax_res.ranking_is_provisional and tax_res.has_missing_classification
+    orch9 = DecisionOrchestrator()
+    st9 = TreasuryState(operational_cash_usd=25_000_000.0, upcoming_obligations_usd=5_000_000.0, as_of_timestamp=now)
+    res9 = orch9.run_cycle(current_state=st9, as_of_timestamp=now, tax_profile=None, auto_simulate_execution=True)
+
+    c9_pass = (
+        tax_res.ranking_is_provisional
+        and tax_res.has_missing_classification
+        and (tax_res.after_tax_net_value == 100_000.0)
+        and (res9.approval_status == ApprovalStatus.PENDING_APPROVAL.value)
+        and (res9.simulated_outcome is None)
+    )
     log_result(
         9,
-        "Missing tax profile handled as provisional gross yield",
+        "Missing tax profile handled as provisional gross yield with human sign-off",
         c9_pass,
-        f"Ranking provisional: {tax_res.ranking_is_provisional} | Missing classification: {tax_res.has_missing_classification} | Warnings: {tax_res.warnings}",
+        f"Ranking provisional: {tax_res.ranking_is_provisional} | Approval: {res9.approval_status} | Sim outcome: {res9.simulated_outcome} | Warnings: {tax_res.warnings}",
     )
 
     # --------------------------------------------------------------------------

@@ -132,43 +132,96 @@ def evaluate_tax_adjusted_value(
     has_missing_classification = False
     ranking_is_provisional = False
 
-    # Use default corporate profile if none provided, but flag warning
+    # Case 1: Missing TaxProfile -> Fall back safely to gross (pre-tax) yield.
+    # NEVER silently apply synthetic demo assumptions to an operational decision cycle.
     if tax_profile is None:
-        tax_profile = create_default_corporate_profile()
-        warnings.append(
-            "No TaxProfile provided; defaulted to synthetic demo profile. "
-            "For production tax calculations, configure create_statutory_us_corp_profile."
+        net_pre_tax_value = gross_revenue - financing_costs - transaction_fees - liquidation_losses
+        return TaxAdjustedValueResult(
+            gross_revenue=gross_revenue,
+            financing_costs=financing_costs,
+            transaction_fees=transaction_fees,
+            liquidation_losses=liquidation_losses,
+            net_pre_tax_value=net_pre_tax_value,
+            tax_liability=0.0,
+            tax_shield=0.0,
+            after_tax_net_value=net_pre_tax_value,  # Distinguish gross yield from verified after-tax yield
+            effective_tax_rate=0.0,
+            marginal_tax_rate=0.0,
+            jurisdiction_version="UNCONFIGURED_GROSS_ONLY",
+            has_missing_classification=True,
+            ranking_is_provisional=True,
+            warnings=[
+                "NO_TAX_PROFILE: No approved TaxProfile configured. Ranking is calculated on gross yield; "
+                "net-of-tax optimization is provisional and unverified. "
+                "For production tax calculations, configure create_statutory_us_corp_profile."
+            ],
         )
-        ranking_is_provisional = True
+
+    # Case 2: Invalid TaxProfile -> Block net-of-tax calculation, return provisional gross yield with validation errors
+    val_errors = tax_profile.validate()
+    if val_errors:
+        net_pre_tax_value = gross_revenue - financing_costs - transaction_fees - liquidation_losses
+        return TaxAdjustedValueResult(
+            gross_revenue=gross_revenue,
+            financing_costs=financing_costs,
+            transaction_fees=transaction_fees,
+            liquidation_losses=liquidation_losses,
+            net_pre_tax_value=net_pre_tax_value,
+            tax_liability=0.0,
+            tax_shield=0.0,
+            after_tax_net_value=net_pre_tax_value,
+            effective_tax_rate=0.0,
+            marginal_tax_rate=0.0,
+            jurisdiction_version="INVALID_TAX_PROFILE",
+            has_missing_classification=True,
+            ranking_is_provisional=True,
+            warnings=[
+                f"INVALID_TAX_PROFILE: {'; '.join(val_errors)}. "
+                "Net-of-tax optimization blocked; defaulted to provisional gross yield ranking."
+            ],
+        )
 
     rules = tax_profile.jurisdiction_rules
-    classification = tax_profile.get_classification(instrument_id)
 
-    if classification is None and explicit_income_type is None:
-        has_missing_classification = True
+    # Case 3: Synthetic demo profile provided -> evaluate demo bracket math but mark as PROVISIONAL
+    if rules.is_synthetic:
         ranking_is_provisional = True
         warnings.append(
-            f"WARNING: Missing tax classification for asset '{instrument_id}'. "
-            f"Assuming ordinary interest income; ranking must be verified by audit."
+            f"SYNTHETIC_TAX_PROFILE: Profile '{tax_profile.entity_id}' is marked synthetic "
+            f"({rules.jurisdiction_code}). Rankings computed with synthetic assumptions are provisional "
+            "and prohibited from production execution."
         )
-        resolved_income_type = IncomeType.INTEREST
-        is_exempt = False
-        is_qualified = False
-    elif explicit_income_type is not None:
-        resolved_income_type = explicit_income_type
-        if classification is not None:
-            # Preserve existing classification attributes unless explicitly noted, and log auditable note
-            is_exempt = classification.is_exempt
-            is_qualified = classification.is_qualified_dividend
+
+    classification = tax_profile.get_classification(instrument_id)
+
+    if classification is None:
+        has_missing_classification = True
+        ranking_is_provisional = True
+        if explicit_income_type is None:
             warnings.append(
-                f"Auditable Override: Instrument '{instrument_id}' income type overridden to {explicit_income_type.value} "
-                f"while preserving classification attributes (exempt={is_exempt}, qualified={is_qualified})."
+                f"MISSING_ASSET_CLASSIFICATION: Missing tax classification for asset '{instrument_id}'. "
+                f"Assuming ordinary interest income provisionally; ranking must be verified by audit."
             )
-        else:
+            resolved_income_type = IncomeType.INTEREST
             is_exempt = False
             is_qualified = False
+        else:
+            resolved_income_type = explicit_income_type
+            is_exempt = False
+            is_qualified = False
+            warnings.append(
+                f"UNREGISTERED_ASSET_CLASSIFICATION: Asset '{instrument_id}' is not registered in tax profile. "
+                f"Using explicit income type '{explicit_income_type.value}' provisionally; ranking must be verified by audit."
+            )
+    elif explicit_income_type is not None:
+        resolved_income_type = explicit_income_type
+        is_exempt = classification.is_exempt
+        is_qualified = classification.is_qualified_dividend
+        warnings.append(
+            f"Auditable Override: Instrument '{instrument_id}' income type overridden to {explicit_income_type.value} "
+            f"while preserving classification attributes (exempt={is_exempt}, qualified={is_qualified})."
+        )
     else:
-        assert classification is not None
         resolved_income_type = classification.income_type
         is_exempt = classification.is_exempt
         is_qualified = classification.is_qualified_dividend

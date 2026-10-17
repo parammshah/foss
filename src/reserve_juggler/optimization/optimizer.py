@@ -1132,6 +1132,18 @@ def optimize_treasury_actions(
             - selected_action.risk_penalty
         )
 
+    is_provisional_tax = bool(
+        tax_profile is None
+        or getattr(getattr(tax_profile, "jurisdiction_rules", None), "is_synthetic", False)
+        or any(c.ranking_is_provisional for c in candidates)
+    )
+    if is_provisional_tax:
+        selected_action.ranking_is_provisional = True
+        remediation_notes.append(
+            "PROVISIONAL_TAX_ASSUMPTIONS: Missing, unverified, or synthetic tax profile utilized. "
+            "Optimization ranking is provisional (gross yield or demo rules); human approval required prior to trade execution."
+        )
+
     return OptimizationResult(
         selected_action=selected_action,
         candidate_actions=candidates,

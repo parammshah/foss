@@ -230,6 +230,40 @@ class IndependentConstraintValidator:
             else:
                 requires_human = True
 
+        # Gate 6: Tax Safety and Regulatory Authority Gate
+        meta = getattr(proposal, "metadata", {}) or {}
+        tax_status = meta.get("tax_profile_status")
+        is_provisional_tax = bool(
+            meta.get("ranking_is_provisional", False)
+            or getattr(proposal, "ranking_is_provisional", False)
+            or any("PROVISIONAL_TAX" in str(r) for r in getattr(proposal, "reason_codes", []))
+        )
+        if is_provisional_tax or tax_status in ("UNCONFIGURED_GROSS_ONLY", "SYNTHETIC_DEMO", "INVALID"):
+            warnings.append(
+                f"Provisional Tax Assumptions: Tax profile status is '{tax_status or 'PROVISIONAL'}'. "
+                "Ranking is calculated on gross yield; human officer approval is required before execution."
+            )
+            requires_human = True
+            gates.append(
+                HardGateOutcome(
+                    gate_name="TaxSafetyAuthorityGate",
+                    status=GateStatus.PASS,
+                    threshold_value=1.0,
+                    observed_value=0.0,
+                    reason=f"Provisional tax profile ({tax_status or 'PROVISIONAL'}): requires human approval prior to commitment.",
+                )
+            )
+        else:
+            gates.append(
+                HardGateOutcome(
+                    gate_name="TaxSafetyAuthorityGate",
+                    status=GateStatus.PASS,
+                    threshold_value=1.0,
+                    observed_value=1.0,
+                    reason="Verified statutory corporate tax profile.",
+                )
+            )
+
         passed = len(reasons) == 0
         return ValidationResult(
             passed=passed,

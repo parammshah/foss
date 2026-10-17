@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 
 from reserve_juggler.contracts import (
+    ApprovalStatus,
     TreasuryState,
     AssetPosition,
     AssetTier,
@@ -151,12 +152,25 @@ def test_adv_08_credit_line_capacity_enforcement(base_now: datetime):
     assert any("exceeds committed facility limit" in r for r in res.rejection_reasons)
 
 
-def test_adv_09_missing_tax_assumptions_labeled_provisional():
-    """Case 9: Missing tax profile produces provisional ranking with audit warnings."""
+def test_adv_09_missing_tax_assumptions_labeled_provisional(base_now: datetime):
+    """Case 9: Missing tax profile produces provisional ranking with audit warnings and requires human approval in orchestrator."""
+    # 1. Engine level: gross yield returned, not synthetic brackets
     tax_res = evaluate_tax_adjusted_value(gross_revenue=100_000.0, instrument_id="TOKEN", tax_profile=None)
     assert tax_res.ranking_is_provisional
     assert tax_res.has_missing_classification
-    assert len(tax_res.warnings) > 0
+    assert tax_res.after_tax_net_value == 100_000.0  # Gross yield, no synthetic tax subtracted
+    assert any("NO_TAX_PROFILE" in w for w in tax_res.warnings)
+
+    # 2. Orchestration level: missing profile triggers provisional status and requires human sign-off
+    orch = DecisionOrchestrator()
+    st = TreasuryState(operational_cash_usd=25_000_000.0, upcoming_obligations_usd=5_000_000.0, as_of_timestamp=base_now)
+    res = orch.run_cycle(current_state=st, as_of_timestamp=base_now, tax_profile=None, auto_simulate_execution=True)
+    assert res.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res.simulated_outcome is None  # Blocked from auto-execution
+    assert res.decision_record.metadata.get("ranking_is_provisional") is True
+    assert res.decision_record.metadata.get("tax_profile_status") == "UNCONFIGURED_GROSS_ONLY"
+    assert res.explanation is not None
+    assert any("Tax Profile" in d for d in res.explanation.disclosed_missing_information)
 
 
 def test_adv_10_news_deduplication_and_clustering(base_now: datetime):

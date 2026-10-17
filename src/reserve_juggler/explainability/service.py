@@ -240,6 +240,19 @@ class DecisionExplanationService:
             tss_display = "UNAVAILABLE"
             missing_disclosures.append("Treasury Safety Score is UNAVAILABLE due to missing component metrics.")
 
+        meta = getattr(decision_record, "metadata", {}) or {}
+        tax_status = meta.get("tax_profile_status")
+        is_prov_tax = bool(
+            meta.get("ranking_is_provisional", False)
+            or getattr(decision_record, "ranking_is_provisional", False)
+            or any("PROVISIONAL_TAX" in str(r) for r in getattr(decision_record, "reason_codes", []))
+        )
+        if is_prov_tax or tax_status in ("UNCONFIGURED_GROSS_ONLY", "SYNTHETIC_DEMO", "INVALID"):
+            missing_disclosures.append(
+                f"Tax Profile Status: {tax_status or 'PROVISIONAL'}. "
+                "Ranking is calculated on gross yield; operational execution requires an approved statutory corporate TaxProfile."
+            )
+
         if gate_status_str == "PASS":
             rationale_lines.append(f"5. Safety Score: Treasury Safety Score stands at {tss_display}. All mandatory safety gates passed.")
         else:

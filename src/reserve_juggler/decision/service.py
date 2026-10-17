@@ -202,10 +202,21 @@ class TreasuryDecisionService:
             for r in selected_gate_eval.reason_codes:
                 if r not in reason_codes:
                     reason_codes.append(r)
+        # Determine tax profile status
+        tax_status = (
+            "UNCONFIGURED_GROSS_ONLY" if tax_profile is None
+            else ("INVALID" if getattr(tax_profile, "validate", lambda: [])()
+                  else ("SYNTHETIC_DEMO" if getattr(getattr(tax_profile, "jurisdiction_rules", None), "is_synthetic", False)
+                        else "STATUTORY_APPROVED"))
+        )
+
         if opt_result.remediation_notes:
             reason_codes.extend(opt_result.remediation_notes)
-        if selected.ranking_is_provisional or (tax_profile is None):
-            reason_codes.append("WARNING_PROVISIONAL_TAX_RANKING: Missing or synthetic tax profile utilized; ranking must be verified before execution.")
+        if selected.ranking_is_provisional or tax_status != "STATUTORY_APPROVED":
+            reason_codes.append(
+                f"WARNING_PROVISIONAL_TAX_RANKING: Tax profile status is {tax_status}; "
+                "ranking is based on gross yield or demo rules and must be verified before execution."
+            )
 
         # Build DecisionRecord
         record = StandardDecisionRecord(
@@ -227,7 +238,8 @@ class TreasuryDecisionService:
                 "optimization_mode": opt_result.optimization_mode,
                 "is_unresolved_shortfall": opt_result.is_unresolved_shortfall,
                 "unresolved_shortfall": round(opt_result.unresolved_shortfall, 2),
-                "ranking_is_provisional": (tax_profile is None) or selected.ranking_is_provisional or any(c.ranking_is_provisional for c in opt_result.candidate_actions),
+                "tax_profile_status": tax_status,
+                "ranking_is_provisional": (tax_status != "STATUTORY_APPROVED") or selected.ranking_is_provisional or any(c.ranking_is_provisional for c in opt_result.candidate_actions),
                 "human_override": human_override.to_dict() if human_override else None,
             },
         )

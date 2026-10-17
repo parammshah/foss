@@ -102,6 +102,38 @@ class TaxProfile:
         """Register or update an asset tax classification."""
         self.instrument_classifications[classification.asset_id] = classification
 
+    def validate(self) -> list[str]:
+        """Validate completeness, bracket order, rate bounds, and accounting invariants.
+
+        Returns an empty list if valid, or a list of descriptive validation errors.
+        """
+        errors: list[str] = []
+        if not self.entity_id or not self.entity_id.strip():
+            errors.append("TaxProfile entity_id must not be empty.")
+        rules = self.jurisdiction_rules
+        if not rules:
+            errors.append("TaxProfile jurisdiction_rules must not be None.")
+            return errors
+        if not rules.jurisdiction_code or not rules.jurisdiction_code.strip():
+            errors.append("TaxJurisdictionRules jurisdiction_code must not be empty.")
+        if not (1900 <= rules.tax_year <= 2100):
+            errors.append(f"TaxJurisdictionRules tax_year ({rules.tax_year}) outside valid range [1900, 2100].")
+        if not rules.ordinary_income_brackets:
+            errors.append("TaxJurisdictionRules ordinary_income_brackets must not be empty.")
+        else:
+            for idx, b in enumerate(rules.ordinary_income_brackets):
+                if not (0.0 <= b.rate <= 1.0):
+                    errors.append(f"Ordinary income bracket {idx} rate ({b.rate}) outside valid range [0.0, 1.0].")
+                if b.upper_threshold is not None and b.upper_threshold <= b.lower_threshold:
+                    errors.append(f"Ordinary income bracket {idx} upper_threshold ({b.upper_threshold}) <= lower_threshold ({b.lower_threshold}).")
+        if self.accumulated_ordinary_income < 0.0:
+            errors.append(f"accumulated_ordinary_income ({self.accumulated_ordinary_income}) cannot be negative.")
+        if self.accumulated_capital_gains < 0.0:
+            errors.append(f"accumulated_capital_gains ({self.accumulated_capital_gains}) cannot be negative.")
+        if self.accumulated_capital_losses < 0.0:
+            errors.append(f"accumulated_capital_losses ({self.accumulated_capital_losses}) cannot be negative.")
+        return errors
+
 
 def create_statutory_us_corp_profile(
     entity_id: str = "US_CORP_01", tax_year: int = 2026
@@ -145,7 +177,48 @@ def create_statutory_us_corp_profile(
             "IRS Form 1120 Instructions (Corporate Income Tax)",
         ],
     )
-    return TaxProfile(entity_id=entity_id, jurisdiction_rules=rules)
+    profile = TaxProfile(entity_id=entity_id, jurisdiction_rules=rules)
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="OVERNIGHT_REPO",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="Overnight general collateral repo interest (IRC § 61(a)(4))",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="SOVEREIGN_2Y",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="US Treasury note coupon interest (federal taxable)",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="EQUITY_INDEX",
+            income_type=IncomeType.DIVIDEND,
+            is_qualified_dividend=True,
+            notes="Corporate dividend distributions eligible for 50% DRD (IRC § 243)",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="T1_REPO_PORTFOLIO",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="Tier 1 repo portfolio interest income",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="T2_UST_2Y_PORTFOLIO",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="Tier 2 US Treasury benchmark bond interest income",
+        )
+    )
+    return profile
 
 
 def create_synthetic_demo_profile(entity_id: str = "SYNTHETIC_DEMO_01") -> TaxProfile:
@@ -177,9 +250,37 @@ def create_synthetic_demo_profile(entity_id: str = "SYNTHETIC_DEMO_01") -> TaxPr
         is_synthetic=True,
         statutory_citations=["SYNTHETIC DEMO ONLY - NOT A STATUTORY TAX JURISDICTION"],
     )
-    return TaxProfile(entity_id=entity_id, jurisdiction_rules=rules)
+    profile = TaxProfile(entity_id=entity_id, jurisdiction_rules=rules)
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="OVERNIGHT_REPO",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="Synthetic repo demo interest",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="SOVEREIGN_2Y",
+            income_type=IncomeType.INTEREST,
+            is_exempt=False,
+            notes="Synthetic bond demo interest",
+        )
+    )
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="EQUITY_INDEX",
+            income_type=IncomeType.DIVIDEND,
+            is_qualified_dividend=True,
+            notes="Synthetic dividend demo",
+        )
+    )
+    return profile
 
 
 def create_default_corporate_profile(entity_id: str = "TREASURY_CORP_01") -> TaxProfile:
-    """Backward-compatible default corporate profile (delegates to synthetic demo)."""
+    """Backward-compatible default corporate profile (delegates to synthetic demo).
+
+    NOTE: For operational and production decision cycles, configure create_statutory_us_corp_profile.
+    """
     return create_synthetic_demo_profile(entity_id=entity_id)
