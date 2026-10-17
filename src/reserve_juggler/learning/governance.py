@@ -18,6 +18,38 @@ class SafetyInvariantViolation(Exception):
     pass
 
 
+SUPPORTED_SENTINEL_PARAMETERS: Dict[str, Dict[str, Any]] = {
+    "panic_sentinel_alert_threshold": {
+        "types": (int, float),
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "composite risk score (0-100)",
+        "description": "Threshold for triggering panic sentinel alerts and scenario recommendations.",
+    },
+    "stale_hours_threshold": {
+        "types": (int, float),
+        "min": 1.0,
+        "max": 168.0,
+        "unit": "elapsed hours (1h-168h)",
+        "description": "Elapsed hours after which uncorroborated event confidence decays exponentially.",
+    },
+    "high_severity_threshold": {
+        "types": (int, float),
+        "min": 0.10,
+        "max": 0.90,
+        "unit": "normalized score ratio (0.10-0.90)",
+        "description": "Cutoff for classifying risk signal severity as HIGH.",
+    },
+    "critical_severity_threshold": {
+        "types": (int, float),
+        "min": 0.50,
+        "max": 1.0,
+        "unit": "normalized score ratio (0.50-1.0)",
+        "description": "Cutoff for classifying risk signal severity as CRITICAL.",
+    },
+}
+
+
 class SafetyInvariantValidator:
     """
     Enforces non-negotiable safety rules on candidate updates:
@@ -135,6 +167,26 @@ class SafetyInvariantValidator:
         if "multiplier" in param_lower:
             if isinstance(candidate.proposed_value, (int, float)) and candidate.proposed_value <= 0.0:
                 violations.append(f"Multiplier parameter '{candidate.parameter_key}' must be strictly positive (> 0).")
+
+        # 9. Sentinel specific parameter schema and range constraints
+        if candidate.component.upper() == "SENTINEL_RISK":
+            if candidate.parameter_key not in SUPPORTED_SENTINEL_PARAMETERS:
+                violations.append(
+                    f"Unsupported parameter key '{candidate.parameter_key}' for SENTINEL_RISK. "
+                    f"Supported parameters: {', '.join(sorted(SUPPORTED_SENTINEL_PARAMETERS.keys()))}."
+                )
+            else:
+                spec = SUPPORTED_SENTINEL_PARAMETERS[candidate.parameter_key]
+                val = candidate.proposed_value
+                if not isinstance(val, spec["types"]):
+                    violations.append(
+                        f"Parameter '{candidate.parameter_key}' must be numeric (expected {spec['unit']})."
+                    )
+                elif val < spec["min"] or val > spec["max"]:
+                    violations.append(
+                        f"Parameter '{candidate.parameter_key}' value {val} is outside valid range "
+                        f"[{spec['min']}, {spec['max']}] ({spec['unit']})."
+                    )
 
         return (len(violations) == 0, violations)
 

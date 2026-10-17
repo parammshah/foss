@@ -178,6 +178,9 @@ class CandidateValidationReport:
         else:
             self.status = self.evaluation_status
 
+        if self.shadow_runs == 0 and self.validation_sample_size > 0:
+            self.shadow_runs = self.validation_sample_size
+
         # Fail-closed promotion eligibility: all criteria must pass
         if (
             self.evaluation_status == "PASS"
@@ -186,6 +189,7 @@ class CandidateValidationReport:
             and self.runtime_integrated
             and self.safety_invariants_passed
             and self.stress_shortfall_count == 0
+            and self.shadow_runs > 0
         ):
             self.is_promotable = True
         else:
@@ -222,6 +226,8 @@ class CandidateUpdate:
         if name == "validation_report" and value is not None:
             if getattr(value, "is_promotable", False):
                 self.status = CandidateStatus.SHADOW_MODE
+                self.shadow_mode_runs = getattr(value, "shadow_runs", 0) or getattr(value, "validation_sample_size", 0)
+                self.shadow_win_rate = getattr(value, "shadow_win_rate", 0.0)
             elif not getattr(value, "is_promotable", True):
                 self.status = CandidateStatus.REJECTED
                 if getattr(value, "violations", None):

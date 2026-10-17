@@ -1604,4 +1604,438 @@ def test_55_backend_imports_without_streamlit():
     assert "CLEAN_BACKEND_IMPORT_VERIFIED" in res.stdout
 
 
+def test_56_failed_active_version_persistence_cannot_produce_successful_rollback(tmp_path):
+    """
+    Defect: Failed persistence of active version on rollback must NOT return success.
+    Must revert in-memory and live provider state rather than claiming successful restoration.
+    """
+    from reserve_juggler.learning.runtime_registry import GenericRuntimeProvider, RuntimeComponentRegistry
+    from reserve_juggler.learning.sqlite_store import SqliteEventStore, PersistenceError
+
+    db_path = str(tmp_path / "rollback_fail_test.db")
+    store = SqliteEventStore(db_path)
+    registry = RuntimeComponentRegistry(persistence_store=store)
+    provider = GenericRuntimeProvider("FORECASTING", {"param_a": 100.0})
+    registry.register_provider("FORECASTING", provider)
+
+    # Establish v1.0.0 baseline
+    store.save_runtime_version_config("FORECASTING", "v1.0.0", {"param_a": 100.0}, is_active=True)
+    registry._version_configs["FORECASTING"]["v1.0.0"] = {"param_a": 100.0}
+
+    # Promote to v2.0.0
+    registry.apply_runtime_update("FORECASTING", "param_a", 200.0)
+    registry.record_promoted_version("FORECASTING", "v2.0.0")
+    assert registry.get_parameter("FORECASTING", "param_a") == 200.0
+    assert provider.get_parameter("param_a") == 200.0
+
+    # Inject failure into store.set_active_runtime_version
+    def failing_set_active(component, version_tag):
+        raise PersistenceError("Simulated database write error during active version update.")
+    store.set_active_runtime_version = failing_set_active
+
+    # Attempt rollback to v1.0.0
+    ok, msg = registry.restore_runtime_state("FORECASTING", "v1.0.0")
+
+    # MUST NOT report success!
+    assert not ok
+    assert "Persistent store failed to activate version" in msg
+
+    # State MUST be reverted to v2.0.0, NOT left at v1.0.0 while persistence failed!
+    assert registry.get_parameter("FORECASTING", "param_a") == 200.0
+    assert provider.get_parameter("param_a") == 200.0
+
+
+def test_57_compensation_failure_marks_recovery_required_and_blocks_promotion(tmp_path):
+    """
+    Defect: If runtime consumer fails during compensation after a persistence failure,
+    subsystem must be marked RECOVERY_REQUIRED and subsequent updates/promotions blocked.
+    """
+    from reserve_juggler.learning.runtime_registry import RuntimeProvider, RuntimeComponentRegistry
+    from reserve_juggler.learning.sqlite_store import SqliteEventStore, PersistenceError
+
+    class FailingCompensateProvider(RuntimeProvider):
+        def __init__(self):
+            self.val = 50.0
+            self.allow_set = True
+
+        @property
+        def component_name(self) -> str:
+            return "DECISION_OPTIMIZER"
+
+        def get_parameter(self, parameter_key: str, default: Any = None) -> Any:
+            return self.val
+
+        def set_parameter(self, parameter_key: str, new_value: Any) -> Tuple[bool, str]:
+            if not self.allow_set:
+                return False, "Hardware/connection failure during revert"
+            self.val = float(new_value)
+            return True, "Updated"
+
+    db_path = str(tmp_path / "recovery_req.db")
+    store = SqliteEventStore(db_path)
+    registry = RuntimeComponentRegistry(persistence_store=store)
+    provider = FailingCompensateProvider()
+    registry.register_provider("DECISION_OPTIMIZER", provider)
+
+    store.save_runtime_version_config("DECISION_OPTIMIZER", "v1.0.0", {"risk_penalty_weight": 50.0}, is_active=True)
+    registry._version_configs["DECISION_OPTIMIZER"]["v1.0.0"] = {"risk_penalty_weight": 50.0}
+
+    # Update to 80.0
+    registry.apply_runtime_update("DECISION_OPTIMIZER", "risk_penalty_weight", 80.0)
+    registry.record_promoted_version("DECISION_OPTIMIZER", "v2.0.0")
+
+    # Inject store failure AND provider failure during compensation
+    def failing_set_active(component, version_tag):
+        provider.allow_set = False  # Make revert fail!
+        raise PersistenceError("Database crashed")
+    store.set_active_runtime_version = failing_set_active
+
+    ok, msg = registry.restore_runtime_state("DECISION_OPTIMIZER", "v1.0.0")
+    assert not ok
+    assert registry.is_recovery_required("DECISION_OPTIMIZER")
+    assert "Failed to revert live provider" in registry.get_recovery_reason("DECISION_OPTIMIZER")
+
+    # Subsequent updates must be rejected
+    up_ok, up_msg, _ = registry.apply_runtime_update("DECISION_OPTIMIZER", "risk_penalty_weight", 60.0)
+    assert not up_ok
+    assert "RECOVERY_REQUIRED" in up_msg
+
+
+def test_58_three_forecast_observations_with_inconclusive_drift_produces_inconclusive_status_not_stable():
+    """
+    Confirmed defect: 3 valid forecast observations with inconclusive drift must NOT produce STABLE metric status.
+    Metric status must be INCONCLUSIVE, and aggregate system health must be INCONCLUSIVE, not HEALTHY.
+    """
+    from reserve_juggler.learning.metrics import SystemPerformanceEvaluator
+    from reserve_juggler.learning.models import MatchedForecastOutcome, MatchedDecisionOutcome
+    from reserve_juggler.learning.store import EventStore
+
+    store = EventStore()
+    calc = SystemPerformanceEvaluator(store)
+
+    forecasts = [
+        MatchedForecastOutcome(
+            correlation_id=f"FC-{i}",
+            forecast_id=f"FC-{i}_1h",
+            target_timestamp=f"2026-10-18T1{i}:00:00Z",
+            horizon="1h",
+            predicted_net_flow=1_000_000.0,
+            actual_net_flow=1_050_000.0,
+            is_eligible=True,
+            abs_error=50_000.0,
+        )
+        for i in range(3)
+    ]
+    decisions = [
+        MatchedDecisionOutcome(
+            correlation_id=f"DEC-{i}",
+            decision_id=f"DEC-{i}",
+            timestamp=f"2026-10-18T1{i}:00:00Z",
+            selected_action="DRAW_REPO",
+            target_asset="REPO",
+            proposed_amount=1_000_000.0,
+            approval_status="APPROVED",
+            is_executed=True,
+            execution_status="SETTLED",
+            expected_cost=100.0,
+            realized_cost=100.0,
+            hard_gates=[{"status": "PASS"}],
+        )
+        for i in range(3)
+    ]
+
+    report = calc.evaluate(matched_decisions=decisions, matched_forecasts=forecasts)
+
+    assert report.forecast_metrics.valid_evaluations == 3
+    assert report.forecast_metrics.drift_analysis.status == "INCONCLUSIVE"
+    # MUST NOT BE STABLE!
+    assert report.forecast_metrics.status == "INCONCLUSIVE"
+    assert report.overall_system_health == "INCONCLUSIVE"
+
+
+def test_59_sufficient_observations_with_no_drift_produces_stable():
+    """Prove that >= 10 observations with no statistical drift yields STABLE status and HEALTHY health."""
+    from reserve_juggler.learning.metrics import SystemPerformanceEvaluator
+    from reserve_juggler.learning.models import MatchedForecastOutcome, MatchedDecisionOutcome
+    from reserve_juggler.learning.store import EventStore
+
+    store = EventStore()
+    calc = SystemPerformanceEvaluator(store)
+
+    forecasts = [
+        MatchedForecastOutcome(
+            correlation_id=f"FC-{i}",
+            forecast_id=f"FC-{i}_1h",
+            target_timestamp=f"2026-10-18T{i:02d}:00:00Z",
+            horizon="1h",
+            predicted_net_flow=1_000_000.0,
+            actual_net_flow=1_000_000.0 + (1000.0 if i % 2 == 0 else -1000.0),
+            is_eligible=True,
+            abs_error=1000.0,
+        )
+        for i in range(12)
+    ]
+    decisions = [
+        MatchedDecisionOutcome(
+            correlation_id=f"DEC-{i}",
+            decision_id=f"DEC-{i}",
+            timestamp=f"2026-10-18T{i:02d}:00:00Z",
+            selected_action="DRAW_REPO",
+            target_asset="REPO",
+            proposed_amount=1_000_000.0,
+            approval_status="APPROVED",
+            is_executed=True,
+            execution_status="SETTLED",
+            expected_cost=100.0,
+            realized_cost=100.0,
+            hard_gates=[{"status": "PASS"}],
+        )
+        for i in range(12)
+    ]
+
+    report = calc.evaluate(matched_decisions=decisions, matched_forecasts=forecasts)
+    assert report.forecast_metrics.valid_evaluations == 12
+    assert report.forecast_metrics.drift_analysis.status == "STABLE"
+    assert report.forecast_metrics.status == "STABLE"
+    assert report.overall_system_health == "HEALTHY"
+
+
+def test_60_sufficient_observations_with_confirmed_drift_produces_degraded():
+    """Prove that >= 10 observations with severe error drift yields DEGRADED status and WARNING health."""
+    from reserve_juggler.learning.metrics import SystemPerformanceEvaluator
+    from reserve_juggler.learning.models import MatchedForecastOutcome, MatchedDecisionOutcome
+    from reserve_juggler.learning.store import EventStore
+
+    store = EventStore()
+    calc = SystemPerformanceEvaluator(store)
+
+    # Reference errors tiny (~100), test errors massive (~500,000)
+    forecasts = []
+    for i in range(12):
+        err = 100.0 + i if i < 6 else 500_000.0 + i * 1000.0
+        forecasts.append(
+            MatchedForecastOutcome(
+                correlation_id=f"FC-{i}",
+                forecast_id=f"FC-{i}_1h",
+                target_timestamp=f"2026-10-18T{i:02d}:00:00Z",
+                horizon="1h",
+                predicted_net_flow=1_000_000.0,
+                actual_net_flow=1_000_000.0 + err,
+                is_eligible=True,
+                abs_error=err,
+            )
+        )
+    decisions = [
+        MatchedDecisionOutcome(
+            correlation_id=f"DEC-{i}",
+            decision_id=f"DEC-{i}",
+            timestamp=f"2026-10-18T{i:02d}:00:00Z",
+            selected_action="DRAW_REPO",
+            target_asset="REPO",
+            proposed_amount=1_000_000.0,
+            approval_status="APPROVED",
+            is_executed=True,
+            execution_status="SETTLED",
+            expected_cost=100.0,
+            realized_cost=100.0,
+            hard_gates=[{"status": "PASS"}],
+        )
+        for i in range(12)
+    ]
+
+    report = calc.evaluate(matched_decisions=decisions, matched_forecasts=forecasts)
+    assert report.forecast_metrics.valid_evaluations == 12
+    assert report.forecast_metrics.drift_analysis.drift_detected is True
+    assert report.forecast_metrics.status == "DEGRADED"
+    assert report.overall_system_health == "WARNING"
+
+
+def test_61_sentinel_stale_hours_threshold_evaluated_in_elapsed_hours():
+    """
+    Confirmed defect: stale_hours_threshold must NOT be evaluated as a composite risk score threshold.
+    It must operate in elapsed hours, evaluating signal age decay.
+    """
+    from reserve_juggler.learning.evaluation_engine import CandidateEvaluationEngine
+    from reserve_juggler.learning.models import CandidateUpdate
+
+    engine = CandidateEvaluationEngine()
+
+    cand = CandidateUpdate(
+        candidate_id="CAND-STALE-01",
+        component="SENTINEL_RISK",
+        parameter_key="stale_hours_threshold",
+        current_value=48.0,
+        proposed_value=24.0,  # Tighten staleness decay to 24 hours
+        description="Calibrate news staleness decay window to 24 hours",
+        author="Risk Modeler",
+        created_at="2026-10-18T00:00:00Z",
+    )
+
+    report = engine.evaluate_candidate(cand, sample_size=30)
+    # Metric must be stale signal rejection / decay evaluation, NOT corroboration rate of risk scores!
+    assert report.metric_name == "stale_signal_rejection_f1"
+    assert report.shadow_runs > 0
+    assert report.candidate_metric > 0.0
+
+
+def test_62_sentinel_unsupported_parameters_rejected():
+    """Prove that unsupported parameter keys for SENTINEL_RISK are rejected explicitly."""
+    from reserve_juggler.learning.governance import SafetyInvariantValidator
+    from reserve_juggler.learning.evaluation_engine import CandidateEvaluationEngine
+    from reserve_juggler.learning.models import CandidateUpdate
+
+    validator = SafetyInvariantValidator()
+    engine = CandidateEvaluationEngine(validator=validator)
+
+    cand = CandidateUpdate(
+        candidate_id="CAND-BAD-01",
+        component="SENTINEL_RISK",
+        parameter_key="unsupported_heuristic_cutoff",
+        current_value=10.0,
+        proposed_value=20.0,
+        description="Invalid parameter",
+        author="Tester",
+        created_at="2026-10-18T00:00:00Z",
+    )
+
+    # Static validation rejects
+    passed, violations = validator.validate_candidate(cand)
+    assert not passed
+    assert any("Unsupported parameter key" in v for v in violations)
+
+    # Evaluation engine also rejects and does not promote
+    report = engine.evaluate_candidate(cand)
+    assert report.evaluation_status == "FAIL"
+    assert not report.is_promotable
+    assert any("Unsupported parameter" in v for v in report.violations)
+
+
+def test_63_sentinel_high_and_critical_severity_thresholds_evaluated_as_severity_cutoffs():
+    """Prove severity cutoffs operate in normalized severity domain (0.0 to 1.0) and evaluate precision."""
+    from reserve_juggler.learning.evaluation_engine import CandidateEvaluationEngine
+    from reserve_juggler.learning.models import CandidateUpdate
+
+    engine = CandidateEvaluationEngine()
+
+    cand = CandidateUpdate(
+        candidate_id="CAND-SEV-01",
+        component="SENTINEL_RISK",
+        parameter_key="high_severity_threshold",
+        current_value=0.60,
+        proposed_value=0.65,
+        description="Refine high severity boundary",
+        author="Risk Modeler",
+        created_at="2026-10-18T00:00:00Z",
+    )
+
+    report = engine.evaluate_candidate(cand, sample_size=30)
+    assert report.metric_name == "severity_classification_precision"
+    assert report.shadow_runs > 0
+
+
+def test_64_financial_reconciliation_failure_blocks_candidate_promotion():
+    """Prove that if financial reconciliation fails across any strategy, candidate cannot pass or be promoted."""
+    from reserve_juggler.learning.evaluation_engine import CandidateEvaluationEngine
+    from reserve_juggler.learning.models import CandidateUpdate
+    from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+
+    class DiscrepancyStressEngine(StressLabSimulationEngine):
+        def run_simulation(self, *args, **kwargs):
+            res = super().run_simulation(*args, **kwargs)
+            # Inject reconciliation discrepancy in Greedy Yield outcome
+            strat = res["strategies"]["greedy_yield"]
+            strat.reconciliation_error = 1_584_000.0
+            strat.is_reconciled = False
+            res["all_strategies_reconciled"] = False
+            return res
+
+    engine = CandidateEvaluationEngine(stress_engine=DiscrepancyStressEngine())
+
+    cand = CandidateUpdate(
+        candidate_id="CAND-DEC-01",
+        component="DECISION_OPTIMIZER",
+        parameter_key="liquidity_buffer_multiplier",
+        current_value=1.25,
+        proposed_value=1.35,
+        description="Buffer increase",
+        author="Treasurer",
+        created_at="2026-10-18T00:00:00Z",
+    )
+
+    report = engine.evaluate_candidate(cand, sample_size=30)
+    assert report.evaluation_status == "FAIL"
+    assert not report.is_promotable
+    assert any("Financial reconciliation violation" in v for v in report.violations)
+
+
+def test_65_all_mandatory_stress_scenarios_reconcile_and_distinguish_deficits_from_unpaid_payouts():
+    """
+    Mandatory stress scenario suite:
+    1. Normal conditions
+    2. Deposit shock
+    3. Rate shock
+    4. Delayed repo
+    5. Unavailable credit
+    6. Equity drawdown
+    7. Severe combined scenario
+    8. Missing reserve floor fails closed
+    Verify every scenario reconciles and reserve deficit is distinct from unpaid customer obligations.
+    """
+    from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+    from reserve_juggler.contracts import TreasuryState
+    import pytest
+
+    engine = StressLabSimulationEngine()
+
+    state = TreasuryState(
+        timestamp="2026-10-18T12:00:00Z",
+        available_cash=45_000_000.0,
+        asset_positions=[],
+        obligations=[],
+        authorized_credit_availability=50_000_000.0,
+        protected_reserve_floor=25_000_000.0,
+    )
+
+    scenarios = [
+        {"name": "Normal", "dep": 0.0, "rate": 0.0, "repo": 0, "cred": False, "eq": 0.0},
+        {"name": "Deposit Shock", "dep": 40.0, "rate": 0.0, "repo": 0, "cred": False, "eq": 0.0},
+        {"name": "Rate Shock", "dep": 0.0, "rate": 200.0, "repo": 0, "cred": False, "eq": 0.0},
+        {"name": "Delayed Repo", "dep": 0.0, "rate": 0.0, "repo": 2, "cred": False, "eq": 0.0},
+        {"name": "Unavailable Credit", "dep": 0.0, "rate": 0.0, "repo": 0, "cred": True, "eq": 0.0},
+        {"name": "Equity Drawdown", "dep": 0.0, "rate": 0.0, "repo": 0, "cred": False, "eq": 30.0},
+        {"name": "Severe Combined", "dep": 60.0, "rate": 150.0, "repo": 2, "cred": True, "eq": 30.0},
+    ]
+
+    for sc in scenarios:
+        sim = engine.run_simulation(
+            base_treasury_state=state,
+            deposit_shock_pct=sc["dep"],
+            rate_shock_bps=sc["rate"],
+            repo_delay_days=sc["repo"],
+            credit_unavailable=sc["cred"],
+            equity_drawdown_pct=sc["eq"],
+        )
+        assert sim["all_strategies_reconciled"], f"Scenario {sc['name']} failed reconciliation"
+        for strat_name, strat in sim["strategies"].items():
+            assert strat.is_reconciled, f"{strat_name} failed in {sc['name']}"
+            assert strat.reconciliation_error == 0.0
+            # Reserve deficit is distinct from unpaid customer obligations
+            assert hasattr(strat, "reserve_deficit")
+            assert hasattr(strat, "unpaid_payout_amount")
+
+    # Missing reserve floor fails closed with ValueError
+    bad_state = TreasuryState(
+        timestamp="2026-10-18T12:00:00Z",
+        available_cash=45_000_000.0,
+        asset_positions=[],
+        obligations=[],
+        authorized_credit_availability=50_000_000.0,
+        protected_reserve_floor=None,
+    )
+    with pytest.raises(ValueError) as excinfo:
+        engine.run_simulation(base_treasury_state=bad_state)
+    assert "Required protected_reserve_floor is missing" in str(excinfo.value)
+
+
+
 

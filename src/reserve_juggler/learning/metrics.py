@@ -160,6 +160,13 @@ class SystemPerformanceEvaluator:
                     details=f"Sample size ({valid_evaluations} < {self.MIN_SAMPLES_FOR_DRIFT}) insufficient for conclusive KS test.",
                 )
 
+            if drift_analysis.drift_detected:
+                f_status = "DEGRADED"
+            elif drift_analysis.status == "INCONCLUSIVE":
+                f_status = "INCONCLUSIVE"
+            else:
+                f_status = "STABLE"
+
             f_metrics = ForecastPerformanceMetrics(
                 total_predictions=total_predictions,
                 valid_evaluations=valid_evaluations,
@@ -172,7 +179,7 @@ class SystemPerformanceEvaluator:
                 interval_coverage_pct=round(coverage_pct, 1) if coverage_pct is not None else None,
                 nominal_confidence=0.90,
                 drift_analysis=drift_analysis,
-                status="DEGRADED" if drift_analysis.drift_detected else "STABLE",
+                status=f_status,
             )
 
         # 3. Decision Evaluation
@@ -395,8 +402,8 @@ def calculate_forecast_metrics(
     if sum_actuals > 0:
         wape = sum(errors) / sum_actuals * 100.0
     else:
-        wape = 100.0 if sum(errors) > 0 else 0.0
-        exclusion_reasons.append("Zero actual outflow across all observations; WAPE bounded at 100.0%.")
+        wape = 100.0 if sum(errors) > 0 else None
+        exclusion_reasons.append("Zero actual outflow across all observations; WAPE bounded at 100.0% if errors present, otherwise undefined.")
 
     # Guard zero actuals
     non_zero = [(e, a) for e, a in zip(errors, actuals) if a > 1e-6]
@@ -435,7 +442,12 @@ def calculate_forecast_metrics(
             details=f"Insufficient sample size ({valid_evaluations} < 10) for statistical drift analysis.",
         )
 
-    status = "STABLE" if not drift_analysis.drift_detected else "DEGRADED"
+    if drift_analysis.drift_detected:
+        status = "DEGRADED"
+    elif drift_analysis.status == "INCONCLUSIVE":
+        status = "INCONCLUSIVE"
+    else:
+        status = "STABLE"
 
     return ForecastPerformanceMetrics(
         total_predictions=total_predictions,

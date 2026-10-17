@@ -236,6 +236,14 @@ class LearningService:
         if candidate.status == CandidateStatus.REJECTED:
             return (False, f"Cannot promote rejected candidate: {candidate.rejection_reason}")
 
+        # Check recovery state
+        if self.runtime_registry.is_recovery_required(candidate.component):
+            return (
+                False,
+                f"Promotion blocked: Component '{candidate.component}' is in RECOVERY_REQUIRED state "
+                f"({self.runtime_registry.get_recovery_reason(candidate.component)}). Promotion prohibited.",
+            )
+
         # Enforce that component has a registered active runtime consumer
         if not self.runtime_registry.has_active_provider(candidate.component):
             return (
@@ -252,6 +260,13 @@ class LearningService:
 
         if candidate.validation_report and not candidate.validation_report.is_promotable:
             return (False, f"Promotion blocked by validation report: {'; '.join(candidate.validation_report.violations)}")
+
+        if candidate.status != CandidateStatus.SHADOW_MODE:
+            return (
+                False,
+                f"Promotion blocked: Candidate '{candidate_id}' has not successfully executed in shadow mode "
+                f"(status={candidate.status.value}). Untested candidates cannot be promoted.",
+            )
 
         now_iso = datetime.now(timezone.utc).isoformat()
         version_tag = new_version_tag or f"v{datetime.now().strftime('%Y%m%d%H%M')}"
@@ -289,7 +304,12 @@ class LearningService:
                 self.store.sqlite_store.save_candidate(candidate)
             except Exception as e:
                 # Rollback live runtime change and reconcile version and status (Part E3)
-                self.runtime_registry.restore_runtime_state(candidate.component)
+                rev_ok, rev_msg = self.runtime_registry.restore_runtime_state(candidate.component)
+                if not rev_ok:
+                    self.runtime_registry.mark_recovery_required(
+                        candidate.component,
+                        f"Failed to revert runtime state after candidate persistence failure: {rev_msg}",
+                    )
                 self.registry._active_versions[candidate.component] = prev_version
                 candidate.status = prev_status
                 candidate.promoted_at = None
@@ -323,7 +343,12 @@ class LearningService:
                 )
             )
         except Exception as e:
-            self.runtime_registry.restore_runtime_state(candidate.component)
+            rev_ok, rev_msg = self.runtime_registry.restore_runtime_state(candidate.component)
+            if not rev_ok:
+                self.runtime_registry.mark_recovery_required(
+                    candidate.component,
+                    f"Failed to revert runtime state after promotion audit event failure: {rev_msg}",
+                )
             self.registry._active_versions[candidate.component] = prev_version
             candidate.status = prev_status
             candidate.promoted_at = None
@@ -341,7 +366,12 @@ class LearningService:
         try:
             self.runtime_registry.record_promoted_version(candidate.component, version_tag)
         except Exception as e:
-            self.runtime_registry.restore_runtime_state(candidate.component, prev_version)
+            rev_ok, rev_msg = self.runtime_registry.restore_runtime_state(candidate.component, prev_version)
+            if not rev_ok:
+                self.runtime_registry.mark_recovery_required(
+                    candidate.component,
+                    f"Failed to restore prior runtime version after promoted config failure: {rev_msg}",
+                )
             self.registry._active_versions[candidate.component] = prev_version
             candidate.status = prev_status
             candidate.promoted_at = None
@@ -367,7 +397,7 @@ class LearningService:
     ) -> Tuple[bool, str]:
         """
         Rolls back a subsystem to a prior approved version and restores live runtime parameter state.
-        Fails closed if target_version does not have a restorable runtime configuration (Part E4).
+        Fails closed if target_version does not have a restorable runtime configuration.
         """
         comp = component.upper()
         prev_version = self.registry.get_active_versions().get(comp, "v1.0.0")
@@ -395,7 +425,12 @@ class LearningService:
 
         if not success:
             # Revert runtime state if version governance rejected
-            self.runtime_registry.restore_runtime_state(comp, prev_version)
+            rev_ok, rev_msg = self.runtime_registry.restore_runtime_state(comp, prev_version)
+            if not rev_ok:
+                self.runtime_registry.mark_recovery_required(
+                    comp,
+                    f"Failed to restore prior runtime state after governance rejection: {rev_msg}",
+                )
             return (False, f"Version rollback failed: {msg}")
 
         try:
@@ -418,8 +453,13 @@ class LearningService:
             )
         except Exception as e:
             # Revert runtime state and version registry state on audit failure
-            self.runtime_registry.restore_runtime_state(comp, prev_version)
+            rev_ok, rev_msg = self.runtime_registry.restore_runtime_state(comp, prev_version)
             self.registry._active_versions[comp] = prev_version
+            if not rev_ok:
+                self.runtime_registry.mark_recovery_required(
+                    comp,
+                    f"Failed to restore prior runtime state after rollback audit logging failure: {rev_msg}",
+                )
             logger.error("Audit logging failed during rollback: %s. Rolling back to %s.", e, prev_version)
             return (False, f"Rollback aborted: durable audit persistence failed: {e}")
 

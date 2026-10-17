@@ -212,6 +212,8 @@ class StressLabSimulationEngine:
         cash_start_3 = base_treasury_state.available_cash * mult_factor
         rem_repo_ovn_3 = 30_000_000.0 * mult_factor
         rem_repo_30d_3 = 25_000_000.0 * mult_factor
+        init_repo_ovn_3 = rem_repo_ovn_3
+        init_repo_30d_3 = rem_repo_30d_3
 
         # Conserve starting total assets ($220M) by adjusting 2Y sovereign bond allocation
         buffer_shift = (base_treasury_state.available_cash + 30_000_000.0 + 25_000_000.0) - (cash_start_3 + rem_repo_ovn_3 + rem_repo_30d_3)
@@ -259,7 +261,7 @@ class StressLabSimulationEngine:
         unpaid_payouts_3 = max(0.0, -net_cash_3)
         deficit_3 = max(0.0, reserve_floor - final_cash_3)
         shortfall_3 = deficit_3
-        liquid_cash_3 = cash_start_3 + inflows + credit_drawn_3 + (30_000_000.0 - rem_repo_ovn_3) + (25_000_000.0 - rem_repo_30d_3 - repo_penalty_3)
+        liquid_cash_3 = cash_start_3 + inflows + credit_drawn_3 + (init_repo_ovn_3 - rem_repo_ovn_3) + (init_repo_30d_3 - rem_repo_30d_3 - repo_penalty_3)
         payouts_paid_3 = min(shocked_outflow, liquid_cash_3)
         unpaid_payouts_3 = max(0.0, shocked_outflow - liquid_cash_3)
 

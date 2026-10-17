@@ -168,6 +168,27 @@ class RuntimeComponentRegistry:
             k: [copy.deepcopy(v)] for k, v in self._runtime_configs.items()
         }
 
+        # Track components requiring recovery due to unrecoverable state/compensation failures
+        self._recovery_required: Dict[str, str] = {}
+
+    def mark_recovery_required(self, component: str, reason: str) -> None:
+        """Marks a component as requiring manual recovery, blocking any further promotion."""
+        comp = component.upper()
+        self._recovery_required[comp] = reason
+        logger.critical("Subsystem %s marked RECOVERY_REQUIRED: %s", comp, reason)
+
+    def is_recovery_required(self, component: str) -> bool:
+        """Returns True if the component has had an unrecoverable state failure."""
+        return component.upper() in self._recovery_required
+
+    def get_recovery_reason(self, component: str) -> Optional[str]:
+        """Returns the failure reason if the component requires recovery."""
+        return self._recovery_required.get(component.upper())
+
+    def clear_recovery_required(self, component: str) -> None:
+        """Clears the recovery-required flag after repair."""
+        self._recovery_required.pop(component.upper(), None)
+
     def record_promoted_version(self, component: str, version_tag: str) -> None:
         """Durably associates the active runtime configuration with a promoted version."""
         comp = component.upper()
@@ -188,6 +209,8 @@ class RuntimeComponentRegistry:
     def get_component_status(self, component: str) -> str:
         """Returns the truthful integration status of a subsystem."""
         comp = component.upper()
+        if self.is_recovery_required(comp):
+            return "RECOVERY_REQUIRED"
         if comp in self._providers:
             return "CONNECTED"
         if comp in self._runtime_configs:
@@ -264,6 +287,14 @@ class RuntimeComponentRegistry:
         Returns (success, message, old_value).
         """
         comp = component.upper()
+        if self.is_recovery_required(comp):
+            return (
+                False,
+                f"Component '{comp}' is in RECOVERY_REQUIRED state ({self.get_recovery_reason(comp)}). "
+                f"Cannot apply runtime updates until repaired.",
+                None,
+            )
+
         if comp not in self._runtime_configs:
             return (False, f"Component '{comp}' is not a recognized subsystem.", None)
 
@@ -296,11 +327,15 @@ class RuntimeComponentRegistry:
 
     def restore_runtime_state(self, component: str, target_version: Optional[str] = None) -> Tuple[bool, str]:
         """
-        Restores the operational runtime configuration on rollback (Part B3, E4).
+        Restores the operational runtime configuration on rollback.
         If target_version is provided, restores the configuration durably associated with that version.
         Otherwise restores the immediately prior snapshot.
+        Maintains strict transactional consistency: if persistent store write fails, reverts in-memory
+        and live provider state, returning failure.
         """
         comp = component.upper()
+        original_snapshot = copy.deepcopy(self._runtime_configs.get(comp, {}))
+
         if target_version:
             if comp not in self._version_configs or target_version not in self._version_configs[comp]:
                 return (False, f"Target version '{target_version}' has no valid restorable runtime configuration for {comp}.")
@@ -311,19 +346,60 @@ class RuntimeComponentRegistry:
             self._history_snapshots[comp].pop()
             target_snapshot = self._history_snapshots[comp][-1]
 
-        # Restore on live provider if registered
+        # 1. Restore on live provider if registered
+        applied_keys = []
         if comp in self._providers:
             for k, v in target_snapshot.items():
                 ok, p_msg = self._providers[comp].set_parameter(k, v)
                 if not ok:
+                    # Compensate: revert previously applied parameters back to original
+                    comp_failed = False
+                    for rev_k in applied_keys:
+                        rev_v = original_snapshot.get(rev_k)
+                        if rev_v is not None:
+                            ok_rev, _ = self._providers[comp].set_parameter(rev_k, rev_v)
+                            if not ok_rev:
+                                comp_failed = True
+                    if comp_failed:
+                        self.mark_recovery_required(
+                            comp,
+                            f"Live runtime provider compensation failed after failure applying '{k}': {p_msg}",
+                        )
                     return (False, f"Live runtime consumer failed to apply parameter '{k}' on rollback: {p_msg}")
+                applied_keys.append(k)
 
+        # 2. Update in-memory configuration
         self._runtime_configs[comp] = copy.deepcopy(target_snapshot)
+
+        # 3. Transactionally persist active version to durable store
         if target_version and self._store:
             try:
                 self._store.set_active_runtime_version(comp, target_version)
             except Exception as e:
-                logger.error("Failed to update active version in persistent store on rollback: %s", e)
+                # PERSISTENCE FAILED: Must NOT report successful rollback!
+                # Revert in-memory configuration back to original
+                self._runtime_configs[comp] = copy.deepcopy(original_snapshot)
+
+                # Revert live provider back to original
+                revert_failed = False
+                if comp in self._providers:
+                    for k, v in original_snapshot.items():
+                        ok_p, p_msg = self._providers[comp].set_parameter(k, v)
+                        if not ok_p:
+                            revert_failed = True
+
+                if revert_failed:
+                    self.mark_recovery_required(
+                        comp,
+                        f"Failed to revert live provider after active-version persistence failure: {e}",
+                    )
+
+                logger.error(
+                    "Persistent store failed to activate version %s on rollback: %s. State compensated.",
+                    target_version,
+                    e,
+                )
+                return (False, f"Persistent store failed to activate version '{target_version}' on rollback: {e}")
 
         version_str = f"to version {target_version}" if target_version else "to previous snapshot"
         logger.info("Runtime state restored for %s %s.", comp, version_str)
