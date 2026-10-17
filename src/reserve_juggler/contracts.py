@@ -21,7 +21,7 @@ from __future__ import annotations
 import abc
 from datetime import datetime, timezone
 from enum import Enum, IntEnum
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -213,6 +213,7 @@ class Obligation(CanonicalBaseModel):
     description: str = ""
     priority: str = "MANDATORY"
     is_mandatory: bool = True
+    is_settled: bool = False
     beneficiary: str = ""
     counterparty: str = ""
     obligation_type: ObligationType = ObligationType.OTHER
@@ -222,12 +223,13 @@ class Obligation(CanonicalBaseModel):
     def sync_obligation_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
             # Sync amount and amount_usd
-            amt = data.get("amount") or data.get("amount_usd", 0.0)
+            amt = data.get("amount") if data.get("amount") is not None else data.get("amount_usd", 0.0)
             data["amount"] = float(amt)
             data["amount_usd"] = float(amt)
-            # Sync due_time
-            if "due_time" in data and "due_timestamp" not in data:
-                data["due_timestamp"] = data["due_time"]
+            # Sync timestamps
+            ts = data.get("timestamp") or data.get("due_time") or data.get("due_timestamp")
+            if ts:
+                data["due_timestamp"] = ts
             # Sync mandatory priority
             if "is_mandatory" in data:
                 data["priority"] = "MANDATORY" if data["is_mandatory"] else "OPERATIONAL"
@@ -237,6 +239,10 @@ class Obligation(CanonicalBaseModel):
 
     @property
     def due_time(self) -> datetime:
+        return ensure_utc(self.due_timestamp)
+
+    @property
+    def timestamp(self) -> datetime:
         return ensure_utc(self.due_timestamp)
 
 
@@ -258,6 +264,8 @@ class AssetPosition(CanonicalBaseModel):
     annual_yield_or_return: float = 0.0
     liquidation_haircut_rate: float = 0.0
     early_exit_penalty_pct: float = 0.0
+    early_exit_fee_rate: float = 0.0
+    accrued_income_usd: float = 0.0
     duration_years: float = 0.0
     volatility_annual_pct: float = 0.0
     instrument_type: str = "cash"
@@ -282,7 +290,7 @@ class AssetPosition(CanonicalBaseModel):
             data["annual_yield_or_return"] = float(yd)
 
             # Exit fees
-            ef = data.get("early_exit_penalty_pct") if data.get("early_exit_penalty_pct") is not None else data.get("exit_fees", 0.0)
+            ef = data.get("early_exit_penalty_pct") if data.get("early_exit_penalty_pct") is not None else data.get("early_exit_fee_rate", data.get("exit_fees", 0.0))
             data["early_exit_penalty_pct"] = float(ef)
 
             # Duration
@@ -357,22 +365,116 @@ class AssetPosition(CanonicalBaseModel):
         return ensure_utc(self.maturity_timestamp) if self.maturity_timestamp else None
 
 
+class AssetPositionCollection(list):
+    """Hybrid collection behaving as a list of AssetPositions with dict-like key lookup by asset_id."""
+
+    def __init__(self, items: Union[Dict[str, AssetPosition], Sequence[AssetPosition], None] = None) -> None:
+        if items is None:
+            super().__init__()
+        elif isinstance(items, dict):
+            super().__init__(items.values())
+        else:
+            super().__init__(items)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, str):
+            for item in self:
+                if getattr(item, "asset_id", None) == key:
+                    return item
+            raise KeyError(f"Asset position '{key}' not found in positions.")
+        return super().__getitem__(key)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if isinstance(key, str):
+            for idx, item in enumerate(self):
+                if getattr(item, "asset_id", None) == key:
+                    super().__setitem__(idx, value)
+                    return
+            self.append(value)
+            return
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        if isinstance(key, str):
+            for idx, item in enumerate(self):
+                if getattr(item, "asset_id", None) == key:
+                    super().__delitem__(idx)
+                    return
+            raise KeyError(f"Asset position '{key}' not found in positions.")
+        super().__delitem__(key)
+
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, str):
+            return any(getattr(item, "asset_id", None) == key for item in self)
+        return super().__contains__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def values(self) -> List[AssetPosition]:
+        return list(self)
+
+    def items(self) -> List[Tuple[str, AssetPosition]]:
+        return [(p.asset_id, p) for p in self]
+
+    def keys(self) -> List[str]:
+        return [p.asset_id for p in self]
+
+    def copy(self) -> "AssetPositionCollection":
+        return AssetPositionCollection(list(self))
+
+    def __copy__(self) -> "AssetPositionCollection":
+        return AssetPositionCollection(list(self))
+
+    def __deepcopy__(self, memo: Any) -> "AssetPositionCollection":
+        import copy
+        return AssetPositionCollection([copy.deepcopy(x, memo) for x in self])
+
+
 class CreditFacility(CanonicalBaseModel):
+    facility_id: str = "EMERGENCY_LOC_1"
+    is_available: bool = True
     committed_limit_usd: float = 50_000_000.0
     drawn_amount_usd: float = 0.0
+    utilized_amount_usd: float = 0.0
     apr: float = 0.12
+    fee_rate: float = 0.0025
     facility_name: str = "Standard Emergency Overdraft"
     is_active: bool = True
+    min_draw_usd: float = 0.0
+    max_draw_usd: float = 0.0
+    permitted_draw_rules: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_credit_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            drawn = data.get("drawn_amount_usd") if data.get("drawn_amount_usd") is not None else data.get("utilized_amount_usd", 0.0)
+            data["drawn_amount_usd"] = float(drawn)
+            data["utilized_amount_usd"] = float(drawn)
+            if "is_available" in data:
+                data["is_active"] = bool(data["is_available"])
+            elif "is_active" in data:
+                data["is_available"] = bool(data["is_active"])
+        return data
 
     @property
     def available_credit_usd(self) -> float:
-        if not self.is_active:
+        if not (self.is_available and self.is_active):
             return 0.0
         return max(0.0, self.committed_limit_usd - self.drawn_amount_usd)
+
+    @property
+    def available_capacity_usd(self) -> float:
+        return self.available_credit_usd
 
 
 class TreasuryState(CanonicalBaseModel):
     timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    operational_cash_usd: float = 0.0
     tier0_cash_usd: float = 0.0
     available_cash: float = 0.0
     tier1_repo_usd: float = 0.0
@@ -382,9 +484,10 @@ class TreasuryState(CanonicalBaseModel):
     emergency_credit_drawn_usd: float = 0.0
     authorized_credit_availability: float = 50_000_000.0
     credit_facility: Optional[CreditFacility] = None
-    asset_positions: List[AssetPosition] = Field(default_factory=list)
+    asset_positions: AssetPositionCollection = Field(default_factory=AssetPositionCollection)
     obligations: List[Obligation] = Field(default_factory=list)
     future_obligations: List[Obligation] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
     data_quality_warnings: List[str] = Field(default_factory=list)
     protected_reserve_floor: Optional[float] = None
     core_capital_pct: float = 0.70
@@ -396,11 +499,20 @@ class TreasuryState(CanonicalBaseModel):
     @classmethod
     def sync_treasury_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            cash = data.get("tier0_cash_usd") if data.get("tier0_cash_usd") is not None else data.get("available_cash", 0.0)
+            # Cash
+            cash = data.get("operational_cash_usd")
+            if cash is None:
+                cash = data.get("tier0_cash_usd")
+            if cash is None:
+                cash = data.get("available_cash", 0.0)
+            data["operational_cash_usd"] = float(cash)
             data["tier0_cash_usd"] = float(cash)
             data["available_cash"] = float(cash)
 
-            cred = data.get("emergency_credit_available_usd") if data.get("emergency_credit_available_usd") is not None else data.get("authorized_credit_availability", 50_000_000.0)
+            # Credit
+            cred = data.get("emergency_credit_available_usd")
+            if cred is None:
+                cred = data.get("authorized_credit_availability", 50_000_000.0)
             data["emergency_credit_available_usd"] = float(cred)
             data["authorized_credit_availability"] = float(cred)
 
@@ -408,7 +520,20 @@ class TreasuryState(CanonicalBaseModel):
             obls = data.get("obligations") or data.get("future_obligations") or []
             data["obligations"] = obls
             data["future_obligations"] = obls
+
+            # Warnings
+            warns = data.get("warnings") or data.get("data_quality_warnings") or []
+            data["warnings"] = warns
+            data["data_quality_warnings"] = warns
+
+            # Asset positions: wrap in AssetPositionCollection
+            pos_input = data.get("asset_positions")
+            data["asset_positions"] = AssetPositionCollection(pos_input)
         return data
+
+    @property
+    def operational_cash(self) -> float:
+        return self.operational_cash_usd
 
     @property
     def credit_availability(self) -> float:
@@ -431,17 +556,39 @@ class TreasuryState(CanonicalBaseModel):
         return res
 
     @property
+    def total_investments_market_value_usd(self) -> float:
+        return sum(pos.market_value_usd for pos in self.asset_positions if pos.tier != AssetTier.TIER_0_CASH)
+
+    @property
+    def total_balance_sheet_assets_usd(self) -> float:
+        return self.operational_cash_usd + sum(pos.market_value_usd for pos in self.asset_positions)
+
+    @property
     def total_portfolio_market_value_usd(self) -> float:
-        return self.tier0_cash_usd + sum(p.market_value_usd for p in self.asset_positions)
+        return self.total_balance_sheet_assets_usd
 
     @property
     def total_liquidatable_value_usd(self) -> float:
-        return self.tier0_cash_usd + sum(p.liquidatable_value_usd for p in self.asset_positions)
+        return self.operational_cash_usd + sum(pos.liquidatable_value_usd for pos in self.asset_positions)
+
+    @property
+    def available_credit_usd(self) -> float:
+        if self.credit_facility is not None:
+            return self.credit_facility.available_credit_usd
+        return self.emergency_credit_available_usd
+
+    @property
+    def upcoming_obligations_usd(self) -> float:
+        return sum(ob.amount_usd for ob in self.obligations if not ob.is_settled)
+
+    @property
+    def net_liquidity_usd(self) -> float:
+        return self.total_liquidatable_value_usd + self.available_credit_usd - self.upcoming_obligations_usd
 
 
 class ForecastPoint(CanonicalBaseModel):
-    as_of_timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
-    target_timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    as_of_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    target_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     horizon_hours: int = 1
     horizon: str = "1h"
     expected_inflow: float = 0.0
@@ -468,13 +615,13 @@ class ForecastPoint(CanonicalBaseModel):
     net_outflow_p99: float = 0.0
     cumulative_net_outflow_p95: Optional[float] = None
     cumulative_net_outflow_p99: Optional[float] = None
-    uncertainty_p05: float = 0.0
-    uncertainty_p50: float = 0.0
-    uncertainty_p90: float = 0.0
-    uncertainty_p95: float = 0.0
-    uncertainty_p99: float = 0.0
+    uncertainty_p05: Optional[float] = None
+    uncertainty_p50: Optional[float] = None
+    uncertainty_p90: Optional[float] = None
+    uncertainty_p95: Optional[float] = None
+    uncertainty_p99: Optional[float] = None
     calibration_sample_size: int = 0
-    training_cutoff_timestamp: Optional[Union[datetime, str]] = None
+    training_cutoff_timestamp: Optional[datetime] = None
     reliability_tier: str = "HIGH"
     reliability_rationale: str = ""
     is_fallback: bool = False
@@ -486,6 +633,12 @@ class ForecastPoint(CanonicalBaseModel):
     @classmethod
     def sync_point_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            # Timestamps
+            for k in ["as_of_timestamp", "target_timestamp", "training_cutoff_timestamp"]:
+                v = data.get(k)
+                if isinstance(v, str):
+                    data[k] = ensure_utc(v)
+
             # Horizon
             if "horizon_hours" in data and "horizon" not in data:
                 data["horizon"] = f"{data['horizon_hours']}h"
@@ -523,17 +676,10 @@ class ForecastPoint(CanonicalBaseModel):
             data["net_outflow_p95"] = float(net_p95)
             data["net_outflow_p99"] = float(net_p99)
 
-            u05 = data.get("uncertainty_p05", dep * 0.8 - wid * 1.2)
-            u50 = data.get("uncertainty_p50", dep - wid)
-            u90 = data.get("uncertainty_p90", dep * 1.1 - wid * 0.9)
-            u95 = data.get("uncertainty_p95", dep * 1.2 - wid * 0.8)
-            u99 = data.get("uncertainty_p99", dep * 1.3 - wid * 0.7)
-
-            data["uncertainty_p05"] = float(u05)
-            data["uncertainty_p50"] = float(u50)
-            data["uncertainty_p90"] = float(u90)
-            data["uncertainty_p95"] = float(u95)
-            data["uncertainty_p99"] = float(u99)
+            for k in ["uncertainty_p05", "uncertainty_p50", "uncertainty_p90", "uncertainty_p95", "uncertainty_p99"]:
+                if k in data:
+                    v = data[k]
+                    data[k] = float(v) if v is not None else None
 
         return data
 
@@ -556,15 +702,55 @@ class ForecastPoint(CanonicalBaseModel):
         }
 
 
+class ForecastPointCollection(list):
+    """Hybrid collection behaving as a list of ForecastPoints while supporting string/int horizon indexing."""
+
+    def __init__(self, items: Union[Dict[str, ForecastPoint], Sequence[ForecastPoint], None] = None) -> None:
+        if items is None:
+            super().__init__()
+        elif isinstance(items, dict):
+            super().__init__(items.values())
+        else:
+            super().__init__(items)
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, (str, int)):
+            key_str = f"{key}h" if isinstance(key, int) or str(key).isdigit() else str(key)
+            for item in self:
+                h_str = getattr(item, "horizon", f"{getattr(item, 'horizon_hours', '')}h")
+                if h_str == key_str or str(getattr(item, "horizon_hours", "")) == str(key):
+                    return item
+            raise KeyError(f"Forecast point for horizon '{key}' not found.")
+        return super().__getitem__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def values(self) -> List[ForecastPoint]:
+        return list(self)
+
+    def items(self) -> List[Tuple[str, ForecastPoint]]:
+        return [(getattr(p, "horizon", f"{getattr(p, 'horizon_hours', '')}h"), p) for p in self]
+
+    def keys(self) -> List[str]:
+        return [getattr(p, "horizon", f"{getattr(p, 'horizon_hours', '')}h") for p in self]
+
+    def copy(self) -> "ForecastPointCollection":
+        return ForecastPointCollection(list(self))
+
+
 # Alias for backward compatibility
 HorizonForecast = ForecastPoint
 
 
 class ForecastBundle(CanonicalBaseModel):
     timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
-    forecast_timestamp: Optional[datetime] = None
+    forecast_timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     points: List[ForecastPoint] = Field(default_factory=list)
-    point_forecasts: Dict[str, ForecastPoint] = Field(default_factory=dict)
+    point_forecasts: ForecastPointCollection = Field(default_factory=ForecastPointCollection)
     scenarios: Dict[str, Any] = Field(default_factory=dict)
     scenario_references: Dict[str, Any] = Field(default_factory=dict)
     quality_status: str = "HIGH"
@@ -583,15 +769,9 @@ class ForecastBundle(CanonicalBaseModel):
         if isinstance(data, dict):
             pts = data.get("points")
             pt_dict = data.get("point_forecasts")
-
-            if pts and not pt_dict:
-                built_dict: Dict[str, Any] = {}
-                for p in pts:
-                    h_key = p.horizon if hasattr(p, "horizon") else (p.get("horizon") if isinstance(p, dict) else f"{getattr(p, 'horizon_hours', 1)}h")
-                    built_dict[str(h_key)] = p
-                data["point_forecasts"] = built_dict
-            elif pt_dict and not pts:
-                data["points"] = list(pt_dict.values())
+            coll = ForecastPointCollection(pt_dict if pt_dict is not None else pts)
+            data["point_forecasts"] = coll
+            data["points"] = list(coll)
 
             # Scenarios
             sc = data.get("scenarios") or data.get("scenario_references") or {}
@@ -608,13 +788,18 @@ class ForecastBundle(CanonicalBaseModel):
             data["evaluation_metadata"] = meta
 
             # Timestamp
-            ts = data.get("timestamp") or data.get("forecast_timestamp") or datetime.now(timezone.utc)
+            ts = data.get("forecast_timestamp") or data.get("timestamp") or datetime.now(timezone.utc)
+            if isinstance(ts, str):
+                ts_dt = ensure_utc(ts)
+            else:
+                ts_dt = ts
+            data["forecast_timestamp"] = ts_dt
             data["timestamp"] = ts
-            if isinstance(ts, datetime):
-                data["forecast_timestamp"] = ts
-            elif isinstance(ts, str):
-                data["forecast_timestamp"] = ensure_utc(ts)
         return data
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.is_fallback_bundle
 
     def get_point(self, horizon_hours: int) -> Optional[ForecastPoint]:
         for pt in self.points:
@@ -712,20 +897,49 @@ class ExecutionOutcome(CanonicalBaseModel):
     outcome_id: str = Field(default_factory=lambda: f"out-{uuid.uuid4().hex[:12]}")
     decision_id: str = ""
     correlation_id: str = ""
-    execution_timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
-    simulated: bool = True
-    realized_amount: float = 0.0
-    realized_costs: Dict[str, float] = Field(default_factory=dict)
-    errors: List[str] = Field(default_factory=list)
-    liquidity_shortfall: float = 0.0
+    execution_status: str = "SUCCESS"
     settlement_status: str = "PENDING"
-    slippage_bps: float = 0.0
-    realized_cash_movements: float = 0.0
+    realized_cash_movements: Union[Dict[str, float], float] = Field(default_factory=dict)
+    costs_usd: float = 0.0
+    penalties_usd: float = 0.0
+    losses_usd: float = 0.0
+    shortfall_usd: float = 0.0
+    liquidity_shortfall: float = 0.0
     costs: float = 0.0
     penalties: float = 0.0
     losses: float = 0.0
     liquidity_shortfalls: float = 0.0
+    timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    execution_timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    reconciliation_status: str = "RECONCILED"
+    simulated: bool = True
+    realized_amount: float = 0.0
+    realized_costs: Dict[str, float] = Field(default_factory=dict)
+    errors: List[str] = Field(default_factory=list)
+    slippage_bps: float = 0.0
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_execution_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            c = data.get("costs_usd") if data.get("costs_usd") is not None else data.get("costs", 0.0)
+            data["costs_usd"] = float(c)
+            data["costs"] = float(c)
+            p = data.get("penalties_usd") if data.get("penalties_usd") is not None else data.get("penalties", 0.0)
+            data["penalties_usd"] = float(p)
+            data["penalties"] = float(p)
+            l = data.get("losses_usd") if data.get("losses_usd") is not None else data.get("losses", 0.0)
+            data["losses_usd"] = float(l)
+            data["losses"] = float(l)
+            s = data.get("shortfall_usd") if data.get("shortfall_usd") is not None else data.get("liquidity_shortfall", data.get("liquidity_shortfalls", 0.0))
+            data["shortfall_usd"] = float(s)
+            data["liquidity_shortfall"] = float(s)
+            data["liquidity_shortfalls"] = float(s)
+            ts = data.get("timestamp") or data.get("execution_timestamp") or datetime.now(timezone.utc)
+            data["timestamp"] = ts
+            data["execution_timestamp"] = ts
+        return data
 
 
 class LearningEvent(CanonicalBaseModel):
@@ -735,10 +949,15 @@ class LearningEvent(CanonicalBaseModel):
     module: str = "CORE"
     source_module: str = ""
     timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
+    event_timestamp: Optional[datetime] = None
+    recording_timestamp: Optional[datetime] = None
     correlation_id: str = ""
+    decision_id: Optional[str] = None
     payload: Dict[str, Any] = Field(default_factory=dict)
     associated_versions: Dict[str, str] = Field(default_factory=dict)
     model_version: str = "v1.0"
+    policy_version: Optional[str] = None
+    schema_version: str = "1.0"
 
     @model_validator(mode="before")
     @classmethod
@@ -761,6 +980,14 @@ class LearningEvent(CanonicalBaseModel):
                 vers["model_version"] = mv
             data["associated_versions"] = vers
             data["model_version"] = mv
+
+            # Timestamps
+            ts = data.get("timestamp") or data.get("event_timestamp") or datetime.now(timezone.utc)
+            ts_utc = ensure_utc(ts)
+            data["timestamp"] = ts_utc
+            data["event_timestamp"] = ensure_utc(data.get("event_timestamp", ts_utc))
+            data["recording_timestamp"] = ensure_utc(data.get("recording_timestamp", datetime.now(timezone.utc)))
+            data["schema_version"] = str(data.get("schema_version", "1.0"))
         return data
 
     @property

@@ -158,30 +158,60 @@ class DecisionExplanationService:
         # 5. Alternatives comparison
         alt_comparisons: List[AlternativeComparisonEntry] = []
         for alt in decision_record.alternatives:
-            delta = alt.estimated_total_cost - cost_bd.total_cost
+            if isinstance(alt, dict):
+                act_type = str(alt.get("action_type") or alt.get("type", "HOLD_CASH"))
+                tgt_asset = str(alt.get("target_asset") or alt.get("asset_id", "CASH"))
+                amt = float(alt.get("amount") or alt.get("amount_usd", 0.0) or 0.0)
+                est_cost = float(alt.get("estimated_total_cost") or alt.get("total_estimated_cost", 0.0) or 0.0)
+                settle_h = int(alt.get("settlement_horizon_hours") or alt.get("timing_hours", 0) or 0)
+                rej_reason = str(alt.get("rejection_reason") or alt.get("reason_code", ""))
+                is_feas = bool(alt.get("is_feasible", False))
+            else:
+                act_type = alt.action_type
+                tgt_asset = alt.target_asset
+                amt = alt.amount
+                est_cost = alt.estimated_total_cost
+                settle_h = alt.settlement_horizon_hours
+                rej_reason = alt.rejection_reason
+                is_feas = alt.is_feasible
+
+            delta = est_cost - cost_bd.total_cost
             alt_comparisons.append(
                 AlternativeComparisonEntry(
-                    action_type=alt.action_type,
-                    target_asset=alt.target_asset,
-                    amount=alt.amount,
-                    estimated_total_cost=alt.estimated_total_cost,
+                    action_type=act_type,
+                    target_asset=tgt_asset,
+                    amount=amt,
+                    estimated_total_cost=est_cost,
                     cost_delta_vs_selected=round(delta, 2),
-                    settlement_horizon_hours=alt.settlement_horizon_hours,
-                    rejection_reason=alt.rejection_reason,
-                    is_feasible=alt.is_feasible,  # Truthful feasibility
+                    settlement_horizon_hours=settle_h,
+                    rejection_reason=rej_reason,
+                    is_feasible=is_feas,
                 )
             )
 
         # 6. Build grounded mathematical narrative
-        action_name = decision_record.selected_action.replace("_", " ").title()
+        action_raw = getattr(decision_record, "action_type", None) or (
+            decision_record.selected_action
+            if isinstance(decision_record.selected_action, str)
+            else str(decision_record.selected_action.get("action_type", "HOLD_CASH"))
+        )
+        action_name = str(action_raw).replace("_", " ").title()
         amt_str = f"${decision_record.amount:,.2f}"
         if decision_record.reserve is not None:
-            reserve_str = f"${decision_record.reserve:,.2f}"
+            if isinstance(decision_record.reserve, dict):
+                res_val = decision_record.reserve.get("protected_capital") or decision_record.reserve.get("reserve_amount", 0.0)
+            else:
+                res_val = decision_record.reserve
+            reserve_str = f"${float(res_val):,.2f}"
         else:
             reserve_str = "UNCONFIGURED"
             missing_disclosures.append("Protected reserve floor is UNCONFIGURED / UNKNOWN. Mandatory reserve firewall cannot be certified.")
 
-        surplus_str = f"${decision_record.eligible_surplus:,.2f}"
+        surplus_str = (
+            f"${float(decision_record.eligible_surplus):,.2f}"
+            if getattr(decision_record, "eligible_surplus", None) is not None
+            else "UNSPECIFIED"
+        )
         total_cost_str = f"${cost_bd.total_cost:,.2f}"
 
         rationale_lines = [
@@ -190,9 +220,11 @@ class DecisionExplanationService:
         ]
 
         if f_summary.is_available and f_summary.horizon_24h_flow is not None:
+            p05_str = f"${f_summary.interval_p05:,.2f}" if f_summary.interval_p05 is not None else "N/A"
+            p95_str = f"${f_summary.interval_p95:,.2f}" if f_summary.interval_p95 is not None else "N/A"
             rationale_lines.append(
                 f"3. Liquidity Need: Projected 24h net flow is ${f_summary.horizon_24h_flow:,.2f} "
-                f"(distribution quantile P05 deficit: ${f_summary.interval_p05:,.2f}, P95: ${f_summary.interval_p95:,.2f})."
+                f"(distribution quantile P05 deficit: {p05_str}, P95: {p95_str})."
             )
         else:
             rationale_lines.append("3. Liquidity Need: Live forecast trajectory UNAVAILABLE; baseline constraints applied.")
@@ -222,14 +254,24 @@ class DecisionExplanationService:
 
         grounded_narrative = "\n".join(rationale_lines)
 
+        ts_str = str(decision_record.timestamp.isoformat() if hasattr(decision_record.timestamp, 'isoformat') else decision_record.timestamp)
+        act_str = str(getattr(decision_record, "action_type", None) or (
+            decision_record.selected_action if isinstance(decision_record.selected_action, str) else decision_record.selected_action.get("action_type", "HOLD_CASH")
+        ))
+        res_flt = (
+            float(decision_record.reserve.get("protected_capital", 0.0) or 0.0)
+            if isinstance(decision_record.reserve, dict)
+            else (float(decision_record.reserve) if decision_record.reserve is not None else None)
+        )
+
         return DecisionExplanation(
             decision_id=decision_record.decision_id,
-            timestamp=decision_record.timestamp,
-            recommended_action=decision_record.selected_action,
+            timestamp=ts_str,
+            recommended_action=act_str,
             target_asset=decision_record.target_asset,
-            recommended_amount=decision_record.amount,
-            protected_reserve_floor=decision_record.reserve,
-            eligible_surplus=decision_record.eligible_surplus,
+            recommended_amount=float(decision_record.amount or 0.0),
+            protected_reserve_floor=res_flt,
+            eligible_surplus=float(decision_record.eligible_surplus) if decision_record.eligible_surplus is not None else 0.0,
             treasury_safety_score=decision_record.treasury_safety_score,
             tss_factors=decision_record.tss_factors if decision_record.treasury_safety_score is not None else {},
             forecast_context=f_summary,

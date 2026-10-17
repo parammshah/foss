@@ -84,6 +84,14 @@ class DecisionExplanation:
         "Internal governance decision support. Does not constitute statutory regulatory certification."
     )
 
+    @property
+    def primary_rationale(self) -> str:
+        return self.primary_justification
+
+    @property
+    def rejected_alternatives(self) -> List[AlternativeComparisonEntry]:
+        return [alt for alt in self.alternatives_comparison if not alt.is_feasible or alt.rejection_reason]
+
 
 @dataclass
 class HumanActionRecord:

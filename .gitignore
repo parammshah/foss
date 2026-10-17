@@ -42,6 +42,8 @@ coverage.xml
 # Persistence & Local State
 var/*.sqlite
 var/*.db
+*.sqlite
+*.db
 !var/.gitkeep
 
 # Operating system & IDEs

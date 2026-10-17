@@ -85,6 +85,13 @@ class ApplicationFacade:
         self.team2_adapter = Team2DecisionRiskAdapter(mode=mode_str)
         self.stress_engine = StressLabSimulationEngine()
 
+        from reserve_juggler.integration.orchestrator import DecisionOrchestrator
+        self.orchestrator = DecisionOrchestrator(
+            sentinel=self.sentinel,
+            explanation_service=self.explanation_service,
+            learning_service=self.learning_service,
+        )
+
         self.current_scenario: str = "NORMAL"
         self._audit_trail: List[Dict[str, Any]] = []
         self._incident_log: List[Dict[str, Any]] = []
@@ -416,6 +423,27 @@ class ApplicationFacade:
             repo_delay_days=repo_delay_days,
             credit_unavailable=credit_unavailable,
             equity_drawdown_pct=equity_drawdown_pct,
+        )
+
+    def run_decision_cycle(
+        self,
+        current_state: Optional[TreasuryState] = None,
+        as_of_timestamp: Optional[datetime] = None,
+        historical_df: Optional[Any] = None,
+        external_raw_events: Optional[List[Any]] = None,
+        tax_profile: Optional[Any] = None,
+    ) -> Any:
+        """
+        Runs the canonical 10-step end-to-end decision cycle across all 3 teams.
+        """
+        now = as_of_timestamp or datetime.now(timezone.utc)
+        state = current_state or self.team1_adapter.get_treasury_state(scenario=self.current_scenario)
+        return self.orchestrator.run_cycle(
+            current_state=state,
+            as_of_timestamp=now,
+            historical_df=historical_df,
+            external_raw_events=external_raw_events,
+            tax_profile=tax_profile,
         )
 
     def close(self) -> None:

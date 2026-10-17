@@ -48,3 +48,60 @@ class StandardDecisionRecord:
     def to_json(self) -> str:
         """Convert decision record to JSON string."""
         return json.dumps(self.to_dict(), default=str)
+
+    @property
+    def target_asset(self) -> str:
+        if isinstance(self.selected_action, dict):
+            return str(self.selected_action.get("target_asset") or self.selected_action.get("asset_id") or "CASH")
+        return "CASH"
+
+    @property
+    def amount(self) -> float:
+        if isinstance(self.selected_action, dict):
+            return float(self.selected_action.get("amount") or self.selected_action.get("amount_usd") or 0.0)
+        return 0.0
+
+    @property
+    def action_type(self) -> str:
+        if isinstance(self.selected_action, dict):
+            return str(self.selected_action.get("action_type") or self.selected_action.get("type") or "HOLD_CASH")
+        return str(self.selected_action)
+
+    @property
+    def estimated_costs(self) -> dict[str, float]:
+        return self.cost_breakdown
+
+    @property
+    def hard_gate_outcomes(self) -> list[Any]:
+        from reserve_juggler.contracts import HardGateOutcome, GateStatus
+        res = []
+        for name, outcome in self.hard_gate_results.items():
+            if isinstance(outcome, dict):
+                st = GateStatus.PASS if outcome.get("passed", False) else GateStatus.FAIL
+                res.append(HardGateOutcome(
+                    gate_name=name,
+                    status=st,
+                    threshold_value=float(outcome.get("threshold", 0.0) or 0.0),
+                    observed_value=float(outcome.get("observed", 0.0) or 0.0),
+                    reason=str(outcome.get("reason", "")),
+                ))
+            elif isinstance(outcome, HardGateOutcome):
+                res.append(outcome)
+        return res
+
+    @property
+    def model_versions(self) -> dict[str, str]:
+        return self.metadata.get("model_versions", {"decision_engine": "v2.0.0"})
+
+    @property
+    def treasury_safety_score(self) -> Optional[float]:
+        if isinstance(self.score, dict):
+            val = self.score.get("treasury_safety_score") or self.score.get("composite_score")
+            return float(val) if val is not None else None
+        return None
+
+    @property
+    def tss_factors(self) -> dict[str, float]:
+        if isinstance(self.score, dict):
+            return self.score.get("tss_factors") or self.score.get("factors") or {}
+        return {}

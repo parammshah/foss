@@ -54,9 +54,11 @@ class TreasuryLedger:
 
     def __init__(
         self,
-        config: InitialTreasuryConfig,
+        config: Optional[InitialTreasuryConfig] = None,
         event_publisher: Optional[EventPublisher] = None,
     ) -> None:
+        if config is None:
+            config = InitialTreasuryConfig(opening_cash_usd=25_000_000.0)
         self.config = config
         self.publisher = event_publisher or NoOpEventPublisher()
 

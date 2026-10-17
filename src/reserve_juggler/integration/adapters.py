@@ -52,43 +52,15 @@ class Team1DataForecastAdapter:
 
     def _discover_services(self) -> None:
         """Dynamically discovers canonical Team 1 service implementations."""
-        # 1. Discover Ledger
-        try:
-            ledger_mod = importlib.import_module("reserve_juggler.ledger")
-            if hasattr(ledger_mod, "TreasuryLedger"):
-                self._real_ledger_service = ledger_mod.TreasuryLedger()
-                self.ledger_status = ServiceStatus.CONNECTED
-                logger.info("Connected to canonical Team 1 TreasuryLedger.")
-            elif hasattr(ledger_mod, "TreasuryLedgerService"):
-                self._real_ledger_service = ledger_mod.TreasuryLedgerService()
-                self.ledger_status = ServiceStatus.CONNECTED
-        except ImportError:
-            pass
+        # In live production mode, without external live banking connection, surface UNINTEGRATED
+        if self.mode != "SYNTHETIC_DEMO":
+            self.ledger_status = ServiceStatus.UNINTEGRATED
+            self.forecast_status = ServiceStatus.UNINTEGRATED
+            self.unintegrated_reason = "Live core banking feed and streaming forecast pipeline are not configured."
+            return
 
-        # 2. Discover Forecasting
-        try:
-            forecast_mod = importlib.import_module("reserve_juggler.forecasting")
-            if hasattr(forecast_mod, "ForecastService"):
-                self._real_forecast_service = forecast_mod.ForecastService()
-                self.forecast_status = ServiceStatus.CONNECTED
-                logger.info("Connected to canonical Team 1 ForecastService.")
-                # Check if ForecastService also provides get_state
-                if self._real_ledger_service is None and hasattr(self._real_forecast_service, "get_state"):
-                    self._real_ledger_service = self._real_forecast_service
-                    self.ledger_status = ServiceStatus.CONNECTED
-        except ImportError:
-            pass
-
-        if self.ledger_status != ServiceStatus.CONNECTED or self.forecast_status != ServiceStatus.CONNECTED:
-            missing = []
-            if self.ledger_status != ServiceStatus.CONNECTED:
-                missing.append("TreasuryLedger")
-            if self.forecast_status != ServiceStatus.CONNECTED:
-                missing.append("ForecastService")
-            self.unintegrated_reason = f"Team 1 components [{', '.join(missing)}] not found in PYTHONPATH."
-            if self.mode == "SYNTHETIC_DEMO":
-                self.ledger_status = ServiceStatus.SYNTHETIC_DEMO
-                self.forecast_status = ServiceStatus.SYNTHETIC_DEMO
+        self.ledger_status = ServiceStatus.SYNTHETIC_DEMO
+        self.forecast_status = ServiceStatus.SYNTHETIC_DEMO
 
     @property
     def is_connected(self) -> bool:
@@ -97,14 +69,12 @@ class Team1DataForecastAdapter:
     def get_treasury_state(self, as_of_iso: Optional[str] = None, scenario: str = "NORMAL") -> TreasuryState:
         now_iso = as_of_iso or datetime.now(timezone.utc).isoformat()
 
-        if self._real_ledger_service:
-            if hasattr(self._real_ledger_service, "get_state"):
+        if self.mode != "SYNTHETIC_DEMO":
+            if self._real_ledger_service and hasattr(self._real_ledger_service, "get_state"):
                 state = self._real_ledger_service.get_state(now_iso)
                 state.source_status = ServiceStatus.CONNECTED
                 state.is_synthetic = False
                 return state
-
-        if self.mode != "SYNTHETIC_DEMO":
             raise UnintegratedServiceError(
                 f"Cannot retrieve live TreasuryState: {self.unintegrated_reason or 'Ledger service unintegrated.'}"
             )
@@ -119,15 +89,9 @@ class Team1DataForecastAdapter:
     ) -> Tuple[ForecastBundle, LearningEvent]:
         now_iso = as_of_iso or datetime.now(timezone.utc).isoformat()
 
-        if self._real_forecast_service:
-            if hasattr(self._real_forecast_service, "forecast"):
+        if self.mode != "SYNTHETIC_DEMO":
+            if self._real_forecast_service and getattr(self._real_forecast_service, "suites", None):
                 bundle = self._real_forecast_service.forecast(now_iso)
-            elif hasattr(self._real_forecast_service, "predict"):
-                bundle = self._real_forecast_service.predict(now_iso)
-            else:
-                bundle = None
-
-            if bundle:
                 bundle.source_status = ServiceStatus.CONNECTED
                 bundle.is_synthetic = False
                 corr_id = f"FC-{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
@@ -155,8 +119,6 @@ class Team1DataForecastAdapter:
                     associated_versions=bundle.model_versions,
                 )
                 return (bundle, learning_event)
-
-        if self.mode != "SYNTHETIC_DEMO":
             raise UnintegratedServiceError(
                 f"Cannot retrieve live ForecastBundle: {self.unintegrated_reason or 'Forecast service unintegrated.'}"
             )
@@ -209,20 +171,12 @@ class Team2DecisionRiskAdapter:
 
     def _discover_services(self) -> None:
         """Dynamically discovers canonical Team 2 service implementations."""
-        try:
-            decision_mod = importlib.import_module("reserve_juggler.decision")
-            if hasattr(decision_mod, "TreasuryDecisionService"):
-                self._real_decision_service = decision_mod.TreasuryDecisionService()
-                self.decision_status = ServiceStatus.CONNECTED
-                logger.info("Connected to canonical Team 2 TreasuryDecisionService.")
-            elif hasattr(decision_mod, "DecisionService"):
-                self._real_decision_service = decision_mod.DecisionService()
-                self.decision_status = ServiceStatus.CONNECTED
-                logger.info("Connected to canonical Team 2 DecisionService.")
-        except ImportError:
-            self.unintegrated_reason = "Team 2 module 'reserve_juggler.decision' not found in PYTHONPATH."
-            if self.mode == "SYNTHETIC_DEMO":
-                self.decision_status = ServiceStatus.SYNTHETIC_DEMO
+        if self.mode != "SYNTHETIC_DEMO":
+            self.decision_status = ServiceStatus.UNINTEGRATED
+            self.unintegrated_reason = "Live custody and broker execution gateway are not configured."
+            return
+
+        self.decision_status = ServiceStatus.SYNTHETIC_DEMO
 
     @property
     def is_connected(self) -> bool:
@@ -238,15 +192,16 @@ class Team2DecisionRiskAdapter:
     ) -> Tuple[DecisionRecord, LearningEvent]:
         now_iso = as_of_iso or datetime.now(timezone.utc).isoformat()
 
-        if self._real_decision_service and hasattr(self._real_decision_service, "decide"):
-            record = self._real_decision_service.decide(treasury_state, forecast_bundle, risk_signals)
-            record.source_status = ServiceStatus.CONNECTED
-            record.is_synthetic = False
-        else:
-            if self.mode != "SYNTHETIC_DEMO":
+        if self.mode != "SYNTHETIC_DEMO":
+            if self._real_decision_service and hasattr(self._real_decision_service, "decide"):
+                record = self._real_decision_service.decide(treasury_state, forecast_bundle, risk_signals)
+                record.source_status = ServiceStatus.CONNECTED
+                record.is_synthetic = False
+            else:
                 raise UnintegratedServiceError(
                     f"Cannot compute live Next Best Action: {self.unintegrated_reason or 'Decision service unintegrated.'}"
                 )
+        else:
             record = create_mock_decision_record(now_iso, scenario=scenario)
             record.source_status = ServiceStatus.SYNTHETIC_DEMO
             record.is_synthetic = True
