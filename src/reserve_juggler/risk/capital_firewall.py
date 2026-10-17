@@ -53,13 +53,29 @@ def classify_hot_core_capital(
     core_capital = max(0.0, total_asset_value - hot_money_required)
 
     # The portion of core capital that is currently unencumbered cash ready for investment
-    investable_core = min(core_capital, reserve_assessment.eligible_investable_surplus)
+    # If forecast indicates structural net cash burn (withdrawals > deposits), all surplus is Hot Money protecting payouts
+    is_net_cash_burn = False
+    longest_point = None
+    if forecast_bundle.point_forecasts:
+        longest_point = max(forecast_bundle.point_forecasts, key=lambda p: float(p.forecast_horizon))
+        if float(longest_point.withdrawal_p50) > float(longest_point.deposit_p50) or float(longest_point.withdrawal_p90) > float(longest_point.deposit_p10):
+            is_net_cash_burn = True
 
-    rationale = (
-        f"Treasury partitioned into ${hot_money_required:,.2f} Hot Money "
-        f"(protecting payouts and obligations) and ${core_capital:,.2f} Core Capital "
-        f"(with ${investable_core:,.2f} immediate unencumbered investable surplus)."
-    )
+    if is_net_cash_burn and longest_point is not None:
+        investable_core = 0.0
+        rationale = (
+            f"Treasury partitioned into ${hot_money_required:,.2f} Hot Money "
+            f"(protecting payouts and obligations). Core capital of ${core_capital:,.2f} has $0.00 "
+            f"investable surplus because forecast indicates net cash burn "
+            f"(P50 withdrawals exceed deposits over {longest_point.forecast_horizon:.0f}h horizon)."
+        )
+    else:
+        investable_core = min(core_capital, reserve_assessment.eligible_investable_surplus)
+        rationale = (
+            f"Treasury partitioned into ${hot_money_required:,.2f} Hot Money "
+            f"(protecting payouts and obligations) and ${core_capital:,.2f} Core Capital "
+            f"(with ${investable_core:,.2f} immediate unencumbered investable surplus)."
+        )
 
     return CapitalClassification(
         hot_money=hot_money_required,

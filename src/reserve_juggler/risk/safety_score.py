@@ -77,25 +77,53 @@ def calculate_treasury_safety_score(
     warnings: list[str] = list(state.data_quality_warnings or [])
 
     now = state.timestamp
-    available_cash = max(0.0, float(state.available_cash))
+    raw_cash = float(state.available_cash)
+    if math.isnan(raw_cash) or math.isinf(raw_cash):
+        raise ValueError(f"Invalid non-finite available_cash: {raw_cash}")
+    if raw_cash < 0.0:
+        warnings.append(f"Negative available cash detected (${raw_cash:,.2f}); clamping to 0 for coverage.")
+    available_cash = max(0.0, raw_cash)
+
     credit_avail = max(0.0, float(state.credit_availability))
+    if math.isnan(credit_avail) or math.isinf(credit_avail):
+        raise ValueError(f"Invalid non-finite credit_availability: {credit_avail}")
     total_immediate_funding = available_cash + credit_avail
+
+    # Validate asset positions
+    for pos in state.asset_positions:
+        mv = float(pos.market_value)
+        if math.isnan(mv) or math.isinf(mv) or mv < 0.0:
+            raise ValueError(f"Invalid market value for asset '{pos.asset_id}': {mv}")
+        if pos.exit_fees is not None:
+            ef = float(pos.exit_fees)
+            if math.isnan(ef) or ef < 0.0:
+                raise ValueError(f"Invalid exit fee rate for asset '{pos.asset_id}': {ef}")
 
     # 1. Immediate Obligations and Outflows
     immediate_obligations = _get_immediate_obligations(state.future_obligations, now, window_hours=24.0)
 
     # Calculate near-term conservative net outflow from forecast points (0-24h)
+    # Uses explicit forecast_is_cumulative contract: does not sum overlapping cumulative forecasts!
     near_term_conservative_outflow = 0.0
     total_quantile_spread = 0.0
     point_count_24h = 0
 
     if forecast_bundle.point_forecasts:
-        for fp in forecast_bundle.point_forecasts:
-            if float(fp.forecast_horizon) <= 24.0:
-                pt_outflow = max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10))
-                near_term_conservative_outflow += pt_outflow
+        forecast_is_cumulative = getattr(forecast_bundle, "is_cumulative", True)
+        pts_24h = [fp for fp in forecast_bundle.point_forecasts if float(fp.forecast_horizon) <= 24.0]
+        if pts_24h:
+            if forecast_is_cumulative:
+                # Cumulative forecast semantics: conservative net outflow is the maximum through 24h
+                near_term_conservative_outflow = max(
+                    0.0,
+                    max(float(fp.withdrawal_p90) - float(fp.deposit_p10) for fp in pts_24h)
+                )
+            else:
+                # Discrete interval semantics: sum interval net outflows
+                for fp in pts_24h:
+                    near_term_conservative_outflow += max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10))
 
-                # Quantile spread: P90 - P10 normalized by P50
+            for fp in pts_24h:
                 w_p50 = max(1.0, float(fp.withdrawal_p50))
                 w_spread = max(0.0, float(fp.withdrawal_p90) - float(fp.withdrawal_p10)) / w_p50
                 total_quantile_spread += w_spread
@@ -120,7 +148,8 @@ def calculate_treasury_safety_score(
     total_stress_liquidatable = available_cash + credit_avail
     for pos in state.asset_positions:
         stress_haircut = min(1.0, float(pos.haircut) + (0.15 if pos.tier == 3 else 0.05))
-        stress_val = float(pos.market_value) * (1.0 - stress_haircut) * (1.0 - float(pos.exit_fees))
+        pos_ef = float(pos.exit_fees) if pos.exit_fees is not None else 0.005
+        stress_val = float(pos.market_value) * (1.0 - stress_haircut) * (1.0 - pos_ef)
         total_stress_liquidatable += max(0.0, stress_val)
 
     severe_stress_demand = (immediate_obligations * 1.1) + (near_term_conservative_outflow * 1.25)
@@ -215,7 +244,8 @@ def calculate_treasury_safety_score(
     total_liquidation_loss = 0.0
     total_asset_mv = sum(float(p.market_value) for p in state.asset_positions)
     for pos in state.asset_positions:
-        loss_rate = float(pos.haircut) + float(pos.exit_fees)
+        pos_ef = float(pos.exit_fees) if pos.exit_fees is not None else 0.005
+        loss_rate = float(pos.haircut) + pos_ef
         total_liquidation_loss += float(pos.market_value) * loss_rate
 
     if total_asset_mv <= 0.0:

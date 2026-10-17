@@ -165,7 +165,9 @@ def assess_liquidity_reserve(
     uncovered_scenarios: list[str] = []
     total_liquidatable_resources = available_cash + float(state.credit_availability)
     for pos in state.asset_positions:
-        stressed_val = float(pos.market_value) * (1.0 - float(pos.haircut) - float(pos.exit_fees))
+        pos_ef = float(pos.exit_fees) if pos.exit_fees is not None else 0.005
+        pos_hc = float(pos.haircut) if pos.haircut is not None else 0.0
+        stressed_val = float(pos.market_value) * (1.0 - pos_hc - pos_ef)
         total_liquidatable_resources += max(0.0, stressed_val)
 
     worst_case_stress_demand = (immediate_obligations + future_obligations_beyond) * 1.5 + (
@@ -206,6 +208,9 @@ def evaluate_hard_safety_gates(
     is_partial_funding: bool = False,
     residual_unfunded_amount: float = 0.0,
     action_type: Optional[str] = None,
+    resulting_tier_exposure_pct: Optional[float] = None,
+    tier_portfolio_cap_pct: Optional[float] = None,
+    allow_emergency_credit_draw: bool = False,
 ) -> HardGateEvaluation:
     """Evaluate non-negotiable safety gates independently of the Treasury Safety Score.
 
@@ -223,11 +228,15 @@ def evaluate_hard_safety_gates(
 
     # Hard Gate 1: Immediate Payout Coverage Gate
     # For funding actions, evaluate coverage considering the action's net proceeds by deadline.
-    is_funding_action = action_type in (
-        "BREAK_REPO_EARLY",
-        "SELL_BOND",
-        "SELL_EQUITY",
-        "DRAW_BRIDGE_CREDIT",
+    is_funding_action = (
+        action_type in (
+            "BREAK_REPO_EARLY",
+            "SELL_BOND",
+            "SELL_EQUITY",
+            "DRAW_BRIDGE_CREDIT",
+            "WAIT_REPO_MATURITY",
+        )
+        or proposed_bridge_draw > 0.0
     )
     if is_funding_action:
         deadline_met = (
@@ -235,9 +244,16 @@ def evaluate_hard_safety_gates(
             or payment_deadline_hours is None
             or availability_delay_hours <= payment_deadline_hours
         )
-        payout_coverage_passed = (residual_unfunded_amount == 0.0) and deadline_met
+        if payment_deadline_hours is not None:
+            payout_coverage_passed = (residual_unfunded_amount == 0.0) and deadline_met
+        else:
+            total_funds = available_cash + proposed_bridge_draw
+            payout_coverage_passed = (total_funds >= immediate_obligations) and (residual_unfunded_amount == 0.0)
     else:
-        payout_coverage_passed = (available_cash + credit_avail) >= immediate_obligations
+        # Non-funding action (e.g. KEEP_CASH, BUY_BOND, BUY_EQUITY, UNRESOLVED_FUNDING_SHORTFALL):
+        # Do NOT treat undrawn credit line as cash!
+        # Payout coverage requires actual available cash to cover immediate obligations.
+        payout_coverage_passed = available_cash >= immediate_obligations
 
     gates["immediate_payout_coverage"] = payout_coverage_passed
     if not payout_coverage_passed:
@@ -310,9 +326,10 @@ def evaluate_hard_safety_gates(
         gates["funding_deadline_satisfied"] = True
 
     # Hard Gate 6: Valid Bridge Repayment Source Gate
-    if proposed_bridge_draw > 0.0:
-        gates["valid_repayment_source"] = repayment_feasibility
-        if not repayment_feasibility:
+    if proposed_bridge_draw > 0.0 or action_type == "DRAW_BRIDGE_CREDIT":
+        gate_passed = repayment_feasibility or allow_emergency_credit_draw
+        gates["valid_repayment_source"] = gate_passed
+        if not gate_passed:
             violated_gates.append("valid_repayment_source")
             reason_codes.append(
                 "BREACH_REPAYMENT_SOURCE: Bridge facility draw lacks a verified future cash source for repayment."
@@ -330,6 +347,19 @@ def evaluate_hard_safety_gates(
         )
     else:
         gates["full_payout_funding"] = True
+
+    # Hard Gate 8: Portfolio Exposure Cap Gate
+    if resulting_tier_exposure_pct is not None and tier_portfolio_cap_pct is not None:
+        cap_passed = resulting_tier_exposure_pct <= (tier_portfolio_cap_pct + 1e-4)
+        gates["portfolio_exposure_limit"] = cap_passed
+        if not cap_passed:
+            violated_gates.append("portfolio_exposure_limit")
+            reason_codes.append(
+                f"BREACH_PORTFOLIO_EXPOSURE: Resulting Tier {target_tier} exposure "
+                f"({resulting_tier_exposure_pct*100:.1f}%) exceeds portfolio limit ({tier_portfolio_cap_pct*100:.1f}%)."
+            )
+    else:
+        gates["portfolio_exposure_limit"] = True
 
     all_passed = len(violated_gates) == 0
 

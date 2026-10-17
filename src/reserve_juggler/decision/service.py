@@ -26,7 +26,7 @@ from reserve_juggler.decision.protocols import (
     RiskSignal,
     TreasuryState,
 )
-from reserve_juggler.optimization.models import ActionType
+from reserve_juggler.optimization.models import ActionType, HumanOverride
 from reserve_juggler.optimization.optimizer import optimize_treasury_actions
 from reserve_juggler.risk.capital_firewall import classify_hot_core_capital
 from reserve_juggler.risk.liquidity_shield import (
@@ -65,6 +65,8 @@ class TreasuryDecisionService:
         tax_profile: Optional[TaxProfile] = None,
         repo_overnight_rate_apy: float = 0.043,
         repo_sweep_lockup_hours: float = 15.0,
+        repo_sweep_window_open: Optional[bool] = None,
+        human_override: Optional[HumanOverride] = None,
     ) -> DecisionRecord:
         """Evaluate treasury condition and produce the Next Best Action decision record.
 
@@ -106,13 +108,16 @@ class TreasuryDecisionService:
             reserve_assessment=reserve_assessment,
             repo_overnight_rate_apy=repo_overnight_rate_apy,
             repo_sweep_lockup_hours=repo_sweep_lockup_hours,
+            repo_sweep_window_open=repo_sweep_window_open,
+            human_override=human_override,
         )
 
         selected = opt_result.selected_action
         alternatives = [a.to_dict() for a in opt_result.candidate_actions if a != selected]
 
         # 5. Evaluate Action-Specific Hard Safety Gates on the SELECTED Proposal
-        # Ensures DecisionRecord reports the actual gate results of the proposal, not a dummy base evaluation
+        total_assets = max(0.0, float(state.available_cash)) + sum(float(p.market_value) for p in state.asset_positions)
+
         if selected.action_type == ActionType.DRAW_BRIDGE_CREDIT:
             selected_gate_eval = evaluate_hard_safety_gates(
                 state=state,
@@ -124,14 +129,51 @@ class TreasuryDecisionService:
                 is_partial_funding=selected.is_partial_funding,
                 residual_unfunded_amount=selected.residual_unfunded_amount,
                 action_type=selected.action_type.value,
+                allow_emergency_credit_draw=bool(human_override),
             )
-        elif selected.action_type in (ActionType.PLACE_REPO, ActionType.BUY_BOND, ActionType.BUY_EQUITY):
+        elif selected.action_type == ActionType.WAIT_REPO_MATURITY:
+            selected_gate_eval = evaluate_hard_safety_gates(
+                state=state,
+                reserve_assessment=reserve_assessment,
+                payment_deadline_hours=selected.payment_deadline_hours,
+                availability_delay_hours=selected.timing_hours,
+                is_partial_funding=selected.is_partial_funding,
+                residual_unfunded_amount=selected.residual_unfunded_amount,
+                action_type=selected.action_type.value,
+            )
+        elif selected.action_type == ActionType.PLACE_REPO:
             selected_gate_eval = evaluate_hard_safety_gates(
                 state=state,
                 reserve_assessment=reserve_assessment,
                 proposed_investment_amount=selected.amount,
                 proposed_lockup_hours=selected.timing_hours,
-                target_tier=2 if selected.action_type == ActionType.BUY_BOND else (3 if selected.action_type == ActionType.BUY_EQUITY else 1),
+                target_tier=1,
+                action_type=selected.action_type.value,
+            )
+        elif selected.action_type == ActionType.BUY_BOND:
+            tier2_val = sum(float(p.market_value) for p in state.asset_positions if p.tier == 2) + selected.amount
+            resulting_ratio2 = tier2_val / total_assets if total_assets > 0 else 0.0
+            selected_gate_eval = evaluate_hard_safety_gates(
+                state=state,
+                reserve_assessment=reserve_assessment,
+                proposed_investment_amount=selected.amount,
+                proposed_lockup_hours=selected.timing_hours,
+                target_tier=2,
+                resulting_tier_exposure_pct=resulting_ratio2,
+                tier_portfolio_cap_pct=opt_result.tier_caps_applied.tier2_portfolio_cap_pct,
+                action_type=selected.action_type.value,
+            )
+        elif selected.action_type == ActionType.BUY_EQUITY:
+            tier3_val = sum(float(p.market_value) for p in state.asset_positions if p.tier == 3) + selected.amount
+            resulting_ratio3 = tier3_val / total_assets if total_assets > 0 else 0.0
+            selected_gate_eval = evaluate_hard_safety_gates(
+                state=state,
+                reserve_assessment=reserve_assessment,
+                proposed_investment_amount=selected.amount,
+                proposed_lockup_hours=selected.timing_hours,
+                target_tier=3,
+                resulting_tier_exposure_pct=resulting_ratio3,
+                tier_portfolio_cap_pct=opt_result.tier_caps_applied.tier3_portfolio_cap_pct,
                 action_type=selected.action_type.value,
             )
         elif selected.action_type in (ActionType.BREAK_REPO_EARLY, ActionType.SELL_BOND, ActionType.SELL_EQUITY):
@@ -162,6 +204,8 @@ class TreasuryDecisionService:
                     reason_codes.append(r)
         if opt_result.remediation_notes:
             reason_codes.extend(opt_result.remediation_notes)
+        if selected.ranking_is_provisional or (tax_profile is None):
+            reason_codes.append("WARNING_PROVISIONAL_TAX_RANKING: Missing or synthetic tax profile utilized; ranking must be verified before execution.")
 
         # Build DecisionRecord
         record = StandardDecisionRecord(
@@ -183,6 +227,8 @@ class TreasuryDecisionService:
                 "optimization_mode": opt_result.optimization_mode,
                 "is_unresolved_shortfall": opt_result.is_unresolved_shortfall,
                 "unresolved_shortfall": round(opt_result.unresolved_shortfall, 2),
+                "ranking_is_provisional": (tax_profile is None) or selected.ranking_is_provisional or any(c.ranking_is_provisional for c in opt_result.candidate_actions),
+                "human_override": human_override.to_dict() if human_override else None,
             },
         )
 

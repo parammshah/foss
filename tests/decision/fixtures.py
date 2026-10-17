@@ -46,6 +46,9 @@ class ConcreteAssetPosition:
     duration: float = 0.0  # Duration in years
     volatility: float = 0.0  # Annualized volatility
     cost_basis: float = 0.0
+    units: float = 0.0
+    entry_price: float = 0.0
+    purchase_timestamp: Optional[datetime] = None
     instrument_type: str = "repo"  # 'cash', 'repo', 'bond', 'equity'
 
 

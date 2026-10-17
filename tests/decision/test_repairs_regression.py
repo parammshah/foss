@@ -156,11 +156,15 @@ def test_regression_b_bridge_credit_without_repayment_source():
     ]
     assert len(bridge_candidates) == 1
     bridge = bridge_candidates[0]
-
     # Because competing obligations absorb proceeds before repayment, bridge cannot be verified as repaid
-    # The engine evaluates draw, but flags repayment feasibility appropriately
+    # The engine evaluates draw, but flags repayment feasibility as False and rejects the candidate
     assert bridge.principal_borrowed == 10000000.0
     assert bridge.credit_availability_after_draw == 0.0
+    assert bridge.repayment_feasibility is False
+    assert bridge.is_feasible is False
+    assert bridge.hard_gate_passed is False
+    assert "REJECTED_BRIDGE_REPAYMENT" in bridge.reason_code
+    assert bridge.residual_debt_after_repayment > 0.0
 
 
 def test_regression_c_explicit_unresolved_funding_shortfall():
@@ -526,3 +530,349 @@ def test_decision_service_json_serialization_and_event_publishing():
         payload_str = json.dumps(event_dict, default=str)
         assert len(payload_str) > 0
         assert "correlation_id" in event_dict
+
+
+# =============================================================================
+# 9. Additional Repaired Regression Invariants (P0, P1, P2)
+# =============================================================================
+
+
+def test_wait_repo_maturity_with_insufficient_proceeds():
+    """Verify P0: WAIT_REPO_MATURITY with Insufficient Proceeds.
+    - Available cash: $0.
+    - Mandatory payout: $10,000,000 due in 3 hours.
+    - Repo proceeds: $2,000,000 maturing in 2 hours.
+    - Authorized credit limit: $10,000,000.
+    The optimizer MUST NOT mark waiting alone as fully funding the $10M payout!
+    It must report residual gap of $8,000,000, mark wait infeasible, and select bridge credit.
+    """
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    repo_2m = ConcreteAssetPosition(
+        asset_id="REPO_2M",
+        tier=1,
+        market_value=2000000.0,
+        liquidatable_value=1990000.0,
+        availability=now + timedelta(hours=2),
+        maturity=now + timedelta(hours=2),
+        exit_fees=0.005,
+        instrument_type="repo",
+    )
+
+    obligation_10m = ConcreteObligation(
+        due_time=now + timedelta(hours=3),
+        amount=10000000.0,
+        is_mandatory=True,
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=0.0,
+        asset_positions=[repo_2m],
+        future_obligations=[obligation_10m],
+        credit_availability=10000000.0,
+        credit_limit=10000000.0,
+        credit_apr=0.12,
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+
+    # Inspect WAIT_REPO_MATURITY candidate
+    wait_candidates = [
+        c for c in opt_result.candidate_actions if c.action_type == ActionType.WAIT_REPO_MATURITY
+    ]
+    assert len(wait_candidates) == 1
+    wait_cand = wait_candidates[0]
+
+    assert wait_cand.is_feasible is False
+    assert wait_cand.is_partial_funding is True
+    assert round(wait_cand.residual_unfunded_amount, 2) == 8000000.0
+    assert "REJECTED_WAIT_PROCEEDS" in wait_cand.reason_code
+
+    # Selected action must be DRAW_BRIDGE_CREDIT (or funding action), NOT WAIT_REPO_MATURITY
+    assert opt_result.selected_action.action_type == ActionType.DRAW_BRIDGE_CREDIT
+    assert opt_result.selected_action.amount == 10000000.0
+
+
+def test_wait_repo_maturity_with_sufficient_proceeds():
+    """Verify P0: WAIT_REPO_MATURITY with Sufficient Proceeds.
+    - Available cash: $0.
+    - Mandatory payout: $2,000,000 due in 3 hours.
+    - Repo proceeds: $10,000,000 maturing in 2 hours.
+    Waiting alone fully funds the payout with 0 fees!
+    """
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    repo_10m = ConcreteAssetPosition(
+        asset_id="REPO_10M",
+        tier=1,
+        market_value=10000000.0,
+        liquidatable_value=9950000.0,
+        availability=now + timedelta(hours=2),
+        maturity=now + timedelta(hours=2),
+        exit_fees=0.005,
+        instrument_type="repo",
+    )
+
+    obligation_2m = ConcreteObligation(
+        due_time=now + timedelta(hours=3),
+        amount=2000000.0,
+        is_mandatory=True,
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=0.0,
+        asset_positions=[repo_10m],
+        future_obligations=[obligation_2m],
+        credit_availability=10000000.0,
+        credit_limit=10000000.0,
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+    selected = opt_result.selected_action
+
+    assert selected.action_type == ActionType.WAIT_REPO_MATURITY
+    assert selected.is_feasible is True
+    assert selected.residual_unfunded_amount == 0.0
+    assert selected.total_estimated_cost == 0.0
+    assert "fully funding the payout" in selected.reason_code
+
+
+def test_wait_repo_maturity_after_deadline_rejected():
+    """Verify P0: WAIT_REPO_MATURITY maturing AFTER deadline is rejected."""
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    repo_late = ConcreteAssetPosition(
+        asset_id="REPO_LATE",
+        tier=1,
+        market_value=10000000.0,
+        liquidatable_value=9950000.0,
+        availability=now + timedelta(hours=4),
+        maturity=now + timedelta(hours=4),
+        exit_fees=0.005,
+        instrument_type="repo",
+    )
+
+    obligation_early = ConcreteObligation(
+        due_time=now + timedelta(hours=1),
+        amount=5000000.0,
+        is_mandatory=True,
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=0.0,
+        asset_positions=[repo_late],
+        future_obligations=[obligation_early],
+        credit_availability=0.0,
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+    wait_cands = [c for c in opt_result.candidate_actions if c.action_type == ActionType.WAIT_REPO_MATURITY]
+    assert len(wait_cands) == 1
+    assert wait_cands[0].is_feasible is False
+    assert "AFTER payment deadline" in wait_cands[0].reason_code
+
+
+def test_explicit_zero_repo_exit_fee_preserved():
+    """Verify P1: Explicitly configured 0.0 repo exit fee remains 0.0."""
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    repo_zero_fee = ConcreteAssetPosition(
+        asset_id="REPO_ZERO_FEE",
+        tier=1,
+        market_value=10000000.0,
+        liquidatable_value=10000000.0,
+        availability=now,
+        maturity=now + timedelta(hours=24),
+        exit_fees=0.0,  # Explicitly configured zero fee!
+        instrument_type="repo",
+    )
+
+    ob = ConcreteObligation(
+        due_time=now + timedelta(hours=1),
+        amount=5000000.0,
+        is_mandatory=True,
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=0.0,
+        asset_positions=[repo_zero_fee],
+        future_obligations=[ob],
+        credit_availability=0.0,
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+    break_cands = [c for c in opt_result.candidate_actions if c.action_type == ActionType.BREAK_REPO_EARLY]
+    assert len(break_cands) == 1
+    action = break_cands[0]
+
+    # Explicit 0.0 exit fee must NOT be replaced with 0.005 ($25,000 fee)!
+    assert action.transaction_cost == 0.0
+    assert action.total_estimated_cost == 0.0
+    assert action.net_proceeds == action.gross_proceeds == 5000000.0
+
+
+def test_missing_repo_exit_fee_uses_fallback():
+    """Verify P1: Missing exit fee (None) uses default 0.5% fallback."""
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    repo_missing_fee = ConcreteAssetPosition(
+        asset_id="REPO_MISSING_FEE",
+        tier=1,
+        market_value=10000000.0,
+        liquidatable_value=9950000.0,
+        availability=now,
+        maturity=now + timedelta(hours=24),
+        exit_fees=None,  # Missing fee!
+        instrument_type="repo",
+    )
+
+    ob = ConcreteObligation(
+        due_time=now + timedelta(hours=1),
+        amount=5000000.0,
+        is_mandatory=True,
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=0.0,
+        asset_positions=[repo_missing_fee],
+        future_obligations=[ob],
+        credit_availability=0.0,
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+    break_cands = [c for c in opt_result.candidate_actions if c.action_type == ActionType.BREAK_REPO_EARLY]
+    assert len(break_cands) == 1
+    action = break_cands[0]
+
+    # Default fallback 0.5% must be applied
+    assert round(action.transaction_cost, 2) > 0.0
+    assert action.metadata["exit_fee_rate"] == 0.005
+
+
+def test_existing_tier2_portfolio_exposure_breach_freezes_purchases():
+    """Verify P0: Existing Tier 2 portfolio exposure breach freezes new purchases.
+    - Existing Tier 2 market value: $200,000,000.
+    - Cash: $20,000,000.
+    - Total Assets: $220,000,000.
+    - Existing Tier 2 exposure: 200M / 220M = 90.9% > 35% cap.
+    - New Tier 2 purchases must be frozen and marked infeasible.
+    """
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+
+    bonds_200m = ConcreteAssetPosition(
+        asset_id="SOVEREIGN_200M",
+        tier=2,
+        market_value=200000000.0,
+        liquidatable_value=196000000.0,
+        availability=now,
+        maturity=now + timedelta(days=730),
+        annual_yield=0.048,
+        instrument_type="bond",
+    )
+
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=20000000.0,
+        asset_positions=[bonds_200m],
+        future_obligations=[],
+    )
+
+    opt_result = optimize_treasury_actions(state, bundle)
+
+    # Check that BUY_BOND candidate was generated but marked infeasible
+    bond_cands = [c for c in opt_result.candidate_actions if c.action_type == ActionType.BUY_BOND]
+    assert len(bond_cands) == 1
+    bond_cand = bond_cands[0]
+    assert bond_cand.is_feasible is False
+    assert bond_cand.hard_gate_passed is False
+    assert "REJECTED_PORTFOLIO_EXPOSURE_BREACH" in bond_cand.reason_code
+
+
+def test_repo_entry_window_logic():
+    """Verify P1: Repo sweep window open vs closed."""
+    now_noon = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now_noon)
+
+    state = ConcreteTreasuryState(
+        timestamp=now_noon,
+        available_cash=20000000.0,
+        asset_positions=[],
+        future_obligations=[],
+    )
+
+    # When window is closed (hour = 12 UTC)
+    opt_closed = optimize_treasury_actions(state, bundle, repo_sweep_window_open=False)
+    repo_cand_closed = next(c for c in opt_closed.candidate_actions if c.action_type == ActionType.PLACE_REPO)
+    assert repo_cand_closed.is_feasible is False
+    assert "REJECTED_WINDOW_CLOSED" in repo_cand_closed.reason_code
+
+    # When window is open (e.g. 17:00 UTC)
+    now_17 = datetime(2026, 10, 17, 17, 0, tzinfo=timezone.utc)
+    bundle_17 = make_healthy_forecast_bundle(now_17)
+    state_17 = ConcreteTreasuryState(
+        timestamp=now_17,
+        available_cash=20000000.0,
+        asset_positions=[],
+        future_obligations=[],
+    )
+    opt_open = optimize_treasury_actions(state_17, bundle_17, repo_sweep_window_open=True)
+    repo_cand_open = next(c for c in opt_open.candidate_actions if c.action_type == ActionType.PLACE_REPO)
+    assert repo_cand_open.is_feasible is True
+    assert repo_cand_open.hard_gate_passed is True
+
+
+def test_tax_classification_override_preserves_exemption():
+    """Verify P1: Explicit income-type override preserves exemption/eligibility attributes."""
+    profile = create_statutory_us_corp_profile()
+    # Add a tax-exempt instrument classification
+    from reserve_juggler.tax.tax_profile import InstrumentTaxClassification
+    profile.register_classification(
+        InstrumentTaxClassification(
+            asset_id="MUNI_BOND_EXEMPT",
+            income_type=IncomeType.INTEREST,
+            is_exempt=True,
+            is_qualified_dividend=False,
+        )
+    )
+
+    res = evaluate_tax_adjusted_value(
+        gross_revenue=100000.0,
+        instrument_id="MUNI_BOND_EXEMPT",
+        tax_profile=profile,
+        explicit_income_type=IncomeType.INTEREST,
+    )
+
+    # Exemption must be preserved: 0 tax liability, with auditable override warning
+    assert res.tax_liability == 0.0
+    assert res.after_tax_net_value == 100000.0
+    assert any("Auditable Override" in w for w in res.warnings)
+
+
+def test_provisional_tax_ranking_propagation_to_decision_record():
+    """Verify P1: Missing/synthetic profile propagates provisional status into DecisionRecord."""
+    now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+    bundle = make_healthy_forecast_bundle(now)
+    state = ConcreteTreasuryState(
+        timestamp=now,
+        available_cash=10000000.0,
+        asset_positions=[],
+        future_obligations=[],
+    )
+
+    service = TreasuryDecisionService()
+    # Call without tax_profile
+    record = service.decide(state, bundle, tax_profile=None)
+
+    assert record.metadata.get("ranking_is_provisional") is True
+    assert any("PROVISIONAL_TAX_RANKING" in r for r in record.reason_codes)

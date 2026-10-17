@@ -156,8 +156,17 @@ def evaluate_tax_adjusted_value(
         is_qualified = False
     elif explicit_income_type is not None:
         resolved_income_type = explicit_income_type
-        is_exempt = False
-        is_qualified = False
+        if classification is not None:
+            # Preserve existing classification attributes unless explicitly noted, and log auditable note
+            is_exempt = classification.is_exempt
+            is_qualified = classification.is_qualified_dividend
+            warnings.append(
+                f"Auditable Override: Instrument '{instrument_id}' income type overridden to {explicit_income_type.value} "
+                f"while preserving classification attributes (exempt={is_exempt}, qualified={is_qualified})."
+            )
+        else:
+            is_exempt = False
+            is_qualified = False
     else:
         assert classification is not None
         resolved_income_type = classification.income_type

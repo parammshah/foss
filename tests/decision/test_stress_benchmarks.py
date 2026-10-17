@@ -305,6 +305,9 @@ def test_stress_repo_lockup_and_credit_unavailability():
 
     # Since bridge credit is 0, the optimizer must BREAK_REPO_EARLY to fund the payout!
     assert record.selected_action["action_type"] == "BREAK_REPO_EARLY"
-    assert record.selected_action["amount"] == 5000000.0
+    # Action amount matches gross liquidation nominal, netting exactly $5,000,000 after 0.5% exit fee
+    assert round(record.selected_action["net_proceeds"], 2) == 5000000.0
+    assert round(record.selected_action["gross_proceeds"], 2) == 5025125.63
+    assert record.selected_action["amount"] == record.selected_action["gross_proceeds"]
     # Customer payout is protected: shortfalls = 0!
     assert "BREAK_REPO_EARLY" in record.selected_action["reason_code"]

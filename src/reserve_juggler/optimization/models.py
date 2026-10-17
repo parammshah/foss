@@ -5,6 +5,7 @@ Models and types for Operations Research treasury action optimization.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional
 
@@ -34,15 +35,19 @@ class OptimizationMode(str, Enum):
 
 @dataclass(frozen=True)
 class TierExposureLimits:
-    """Configurable experimental limits for new allocations by TSS mode."""
+    """Configurable limits for new allocations and portfolio exposure by TSS mode."""
 
-    tier2_max_pct: float  # Sovereign bonds cap as % of eligible surplus
-    tier3_max_pct: float  # Equities cap as % of eligible surplus
+    tier2_max_pct: float  # Sovereign bonds cap as % of eligible surplus (new allocation)
+    tier3_max_pct: float  # Equities cap as % of eligible surplus (new allocation)
+    tier2_portfolio_cap_pct: float = 0.35  # Maximum Tier 2 allocation as % of total portfolio
+    tier3_portfolio_cap_pct: float = 0.10  # Maximum Tier 3 allocation as % of total portfolio
 
     def to_dict(self) -> dict[str, float]:
         return {
             "tier2_max_pct": self.tier2_max_pct,
             "tier3_max_pct": self.tier3_max_pct,
+            "tier2_portfolio_cap_pct": self.tier2_portfolio_cap_pct,
+            "tier3_portfolio_cap_pct": self.tier3_portfolio_cap_pct,
         }
 
 
@@ -55,13 +60,51 @@ def get_tier_limits_for_tss(tss_score: float) -> TierExposureLimits:
     TSS 80–100: Tier 2 cap 35%, Tier 3 cap 10%
     """
     if tss_score < 40.0:
-        return TierExposureLimits(tier2_max_pct=0.0, tier3_max_pct=0.0)
+        return TierExposureLimits(
+            tier2_max_pct=0.0,
+            tier3_max_pct=0.0,
+            tier2_portfolio_cap_pct=0.0,
+            tier3_portfolio_cap_pct=0.0,
+        )
     elif tss_score < 60.0:
-        return TierExposureLimits(tier2_max_pct=0.10, tier3_max_pct=0.0)
+        return TierExposureLimits(
+            tier2_max_pct=0.10,
+            tier3_max_pct=0.0,
+            tier2_portfolio_cap_pct=0.10,
+            tier3_portfolio_cap_pct=0.0,
+        )
     elif tss_score < 80.0:
-        return TierExposureLimits(tier2_max_pct=0.25, tier3_max_pct=0.05)
+        return TierExposureLimits(
+            tier2_max_pct=0.25,
+            tier3_max_pct=0.05,
+            tier2_portfolio_cap_pct=0.25,
+            tier3_portfolio_cap_pct=0.05,
+        )
     else:
-        return TierExposureLimits(tier2_max_pct=0.35, tier3_max_pct=0.10)
+        return TierExposureLimits(
+            tier2_max_pct=0.35,
+            tier3_max_pct=0.10,
+            tier2_portfolio_cap_pct=0.35,
+            tier3_portfolio_cap_pct=0.10,
+        )
+
+
+@dataclass
+class HumanOverride:
+    """Explicit, auditable human override that supersedes candidate rejection."""
+
+    candidate_id: str
+    authorized_by: str
+    override_reason: str
+    timestamp: Optional[datetime] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "authorized_by": self.authorized_by,
+            "override_reason": self.override_reason,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+        }
 
 
 @dataclass
@@ -70,6 +113,7 @@ class TreasuryAction:
 
     action_type: ActionType
     amount: float
+    candidate_id: str = ""
     asset_id: Optional[str] = None
     expected_net_value: float = 0.0
     total_estimated_cost: float = 0.0
@@ -81,6 +125,11 @@ class TreasuryAction:
     repayment_feasibility: bool = True
     reason_code: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Resolution and funding states
+    payout_funded: bool = True
+    funding_plan_resolved: bool = True
+    repayment_plan_feasible: bool = True
 
     # Time-indexed funding plan attributes
     required_payout_amount: float = 0.0
@@ -106,9 +155,11 @@ class TreasuryAction:
     payouts_due_before_repayment: float = 0.0
     residual_debt_after_repayment: float = 0.0
     credit_availability_after_draw: float = 0.0
+    ranking_is_provisional: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "candidate_id": self.candidate_id,
             "action_type": self.action_type.value,
             "asset_id": self.asset_id,
             "amount": round(self.amount, 2),
@@ -117,6 +168,9 @@ class TreasuryAction:
             "risk_penalty": round(self.risk_penalty, 4),
             "is_feasible": self.is_feasible,
             "hard_gate_passed": self.hard_gate_passed,
+            "payout_funded": self.payout_funded,
+            "funding_plan_resolved": self.funding_plan_resolved,
+            "repayment_plan_feasible": self.repayment_plan_feasible,
             "cost_breakdown": {k: round(v, 4) for k, v in self.cost_breakdown.items()},
             "timing_hours": round(self.timing_hours, 2),
             "repayment_feasibility": self.repayment_feasibility,
@@ -145,6 +199,7 @@ class TreasuryAction:
             "payouts_due_before_repayment": round(self.payouts_due_before_repayment, 2),
             "residual_debt_after_repayment": round(self.residual_debt_after_repayment, 2),
             "credit_availability_after_draw": round(self.credit_availability_after_draw, 2),
+            "ranking_is_provisional": self.ranking_is_provisional,
             "metadata": self.metadata,
         }
 
@@ -163,6 +218,7 @@ class OptimizationResult:
     optimization_mode: str = "SURPLUS_ALLOCATION"  # 'EMERGENCY_FUNDING' vs 'SURPLUS_ALLOCATION'
     unresolved_shortfall: float = 0.0
     is_unresolved_shortfall: bool = False
+    human_override: Optional[HumanOverride] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -176,4 +232,6 @@ class OptimizationResult:
             "optimization_mode": self.optimization_mode,
             "unresolved_shortfall": round(self.unresolved_shortfall, 2),
             "is_unresolved_shortfall": self.is_unresolved_shortfall,
+            "human_override": self.human_override.to_dict() if self.human_override else None,
         }
+
