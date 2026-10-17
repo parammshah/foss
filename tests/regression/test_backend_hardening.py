@@ -2037,5 +2037,166 @@ def test_65_all_mandatory_stress_scenarios_reconcile_and_distinguish_deficits_fr
     assert "Required protected_reserve_floor is missing" in str(excinfo.value)
 
 
+def test_66_rollback_to_unpersisted_version_fails_closed_without_runtime_mutation(tmp_path):
+    """
+    Defect 1: Rollback can claim success while runtime and SQLite disagree.
+    Isolated database scenario:
+    - Component FORECASTING is active at v2.0.0 with param_a = 200.0.
+    - Historical version v1.4.0 configuration was never persisted in SQLite.
+    - Attempting rollback to v1.4.0 must:
+      1. Fail closed (return False).
+      2. Keep param_a = 200.0 in the runtime registry.
+      3. Keep param_a = 200.0 on the live provider.
+      4. Retain v2.0.0 as the active version in SQLite (not leave SQLite with no active version).
+      5. Directly calling store.set_active_runtime_version for an unpersisted version must raise PersistenceError.
+    """
+    from reserve_juggler.learning.sqlite_store import SqliteEventStore, PersistenceError
+    from reserve_juggler.learning.runtime_registry import GenericRuntimeProvider, RuntimeComponentRegistry
+    import pytest
+
+    db_path = str(tmp_path / "rollback_disagreement.db")
+    store = SqliteEventStore(db_path)
+
+    # Establish an isolated database where only v2.0.0 exists and is active with param_a = 200.0
+    store.save_runtime_version_config("FORECASTING", "v2.0.0", {"param_a": 200.0, "param_b": 50.0}, is_active=True)
+
+    # Instantiate registry connected to this isolated store
+    registry = RuntimeComponentRegistry(persistence_store=store)
+    provider = GenericRuntimeProvider("FORECASTING", {"param_a": 200.0, "param_b": 50.0})
+    registry.register_provider("FORECASTING", provider)
+
+    assert registry.get_parameter("FORECASTING", "param_a") == 200.0
+    assert provider.get_parameter("param_a") == 200.0
+    active_in_db = store.get_active_runtime_versions()
+    assert active_in_db["FORECASTING"][0] == "v2.0.0"
+
+    # Verify that v1.4.0 is recognized as NOT having a restorable config
+    assert not registry.has_version_config("FORECASTING", "v1.4.0")
+
+    # Request rollback to unpersisted historical version v1.4.0
+    ok, msg = registry.restore_runtime_state("FORECASTING", "v1.4.0")
+
+    # 1. Must fail closed
+    assert not ok
+    assert "no valid restorable runtime configuration" in msg
+
+    # 2. Runtime registry must NOT discard param_a
+    assert registry.get_parameter("FORECASTING", "param_a") == 200.0
+
+    # 3. Live provider must still have param_a = 200.0
+    assert provider.get_parameter("param_a") == 200.0
+
+    # 4. SQLite must STILL have active version v2.0.0 (NOT left with no active version!)
+    active_in_db_after = store.get_active_runtime_versions()
+    assert "FORECASTING" in active_in_db_after
+    assert active_in_db_after["FORECASTING"][0] == "v2.0.0"
+
+    # 5. Direct call to store.set_active_runtime_version for unpersisted version must raise PersistenceError
+    with pytest.raises(PersistenceError) as excinfo:
+        store.set_active_runtime_version("FORECASTING", "v1.4.0")
+    assert "version does not exist in persistent database" in str(excinfo.value)
+
+    # 6. Verify that when a valid historical version IS persisted and restored,
+    # provider parameters not in target_snapshot are removed so live provider matches registry exactly
+    store.save_runtime_version_config("FORECASTING", "v1.0.0", {"base_param": 10.0}, is_active=False)
+    ok_valid, msg_valid = registry.restore_runtime_state("FORECASTING", "v1.0.0")
+    assert ok_valid
+    assert registry.get_parameter("FORECASTING", "base_param") == 10.0
+    assert provider.get_parameter("base_param") == 10.0
+    assert provider.get_parameter("param_a") is None  # param_a was cleanly removed!
+    assert store.get_active_runtime_versions()["FORECASTING"][0] == "v1.0.0"
+
+
+def test_67_sentinel_reports_true_sample_size_and_rejects_sub_minimum_evaluations():
+    """
+    Defect 2: Sentinel can pass evaluation with fewer observations than reported.
+    When evaluating a Sentinel threshold with a GenericRuntimeProvider and eight deterministic benchmark records:
+    1. evaluation_status must be INCONCLUSIVE (not PASS).
+    2. is_promotable must be False.
+    3. validation_sample_size must be 8 (truthful count of actual evaluated records, not 30).
+    4. actual shadow runs must be 8.
+    5. violations must include the sub-minimum sample size warning (< 10).
+    """
+    from reserve_juggler.learning.evaluation_engine import CandidateEvaluationEngine
+    from reserve_juggler.learning.models import CandidateUpdate
+    from reserve_juggler.learning.runtime_registry import GenericRuntimeProvider, RuntimeComponentRegistry
+
+    registry = RuntimeComponentRegistry()
+    provider = GenericRuntimeProvider("SENTINEL_RISK", {"panic_sentinel_alert_threshold": 60.0})
+    registry.register_provider("SENTINEL_RISK", provider)
+
+    engine = CandidateEvaluationEngine(runtime_registry=registry)
+
+    cand = CandidateUpdate(
+        candidate_id="CAND-SENT-8REC",
+        component="SENTINEL_RISK",
+        parameter_key="panic_sentinel_alert_threshold",
+        current_value=60.0,
+        proposed_value=65.0,
+        description="Threshold calibration with 8 records",
+        author="Risk Modeler",
+        created_at="2026-10-18T00:00:00Z",
+        holdout_sample_size=30,
+    )
+
+    eight_benchmark_records = [
+        {"score": 45.0, "is_corroborated": False},
+        {"score": 55.0, "is_corroborated": False},
+        {"score": 62.0, "is_corroborated": True},
+        {"score": 65.0, "is_corroborated": True},
+        {"score": 70.0, "is_corroborated": True},
+        {"score": 75.0, "is_corroborated": True},
+        {"score": 80.0, "is_corroborated": True},
+        {"score": 85.0, "is_corroborated": True},
+    ]
+
+    report = engine.evaluate_candidate(
+        candidate=cand,
+        sample_size=30,  # requested 30, but only 8 provided
+        evaluation_records=eight_benchmark_records,
+    )
+
+    # 1. evaluation_status must be INCONCLUSIVE
+    assert report.evaluation_status == "INCONCLUSIVE"
+
+    # 2. is_promotable must be False
+    assert report.is_promotable is False
+
+    # 3. validation_sample_size must be 8, NEVER 30!
+    assert report.validation_sample_size == 8
+
+    # 4. shadow_runs must be 8
+    assert report.shadow_runs == 8
+
+    # 5. violations must state below minimum threshold (10)
+    assert any("below minimum statistical threshold (10)" in v for v in report.violations)
+
+    # 6. Verify that when at least 10 observations are evaluated and metric improves, true sample size is reported
+    twelve_records = [
+        {"score": 45.0, "is_corroborated": False},
+        {"score": 55.0, "is_corroborated": False},
+        {"score": 62.0, "is_corroborated": True},
+        {"score": 63.0, "is_corroborated": False},  # False alarm between 60 and 65 filtered out by candidate
+        {"score": 66.0, "is_corroborated": True},
+        {"score": 70.0, "is_corroborated": True},
+        {"score": 75.0, "is_corroborated": True},
+        {"score": 80.0, "is_corroborated": True},
+        {"score": 85.0, "is_corroborated": True},
+        {"score": 88.0, "is_corroborated": True},
+        {"score": 92.0, "is_corroborated": True},
+        {"score": 96.0, "is_corroborated": True},
+    ]
+    report_valid = engine.evaluate_candidate(
+        candidate=cand,
+        sample_size=30,
+        evaluation_records=twelve_records,
+    )
+    assert report_valid.evaluation_status == "PASS"
+    assert report_valid.is_promotable is True
+    assert report_valid.validation_sample_size == 12
+    assert report_valid.shadow_runs == 12
+
+
+
 
 

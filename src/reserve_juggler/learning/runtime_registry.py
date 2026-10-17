@@ -137,12 +137,21 @@ class RuntimeComponentRegistry:
         }
 
         # Active connected provider instances (empty by default; real consumers must register explicitly)
+        # Baseline version tags aligned with VersionRegistry
+        self._initial_versions: Dict[str, str] = {
+            "FORECASTING": "v1.4.0",
+            "DECISION_OPTIMIZER": "v1.2.0",
+            "SENTINEL_RISK": "v1.0.0",
+            "SCENARIO_GENERATOR": "v1.1.0",
+            "EXPLAINABILITY": "v1.0.0",
+        }
+
+        # Active connected provider instances (empty by default; real consumers must register explicitly)
         self._providers: Dict[str, RuntimeProvider] = {}
 
         # Version-specific runtime configuration history (Part B2, B3)
         self._version_configs: Dict[str, Dict[str, Dict[str, Any]]] = {
-            k: {"v1.0.0": copy.deepcopy(v), "v1.4.0": copy.deepcopy(v), "v1.2.0": copy.deepcopy(v), "v2.0.0": copy.deepcopy(v)}
-            for k, v in self._runtime_configs.items()
+            k: {} for k in self._runtime_configs
         }
 
         # Track which components were recovered from durable store
@@ -160,8 +169,19 @@ class RuntimeComponentRegistry:
                     self._runtime_configs[comp] = copy.deepcopy(active_cfg)
                     self._durable_loaded_components.add(comp)
                     logger.info("Restored active runtime configuration for %s version %s from persistent store.", comp, ver_tag)
+
+                # Persist baseline configurations for subsystems that have no records in store yet
+                for comp, cfg in self._runtime_configs.items():
+                    base_ver = self._initial_versions.get(comp, "v1.0.0")
+                    if comp not in all_saved or not all_saved[comp]:
+                        self._store.save_runtime_version_config(comp, base_ver, copy.deepcopy(cfg), is_active=True)
+                        self._version_configs.setdefault(comp, {})[base_ver] = copy.deepcopy(cfg)
             except Exception as e:
                 logger.error("Failed to recover runtime configs from persistent store: %s", e)
+        else:
+            for comp, cfg in self._runtime_configs.items():
+                base_ver = self._initial_versions.get(comp, "v1.0.0")
+                self._version_configs.setdefault(comp, {})[base_ver] = copy.deepcopy(cfg)
 
         # Snapshot stack for rollback
         self._history_snapshots: Dict[str, list[Dict[str, Any]]] = {
@@ -204,6 +224,13 @@ class RuntimeComponentRegistry:
     def has_version_config(self, component: str, version_tag: str) -> bool:
         """Returns True if a specific version has a restorable configuration."""
         comp = component.upper()
+        if self._store:
+            try:
+                configs = self._store.get_runtime_version_configs(comp)
+                return version_tag in configs
+            except Exception as e:
+                logger.error("Failed to query runtime configs from store for %s: %s", comp, e)
+                return False
         return comp in self._version_configs and version_tag in self._version_configs[comp]
 
     def get_component_status(self, component: str) -> str:
@@ -227,8 +254,16 @@ class RuntimeComponentRegistry:
             if hasattr(provider, "_params"):
                 for k, v in provider._params.items():
                     self._runtime_configs.setdefault(comp, {})[k] = copy.deepcopy(v)
-            if comp in self._version_configs and "v1.0.0" in self._version_configs[comp]:
-                self._version_configs[comp]["v1.0.0"] = copy.deepcopy(self._runtime_configs.get(comp, {}))
+            base_ver = self._initial_versions.get(comp, "v1.0.0")
+            if comp in self._version_configs:
+                self._version_configs[comp][base_ver] = copy.deepcopy(self._runtime_configs.get(comp, {}))
+            if self._store:
+                try:
+                    active_map = self._store.get_active_runtime_versions()
+                    if comp not in active_map or active_map[comp][0] == base_ver:
+                        self._store.save_runtime_version_config(comp, base_ver, self._runtime_configs[comp], is_active=True)
+                except Exception as e:
+                    logger.debug("Could not sync provider params to store: %s", e)
 
         # Always synchronize configuration from active registry to provider
         for k, v in self._runtime_configs.get(comp, {}).items():
@@ -337,29 +372,54 @@ class RuntimeComponentRegistry:
         original_snapshot = copy.deepcopy(self._runtime_configs.get(comp, {}))
 
         if target_version:
-            if comp not in self._version_configs or target_version not in self._version_configs[comp]:
-                return (False, f"Target version '{target_version}' has no valid restorable runtime configuration for {comp}.")
-            target_snapshot = self._version_configs[comp][target_version]
+            if self._store:
+                try:
+                    store_configs = self._store.get_runtime_version_configs(comp)
+                except Exception as e:
+                    return (False, f"Failed to query persistent database for {comp}: {e}")
+                if target_version not in store_configs:
+                    return (
+                        False,
+                        f"Target version '{target_version}' has no valid restorable runtime configuration for {comp}.",
+                    )
+                target_snapshot = store_configs[target_version]
+                self._version_configs.setdefault(comp, {})[target_version] = copy.deepcopy(target_snapshot)
+            else:
+                if comp not in self._version_configs or target_version not in self._version_configs[comp]:
+                    return (False, f"Target version '{target_version}' has no valid restorable runtime configuration for {comp}.")
+                target_snapshot = self._version_configs[comp][target_version]
         else:
             if comp not in self._history_snapshots or len(self._history_snapshots[comp]) <= 1:
                 return (False, f"No previous runtime snapshot available to restore for {comp}.")
             self._history_snapshots[comp].pop()
             target_snapshot = self._history_snapshots[comp][-1]
 
+        # Snapshot original provider params for safe compensation
+        original_provider_params = None
+        if comp in self._providers and hasattr(self._providers[comp], "_params") and isinstance(self._providers[comp]._params, dict):
+            original_provider_params = copy.deepcopy(self._providers[comp]._params)
+
         # 1. Restore on live provider if registered
         applied_keys = []
         if comp in self._providers:
+            provider = self._providers[comp]
+            # Synchronize provider params: discard old parameters that do not exist in target historical version
+            if hasattr(provider, "_params") and isinstance(provider._params, dict):
+                for old_k in list(provider._params.keys()):
+                    if old_k not in target_snapshot:
+                        del provider._params[old_k]
+
             for k, v in target_snapshot.items():
-                ok, p_msg = self._providers[comp].set_parameter(k, v)
+                ok, p_msg = provider.set_parameter(k, v)
                 if not ok:
                     # Compensate: revert previously applied parameters back to original
+                    if original_provider_params is not None and hasattr(provider, "_params"):
+                        provider._params = copy.deepcopy(original_provider_params)
                     comp_failed = False
-                    for rev_k in applied_keys:
-                        rev_v = original_snapshot.get(rev_k)
-                        if rev_v is not None:
-                            ok_rev, _ = self._providers[comp].set_parameter(rev_k, rev_v)
-                            if not ok_rev:
-                                comp_failed = True
+                    for rev_k, rev_v in original_snapshot.items():
+                        ok_rev, _ = provider.set_parameter(rev_k, rev_v)
+                        if not ok_rev:
+                            comp_failed = True
                     if comp_failed:
                         self.mark_recovery_required(
                             comp,
@@ -381,6 +441,8 @@ class RuntimeComponentRegistry:
                 self._runtime_configs[comp] = copy.deepcopy(original_snapshot)
 
                 # Revert live provider back to original
+                if original_provider_params is not None and hasattr(self._providers[comp], "_params"):
+                    self._providers[comp]._params = copy.deepcopy(original_provider_params)
                 revert_failed = False
                 if comp in self._providers:
                     for k, v in original_snapshot.items():

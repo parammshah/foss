@@ -437,6 +437,15 @@ class SqliteEventStore:
         comp = component.upper()
         try:
             with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT 1 FROM runtime_version_configs WHERE component = ? AND version_tag = ?;",
+                    (comp, version_tag),
+                )
+                if not cursor.fetchone():
+                    raise PersistenceError(
+                        f"Cannot activate version '{version_tag}' for component '{comp}': "
+                        f"version does not exist in persistent database."
+                    )
                 conn.execute("UPDATE runtime_version_configs SET is_active = 0 WHERE component = ?;", (comp,))
                 conn.execute(
                     "UPDATE runtime_version_configs SET is_active = 1 WHERE component = ? AND version_tag = ?;",
