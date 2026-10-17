@@ -1,0 +1,367 @@
+"""
+Governance, Safety Invariants, and Version Rollback Registry.
+Enforces non-negotiable safety rules on candidate updates and records audited rollback history.
+"""
+
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from reserve_juggler.learning.models import CandidateUpdate
+
+logger = logging.getLogger(__name__)
+
+
+class SafetyInvariantViolation(Exception):
+    """Raised when an update violates fundamental treasury safety invariants."""
+    pass
+
+
+SUPPORTED_SENTINEL_PARAMETERS: Dict[str, Dict[str, Any]] = {
+    "panic_sentinel_alert_threshold": {
+        "types": (int, float),
+        "min": 0.0,
+        "max": 100.0,
+        "unit": "composite risk score (0-100)",
+        "description": "Threshold for triggering panic sentinel alerts and scenario recommendations.",
+    },
+    "stale_hours_threshold": {
+        "types": (int, float),
+        "min": 1.0,
+        "max": 168.0,
+        "unit": "elapsed hours (1h-168h)",
+        "description": "Elapsed hours after which uncorroborated event confidence decays exponentially.",
+    },
+    "high_severity_threshold": {
+        "types": (int, float),
+        "min": 0.10,
+        "max": 0.90,
+        "unit": "normalized score ratio (0.10-0.90)",
+        "description": "Cutoff for classifying risk signal severity as HIGH.",
+    },
+    "critical_severity_threshold": {
+        "types": (int, float),
+        "min": 0.50,
+        "max": 1.0,
+        "unit": "normalized score ratio (0.50-1.0)",
+        "description": "Cutoff for classifying risk signal severity as CRITICAL.",
+    },
+}
+
+
+class SafetyInvariantValidator:
+    """
+    Enforces non-negotiable safety rules on candidate updates:
+    - Never remove or lower mandatory liquidity reserves below statutory floors.
+    - Never bypass credit limits or asset eligibility.
+    - Never rewrite statutory tax rules.
+    - Never disable hard safety constraints.
+    - Never approve own high-risk policy changes.
+    - Reject candidates that improve accuracy but increase liquidity shortfalls.
+    """
+
+    FORBIDDEN_PARAMETER_PATTERNS = [
+        "bypass_reserve",
+        "disable_gate",
+        "override_tax_rate",
+        "ignore_credit_limit",
+        "force_unverified_liquidation",
+        "disable_firewall",
+        "reduce_reserve",
+    ]
+
+    ALLOWED_COMPONENTS = {
+        "FORECASTING",
+        "DECISION_OPTIMIZER",
+        "SENTINEL_RISK",
+        "SCENARIO_GENERATOR",
+        "EXPLAINABILITY",
+    }
+
+    def validate_candidate(self, candidate: CandidateUpdate) -> Tuple[bool, List[str]]:
+        violations: List[str] = []
+
+        # 1. Component check
+        if candidate.component not in self.ALLOWED_COMPONENTS:
+            violations.append(
+                f"Unauthorized component '{candidate.component}'. Only approved subsystems may be updated."
+            )
+
+        # 2. Forbidden parameter checks
+        param_lower = candidate.parameter_key.lower()
+        for forbidden in self.FORBIDDEN_PARAMETER_PATTERNS:
+            if forbidden in param_lower:
+                violations.append(
+                    f"Safety Invariant Violation: Parameter '{candidate.parameter_key}' violates safety firewall rule '{forbidden}'."
+                )
+
+        # 3. Mandatory Reserve protection
+        if "reserve_floor" in param_lower or "mandatory_reserve" in param_lower:
+            if isinstance(candidate.proposed_value, (int, float)) and isinstance(candidate.current_value, (int, float)):
+                if candidate.proposed_value < candidate.current_value:
+                    violations.append(
+                        "Safety Invariant Violation: Autonomous learning may never reduce the mandatory liquidity reserve floor."
+                    )
+
+        # 4. Tax code integrity
+        if "tax" in param_lower or "statutory" in param_lower:
+            violations.append(
+                "Safety Invariant Violation: Statutory tax rules and schedules cannot be modified by machine learning."
+            )
+
+        # 5. Stress shortfall check: Never promote a candidate that induces liquidity deficit
+        if candidate.stress_shortfall_count > 0:
+            violations.append(
+                f"Safety Invariant Violation: Candidate generated {candidate.stress_shortfall_count} liquidity shortfalls under stress testing. Promotion prohibited."
+            )
+
+        # 6. Sample size check (avoid fabricating improvement)
+        if candidate.holdout_sample_size < 3:
+            violations.append(
+                f"Inconclusive holdout data: Sample size ({candidate.holdout_sample_size}) is insufficient for safe statistical validation."
+            )
+
+        # 7. Parameter value finiteness and type validation (Part A5)
+        import math
+        def check_val(v: Any, path: str = "") -> List[str]:
+            errs: List[str] = []
+            if isinstance(v, (int, float)):
+                if math.isnan(v):
+                    errs.append(f"Invalid parameter value at {path or 'root'}: NaN is not allowed.")
+                elif math.isinf(v):
+                    errs.append(f"Invalid parameter value at {path or 'root'}: Infinity is not allowed.")
+            elif isinstance(v, dict):
+                for k, sub_v in v.items():
+                    errs.extend(check_val(sub_v, f"{path}.{k}" if path else str(k)))
+            elif isinstance(v, (list, tuple)):
+                for idx, sub_v in enumerate(v):
+                    errs.extend(check_val(sub_v, f"{path}[{idx}]"))
+            return errs
+
+        violations.extend(check_val(candidate.proposed_value))
+
+        # 8. Component and parameter specific range & normalization constraints (Part A5)
+        if candidate.parameter_key == "ensemble_combining_weights":
+            if isinstance(candidate.proposed_value, dict):
+                weights = candidate.proposed_value.values()
+                if any(not isinstance(w, (int, float)) for w in weights):
+                    violations.append("Ensemble combining weights must be numeric.")
+                elif any(w < 0.0 for w in weights):
+                    violations.append("Ensemble combining weights must be non-negative.")
+                elif abs(sum(weights) - 1.0) > 1e-4:
+                    violations.append(
+                        f"Ensemble combining weights must form a convex combination summing to 1.0 (observed sum: {sum(weights):.4f})."
+                    )
+            elif isinstance(candidate.proposed_value, (list, tuple)):
+                if any(not isinstance(w, (int, float)) for w in candidate.proposed_value):
+                    violations.append("Ensemble combining weights must be numeric.")
+                elif any(w < 0.0 for w in candidate.proposed_value):
+                    violations.append("Ensemble combining weights must be non-negative.")
+                elif abs(sum(candidate.proposed_value) - 1.0) > 1e-4:
+                    violations.append(
+                        f"Ensemble combining weights must form a convex combination summing to 1.0 (observed sum: {sum(candidate.proposed_value):.4f})."
+                    )
+
+        # Buffer multipliers must be positive
+        if "multiplier" in param_lower:
+            if isinstance(candidate.proposed_value, (int, float)) and candidate.proposed_value <= 0.0:
+                violations.append(f"Multiplier parameter '{candidate.parameter_key}' must be strictly positive (> 0).")
+
+        # 9. Sentinel specific parameter schema and range constraints
+        if candidate.component.upper() == "SENTINEL_RISK":
+            if candidate.parameter_key not in SUPPORTED_SENTINEL_PARAMETERS:
+                violations.append(
+                    f"Unsupported parameter key '{candidate.parameter_key}' for SENTINEL_RISK. "
+                    f"Supported parameters: {', '.join(sorted(SUPPORTED_SENTINEL_PARAMETERS.keys()))}."
+                )
+            else:
+                spec = SUPPORTED_SENTINEL_PARAMETERS[candidate.parameter_key]
+                val = candidate.proposed_value
+                if not isinstance(val, spec["types"]):
+                    violations.append(
+                        f"Parameter '{candidate.parameter_key}' must be numeric (expected {spec['unit']})."
+                    )
+                elif val < spec["min"] or val > spec["max"]:
+                    violations.append(
+                        f"Parameter '{candidate.parameter_key}' value {val} is outside valid range "
+                        f"[{spec['min']}, {spec['max']}] ({spec['unit']})."
+                    )
+
+        return (len(violations) == 0, violations)
+
+
+@dataclass
+class VersionAuditEntry:
+    entry_id: str
+    component: str
+    previous_version: str
+    new_version: str
+    timestamp: str
+    author: str
+    approver: str
+    approver_role: str
+    action_type: str  # "PROMOTION", "ROLLBACK"
+    justification: str
+
+
+class VersionRegistry:
+    """
+    Tracks version lineage and rollback history for all subsystems.
+    """
+
+    def __init__(self, persistence_store: Optional[Any] = None):
+        self.persistence_store = persistence_store
+        self._active_versions: Dict[str, str] = {
+            "FORECASTING": "v1.4.0",
+            "DECISION_OPTIMIZER": "v1.2.0",
+            "SENTINEL_RISK": "v1.0.0",
+            "SCENARIO_GENERATOR": "v1.1.0",
+            "EXPLAINABILITY": "v1.0.0",
+        }
+        self._version_history: Dict[str, List[str]] = {
+            k: [v] for k, v in self._active_versions.items()
+        }
+        self._audit_trail: List[VersionAuditEntry] = []
+
+        # Recover persisted version audits and restore latest approved version
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store") and self.persistence_store.sqlite_store:
+            try:
+                audits = self.persistence_store.sqlite_store.get_version_audits()
+                for a in audits:
+                    entry = VersionAuditEntry(
+                        entry_id=a["entry_id"],
+                        component=a["component"],
+                        previous_version=a["previous_version"],
+                        new_version=a["new_version"],
+                        timestamp=a["timestamp"],
+                        author=a["author"],
+                        approver=a["approver"],
+                        approver_role=a["approver_role"],
+                        action_type=a["action_type"],
+                        justification=a["justification"],
+                    )
+                    self._audit_trail.append(entry)
+                    comp = a["component"].upper()
+                    self._active_versions[comp] = a["new_version"]
+                    self._version_history.setdefault(comp, []).append(a["new_version"])
+            except Exception as e:
+                logger.debug("Could not recover version audits from persistence: %s", e)
+
+    def get_active_versions(self) -> Dict[str, str]:
+        return dict(self._active_versions)
+
+    def get_active_version(self, component: str) -> str:
+        return self._active_versions.get(component.upper(), "v1.0.0")
+
+    def register_promotion(
+        self,
+        component: str,
+        new_version: str,
+        author: str,
+        approver: str,
+        approver_role: str,
+        justification: str,
+    ) -> None:
+        """Register a promoted candidate as the new active version."""
+        comp = component.upper()
+        prev = self._active_versions.get(comp, "v1.0.0")
+        self._active_versions[comp] = new_version
+        self._version_history.setdefault(comp, []).append(new_version)
+
+        entry = VersionAuditEntry(
+            entry_id=f"AUD-{len(self._audit_trail)+1}",
+            component=comp,
+            previous_version=prev,
+            new_version=new_version,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            author=author,
+            approver=approver,
+            approver_role=approver_role,
+            action_type="PROMOTION",
+            justification=justification,
+        )
+        self._audit_trail.append(entry)
+
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store"):
+            try:
+                self.persistence_store.sqlite_store.save_version_audit({
+                    "entry_id": entry.entry_id,
+                    "component": entry.component,
+                    "previous_version": entry.previous_version,
+                    "new_version": entry.new_version,
+                    "timestamp": entry.timestamp,
+                    "author": entry.author,
+                    "approver": entry.approver,
+                    "approver_role": entry.approver_role,
+                    "action_type": entry.action_type,
+                    "justification": entry.justification,
+                })
+            except Exception as e:
+                self._active_versions[comp] = prev
+                if self._version_history.get(comp) and self._version_history[comp][-1] == new_version:
+                    self._version_history[comp].pop()
+                if self._audit_trail and self._audit_trail[-1] == entry:
+                    self._audit_trail.pop()
+                logger.error("Failed to persist version audit: %s", str(e))
+                raise
+
+    def rollback(
+        self,
+        component: str,
+        target_version: str,
+        author: str,
+        approver_role: str,
+        justification: str,
+    ) -> Tuple[bool, str]:
+        """Roll back an active component to a previously approved version."""
+        comp = component.upper()
+        if approver_role not in ("HEAD_OF_TREASURY", "RISK_OFFICER", "AUDITOR"):
+            return (False, f"Permission Denied: Role '{approver_role}' cannot authorize model rollback.")
+
+        history = self._version_history.get(comp, [])
+        if target_version not in history:
+            return (False, f"Target version '{target_version}' not found in approved version history for {comp}.")
+
+        prev = self._active_versions.get(comp, "v1.0.0")
+        self._active_versions[comp] = target_version
+
+        entry = VersionAuditEntry(
+            entry_id=f"AUD-{len(self._audit_trail)+1}",
+            component=comp,
+            previous_version=prev,
+            new_version=target_version,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            author=author,
+            approver=author,
+            approver_role=approver_role,
+            action_type="ROLLBACK",
+            justification=justification,
+        )
+        self._audit_trail.append(entry)
+
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store"):
+            try:
+                self.persistence_store.sqlite_store.save_version_audit({
+                    "entry_id": entry.entry_id,
+                    "component": entry.component,
+                    "previous_version": entry.previous_version,
+                    "new_version": entry.new_version,
+                    "timestamp": entry.timestamp,
+                    "author": entry.author,
+                    "approver": entry.approver,
+                    "approver_role": entry.approver_role,
+                    "action_type": entry.action_type,
+                    "justification": entry.justification,
+                })
+            except Exception as e:
+                self._active_versions[comp] = prev
+                if self._audit_trail and self._audit_trail[-1] == entry:
+                    self._audit_trail.pop()
+                logger.error("Failed to persist version audit: %s", str(e))
+                return (False, f"Rollback aborted: version audit persistence failed: {e}")
+
+        return (True, f"Successfully rolled back {comp} from {prev} to {target_version}.")
+
+    def get_audit_trail(self) -> List[VersionAuditEntry]:
+        return list(self._audit_trail)
