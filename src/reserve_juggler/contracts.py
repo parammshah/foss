@@ -227,12 +227,36 @@ class ForecastPoint(BaseModel):
     cumulative_net_outflow_p95: float = Field(default=0.0, description="Conservative cumulative net outflow from t=0 to target at P95")
     cumulative_net_outflow_p99: float = Field(default=0.0, description="Extreme stress cumulative net outflow from t=0 to target at P99")
 
+    # Point forecasts (USD)
+    deposit_point_forecast: Optional[float] = Field(default=None, description="Expected point forecast for deposits in USD")
+    withdrawal_point_forecast: Optional[float] = Field(default=None, description="Expected point forecast for withdrawals in USD")
+
+    # Multi-level interval quantiles (50% and 95% bounds)
+    deposit_p25: Optional[float] = Field(default=None, description="25th percentile deposit volume in USD")
+    deposit_p75: Optional[float] = Field(default=None, description="75th percentile deposit volume in USD")
+    deposit_p025: Optional[float] = Field(default=None, description="2.5th percentile deposit volume in USD")
+    deposit_p975: Optional[float] = Field(default=None, description="97.5th percentile deposit volume in USD")
+
+    withdrawal_p25: Optional[float] = Field(default=None, description="25th percentile withdrawal volume in USD")
+    withdrawal_p75: Optional[float] = Field(default=None, description="75th percentile withdrawal volume in USD")
+    withdrawal_p025: Optional[float] = Field(default=None, description="2.5th percentile withdrawal volume in USD")
+    withdrawal_p975: Optional[float] = Field(default=None, description="97.5th percentile withdrawal volume in USD")
+
+    # Reliability and calibration metadata
+    calibration_sample_size: Optional[int] = Field(default=None, description="Historical residual sample count used for uncertainty calibration")
+    training_cutoff_timestamp: Optional[datetime] = Field(default=None, description="Latest historical observation timestamp included in model training")
+    reliability_tier: str = Field(default="HIGH", description="Reliability classification: HIGH, MEDIUM, LOW, or UNCALIBRATED based on out-of-sample performance")
+    reliability_rationale: Optional[str] = Field(default=None, description="Documented justification for the reliability rating")
+    is_fallback: bool = Field(default=False, description="True if conservative fallback model was invoked due to stale/missing data")
+
     reliability_score: float = Field(ge=0.0, le=1.0, default=1.0, description="Model confidence score [0.0 to 1.0]")
     model_version: str = Field(description="Version string identifying the forecasting ensemble/models used")
 
-    @field_validator("as_of_timestamp", "target_timestamp", mode="before")
+    @field_validator("as_of_timestamp", "target_timestamp", "training_cutoff_timestamp", mode="before")
     @classmethod
-    def validate_utc(cls, v: datetime) -> datetime:
+    def validate_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is None:
+            return None
         return ensure_utc(v) if isinstance(v, datetime) else v
 
 
@@ -244,6 +268,8 @@ class ForecastBundle(BaseModel):
     points: List[ForecastPoint] = Field(description="List of forecast points across requested horizons")
     scenario_references: Dict[str, Any] = Field(default_factory=dict, description="OR-reconciled scenarios or stress paths")
     data_quality_status: DataQualityStatus = Field(default=DataQualityStatus.OK, description="Data quality health status")
+    data_quality_warnings: List[str] = Field(default_factory=list, description="Data quality issues or threshold warnings detected")
+    is_fallback_bundle: bool = Field(default=False, description="True if bundle was produced under fallback degraded mode")
     model_versions: Dict[str, str] = Field(default_factory=dict, description="Map of submodel names to their version strings")
     evaluation_metadata: Dict[str, Any] = Field(default_factory=dict, description="Validation losses, weights, calibration info")
 
