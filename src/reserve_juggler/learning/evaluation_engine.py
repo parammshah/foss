@@ -1,14 +1,24 @@
 """
 Candidate Evaluation Engine for Reserve Juggler.
 Executes genuine champion-vs-candidate evaluations on chronological holdout data
-and stress scenarios. Enforces sample size rules and safety invariant checks.
+and stress scenarios. Enforces sample size rules, safety invariant checks, and
+strictly prohibits hardcoded evaluation shortcuts or fabricated metrics.
 """
 
 from __future__ import annotations
+import copy
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from reserve_juggler.contracts import (
+    AssetPosition,
+    Obligation,
+    ServiceStatus,
+    TreasuryState,
+)
 from reserve_juggler.learning.governance import SafetyInvariantValidator
 from reserve_juggler.learning.models import CandidateUpdate, CandidateValidationReport
+from reserve_juggler.learning.runtime_registry import RuntimeComponentRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +26,104 @@ logger = logging.getLogger(__name__)
 class CandidateEvaluationEngine:
     """
     Evaluates candidate models and parameters against the active champion
-    using chronological holdout data and stress test scenarios.
+    using genuine chronological holdout data and executed stress test scenarios.
     """
 
     MIN_VALIDATION_SAMPLE_SIZE = 10
 
-    def __init__(self, validator: Optional[SafetyInvariantValidator] = None):
+    def __init__(
+        self,
+        validator: Optional[SafetyInvariantValidator] = None,
+        runtime_registry: Optional[RuntimeComponentRegistry] = None,
+        stress_engine: Optional[Any] = None,
+        store: Optional[Any] = None,
+    ):
         self.validator = validator or SafetyInvariantValidator()
+        self.runtime_registry = runtime_registry
+        self._stress_engine = stress_engine
+        self.store = store
+
+    @property
+    def stress_engine(self) -> Any:
+        if self._stress_engine is None:
+            from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
+            self._stress_engine = StressLabSimulationEngine()
+        return self._stress_engine
+
+    def _build_test_treasury_state(self) -> TreasuryState:
+        """Constructs a deterministic baseline TreasuryState for scenario execution."""
+        return TreasuryState(
+            timestamp="2026-10-17T12:00:00+00:00",
+            available_cash=45_000_000.0,
+            asset_positions=[
+                AssetPosition(
+                    asset_id="REPO-OVN-01",
+                    name="Tri-Party Overnight Treasury Repo",
+                    asset_class="REPO",
+                    market_value=30_000_000.0,
+                    accessible_liquidity=30_000_000.0,
+                    settlement_days=0,
+                    yield_pct=5.30,
+                    is_eligible=True,
+                ),
+                AssetPosition(
+                    asset_id="REPO-30D-01",
+                    name="Term 30-Day Tri-Party Repo",
+                    asset_class="REPO",
+                    market_value=25_000_000.0,
+                    accessible_liquidity=24_625_000.0,
+                    settlement_days=1,
+                    yield_pct=5.45,
+                    is_eligible=True,
+                ),
+                AssetPosition(
+                    asset_id="BOND-2Y-01",
+                    name="US Treasury Benchmark 2-Year Note",
+                    asset_class="SOVEREIGN_BONDS",
+                    market_value=60_000_000.0,
+                    accessible_liquidity=58_500_000.0,
+                    settlement_days=1,
+                    yield_pct=4.85,
+                    duration_years=1.92,
+                    is_eligible=True,
+                ),
+                AssetPosition(
+                    asset_id="BOND-10Y-01",
+                    name="US Treasury Benchmark 10-Year Bond",
+                    asset_class="SOVEREIGN_BONDS",
+                    market_value=40_000_000.0,
+                    accessible_liquidity=38_000_000.0,
+                    settlement_days=1,
+                    yield_pct=4.40,
+                    duration_years=8.25,
+                    is_eligible=True,
+                ),
+                AssetPosition(
+                    asset_id="EQ-SP500-01",
+                    name="S&P 500 Dividend Aristocrats ETF",
+                    asset_class="EQUITIES",
+                    market_value=20_000_000.0,
+                    accessible_liquidity=17_000_000.0,
+                    settlement_days=2,
+                    yield_pct=2.15,
+                    is_eligible=True,
+                ),
+            ],
+            obligations=[
+                Obligation(
+                    obligation_id="OBL-01",
+                    due_timestamp="2026-10-17T16:00:00+00:00",
+                    amount=20_500_000.0,
+                    description="Fedwire customer settlement and clearing obligations",
+                )
+            ],
+            authorized_credit_availability=50_000_000.0,
+            protected_reserve_floor=25_000_000.0,
+            core_capital_pct=0.70,
+            hot_capital_pct=0.30,
+            is_synthetic=True,
+            source_status=ServiceStatus.SYNTHETIC_DEMO,
+        )
 
     def evaluate_candidate(
         self,
@@ -30,79 +131,341 @@ class CandidateEvaluationEngine:
         validation_dataset_name: str = "CHRONOLOGICAL_HOLDOUT_30D",
         sample_size: int = 30,
         simulated_stress_scenarios: Optional[List[str]] = None,
+        evaluation_records: Optional[List[Dict[str, Any]]] = None,
     ) -> CandidateValidationReport:
         """
-        Executes a rigorous champion vs candidate validation run.
+        Executes a genuine champion vs candidate validation run without synthetic shortcuts.
         """
         violations: List[str] = []
-        scenarios = simulated_stress_scenarios or ["DEPOSIT_RUN_SIM", "REPO_SQUEEZE_100BP", "RATE_HIKE_75BP"]
+        status = "PASS"
 
         # 1. Sample Size Check
         if sample_size < self.MIN_VALIDATION_SAMPLE_SIZE:
             violations.append(
                 f"Evaluation sample size ({sample_size}) is below minimum statistical threshold ({self.MIN_VALIDATION_SAMPLE_SIZE})."
             )
+            status = "INCONCLUSIVE"
 
         # 2. Check Static Safety Invariants
         passed_invariants, inv_violations = self.validator.validate_candidate(candidate)
         violations.extend(inv_violations)
+        if not passed_invariants:
+            status = "FAIL"
 
-        # 3. Component-Specific Evaluation
+        # 3. Check live runtime integration
+        is_runtime_integrated = False
+        if self.runtime_registry:
+            is_runtime_integrated = self.runtime_registry.has_active_provider(candidate.component)
+
         comp = candidate.component.upper()
         champion_metric = 0.0
         candidate_metric = 0.0
         metric_name = "score"
         shortfalls = 0
+        improved = False
+        shadow_runs = 0
+        shadow_win_rate = 0.0
 
+        # 4. Component-Specific Real Evaluation Path
         if comp == "FORECASTING":
-            metric_name = "mape"
-            champion_metric = 14.5  # Champion baseline MAPE (%)
-            # If candidate parameter is weights or lag
-            if candidate.parameter_key == "ensemble_combining_weights":
-                val = candidate.proposed_value
-                if isinstance(val, dict) and 0.90 <= sum(val.values()) <= 1.10:
-                    candidate_metric = 12.8
-                else:
-                    candidate_metric = 16.2
-            elif candidate.parameter_key == "arimax_lag_order":
-                candidate_metric = 13.9
-            else:
-                candidate_metric = 14.1
+            metric_name = "wape"
+            # Use genuine holdout observation pairs
+            records = evaluation_records
+            if not records and self.store:
+                try:
+                    from reserve_juggler.learning.matcher import OutcomeMatcher
+                    matcher = OutcomeMatcher(self.store)
+                    pairs = matcher.match_forecasts()
+                    if pairs:
+                        records = [
+                            {
+                                "actual": p.actual_net_flow,
+                                "lstm_pred": (p.predicted_inflow - p.predicted_outflow) if (p.predicted_inflow is not None and p.predicted_outflow is not None) else p.predicted_net_flow,
+                                "arimax_pred": p.predicted_net_flow,
+                            }
+                            for p in pairs
+                            if p.is_eligible and p.actual_net_flow is not None
+                        ]
+                except Exception as e:
+                    logger.debug("Could not extract holdout records from store: %s", e)
 
-            improved = candidate_metric < champion_metric
-            if not improved:
-                violations.append(f"Candidate {metric_name} ({candidate_metric:.1f}%) did not improve over champion ({champion_metric:.1f}%).")
+            if not records or len(records) < self.MIN_VALIDATION_SAMPLE_SIZE:
+                violations.append("Missing holdout validation records. Cannot evaluate candidate without eligible chronological observations.")
+                status = "INCONCLUSIVE"
+                improved = False
+            else:
+                # Compute actual champion error: baseline 50/50 ensemble
+                champ_errors = []
+                cand_errors = []
+                actuals = []
+
+                # Candidate weights
+                if candidate.parameter_key == "ensemble_combining_weights":
+                    weights = candidate.proposed_value if isinstance(candidate.proposed_value, dict) else {}
+                    if "lstm_weight" in weights and "arimax_weight" in weights:
+                        cand_lstm_w = float(weights.get("lstm_weight", 0.5))
+                        cand_arimax_w = float(weights.get("arimax_weight", 0.5))
+                    elif "m1" in weights and "m2" in weights:
+                        cand_lstm_w = float(weights.get("m1", 0.5))
+                        cand_arimax_w = float(weights.get("m2", 0.5))
+                    elif len(weights) >= 2:
+                        vals = list(weights.values())
+                        cand_lstm_w = float(vals[0])
+                        cand_arimax_w = float(vals[1])
+                    else:
+                        cand_lstm_w = 0.5
+                        cand_arimax_w = 0.5
+                else:
+                    cand_lstm_w = 0.5
+                    cand_arimax_w = 0.5
+
+                for rec in records:
+                    act = rec["actual"]
+                    actuals.append(abs(act))
+                    # Champion prediction: 50% LSTM, 50% ARIMAX
+                    champ_p = 0.50 * rec["lstm_pred"] + 0.50 * rec["arimax_pred"]
+                    champ_errors.append(abs(act - champ_p))
+
+                    # Candidate prediction with proposed parameters
+                    cand_p = cand_lstm_w * rec["lstm_pred"] + cand_arimax_w * rec["arimax_pred"]
+                    cand_errors.append(abs(act - cand_p))
+
+                sum_act = sum(actuals)
+                if sum_act > 0:
+                    champion_metric = round((sum(champ_errors) / sum_act) * 100.0, 2)
+                    candidate_metric = round((sum(cand_errors) / sum_act) * 100.0, 2)
+                else:
+                    champion_metric = 0.0
+                    candidate_metric = 0.0
+
+                wins = sum(1 for c_e, ch_e in zip(cand_errors, champ_errors) if c_e < ch_e)
+                shadow_runs = len(records)
+                shadow_win_rate = round(wins / len(records), 2) if records else 0.0
+
+                improved = candidate_metric < champion_metric
+                if not improved:
+                    violations.append(
+                        f"Candidate {metric_name} ({candidate_metric:.2f}%) did not improve over champion ({champion_metric:.2f}%)."
+                    )
+                    status = "FAIL"
 
         elif comp in ("DECISION_OPTIMIZER", "SCENARIO_GENERATOR"):
-            metric_name = "cost_slippage_bps"
-            champion_metric = 22.0
-            candidate_metric = 18.5
-            improved = candidate_metric <= champion_metric
+            metric_name = "liquidity_shortfalls_and_cost"
+            # Actually execute the Stress Lab Simulation Engine across test scenarios
+            base_state = self._build_test_treasury_state()
 
-            # Check if parameter induces shortfalls
-            if "bypass" in candidate.parameter_key.lower() or "lean" in candidate.description.lower():
-                shortfalls = 2
-                violations.append(f"Candidate update induced {shortfalls} liquidity shortfalls under stress testing.")
+            # Scenario 1: Moderate shock
+            sim1 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=25.0,
+                rate_shock_bps=50.0,
+                repo_delay_days=0,
+                credit_unavailable=False,
+            )
+            # Scenario 2: Severe squeeze with repo freeze and credit freeze
+            sim2 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=60.0,
+                rate_shock_bps=150.0,
+                repo_delay_days=2,
+                credit_unavailable=True,
+            )
+            # Scenario 3: Market disruption with equity drawdown
+            sim3 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=40.0,
+                rate_shock_bps=100.0,
+                equity_drawdown_pct=30.0,
+            )
+
+            # Evaluate candidate against champion outcomes
+            champ_shortfalls = (
+                (1 if sim1["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+                + (1 if sim2["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+                + (1 if sim3["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+            )
+            champ_cost = (
+                sim1["strategies"]["reserve_juggler"].emergency_credit_cost
+                + sim1["strategies"]["reserve_juggler"].repo_penalty
+                + sim2["strategies"]["reserve_juggler"].emergency_credit_cost
+                + sim2["strategies"]["reserve_juggler"].repo_penalty
+                + sim3["strategies"]["reserve_juggler"].emergency_credit_cost
+                + sim3["strategies"]["reserve_juggler"].repo_penalty
+            )
+
+            # Execute candidate simulation runs with strategy_overrides (Part A2)
+            overrides = {candidate.parameter_key: candidate.proposed_value}
+            cand_sim1 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=25.0,
+                rate_shock_bps=50.0,
+                repo_delay_days=0,
+                credit_unavailable=False,
+                strategy_overrides=overrides,
+            )
+            cand_sim2 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=60.0,
+                rate_shock_bps=150.0,
+                repo_delay_days=2,
+                credit_unavailable=True,
+                strategy_overrides=overrides,
+            )
+            cand_sim3 = self.stress_engine.run_simulation(
+                base_treasury_state=base_state,
+                deposit_shock_pct=40.0,
+                rate_shock_bps=100.0,
+                equity_drawdown_pct=30.0,
+                strategy_overrides=overrides,
+            )
+
+            # Evaluate candidate against champion outcomes from actual simulation results
+            cand_shortfalls = (
+                (1 if cand_sim1["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+                + (1 if cand_sim2["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+                + (1 if cand_sim3["strategies"]["reserve_juggler"].liquidity_shortfall > 0 else 0)
+            )
+            cand_cost = (
+                cand_sim1["strategies"]["reserve_juggler"].emergency_credit_cost
+                + cand_sim1["strategies"]["reserve_juggler"].repo_penalty
+                + cand_sim2["strategies"]["reserve_juggler"].emergency_credit_cost
+                + cand_sim2["strategies"]["reserve_juggler"].repo_penalty
+                + cand_sim3["strategies"]["reserve_juggler"].emergency_credit_cost
+                + cand_sim3["strategies"]["reserve_juggler"].repo_penalty
+            )
+
+            # Check financial reconciliation invariants on simulation runs (Part F3)
+            for sim_res in (cand_sim1, cand_sim2, cand_sim3):
+                rj_strat = sim_res["strategies"]["reserve_juggler"]
+                if not rj_strat.is_reconciled:
+                    violations.append(
+                        f"Financial reconciliation violation: Strategy reconciliation error ({rj_strat.reconciliation_error}) exceeds tolerance limit."
+                    )
+                    status = "FAIL"
+
+            champion_metric = float(champ_shortfalls)
+            candidate_metric = float(cand_shortfalls)
+            shortfalls = cand_shortfalls
+
+            # Validation metadata for stress benchmarks (Part A3)
+            validation_sample_size_actual = 3
+            validation_dataset_actual = "SYNTHETIC_STRESS_BENCHMARKS"
+            shadow_runs = 3
+            wins = sum(
+                1 for c_sim, ch_sim in [
+                    (cand_sim1, sim1), (cand_sim2, sim2), (cand_sim3, sim3)
+                ]
+                if (
+                    c_sim["strategies"]["reserve_juggler"].liquidity_shortfall <= ch_sim["strategies"]["reserve_juggler"].liquidity_shortfall
+                    and (
+                        c_sim["strategies"]["reserve_juggler"].emergency_credit_cost + c_sim["strategies"]["reserve_juggler"].repo_penalty
+                        <= ch_sim["strategies"]["reserve_juggler"].emergency_credit_cost + ch_sim["strategies"]["reserve_juggler"].repo_penalty
+                    )
+                )
+            )
+            shadow_win_rate = round(wins / 3.0, 2)
+
+            if cand_shortfalls > champ_shortfalls:
+                violations.append(
+                    f"Candidate induced {cand_shortfalls} liquidity shortfalls under stress testing (champion had {champ_shortfalls})."
+                )
+                improved = False
+                status = "FAIL"
+            else:
+                improved = (cand_cost < champ_cost) or (cand_shortfalls < champ_shortfalls and cand_cost <= champ_cost)
 
         elif comp == "SENTINEL_RISK":
             metric_name = "corroboration_rate"
-            champion_metric = 0.85
-            candidate_metric = 0.90
-            improved = candidate_metric >= champion_metric
-        else:
-            improved = True
+            thresh = float(candidate.proposed_value) if isinstance(candidate.proposed_value, (int, float)) else 60.0
+            
+            # Use provided records, or pull from registered sentinel provider or store
+            records = evaluation_records
+            if not records and self.runtime_registry:
+                provider = self.runtime_registry.get_provider("SENTINEL_RISK")
+                sent = getattr(provider, "sentinel", None) or getattr(provider, "consumer", None)
+                if sent and hasattr(sent, "evaluate"):
+                    try:
+                        res = sent.evaluate()
+                        if res and res.active_signals:
+                            records = [
+                                {
+                                    "score": s.confidence * 100.0 if s.confidence <= 1.0 else s.confidence,
+                                    "is_corroborated": s.corroboration_status in ("CORROBORATED", "OFFICIAL"),
+                                }
+                                for s in res.active_signals
+                            ]
+                    except Exception as e:
+                        logger.debug("Could not evaluate sentinel provider: %s", e)
 
-        # Check shortfall constraint
+            if not records and self.store:
+                try:
+                    events = self.store.query(module="SENTINEL_PANIC", limit=100)
+                    if events:
+                        records = [
+                            {
+                                "score": e.payload.get("composite_risk_score", 0.0),
+                                "is_corroborated": e.payload.get("corroboration_status") in ("CORROBORATED", "OFFICIAL"),
+                            }
+                            for e in events
+                        ]
+                except Exception as e:
+                    logger.debug("Could not query store for sentinel events: %s", e)
+
+            if records:
+                # Operational evaluation: calculate corroboration rate above threshold
+                above_thresh = [r for r in records if r.get("score", 0.0) >= thresh]
+                if above_thresh:
+                    corroborated = sum(1 for r in above_thresh if r.get("is_corroborated", False))
+                    candidate_metric = round(corroborated / len(above_thresh), 3)
+                else:
+                    candidate_metric = 0.0
+
+                champ_above = [r for r in records if r.get("score", 0.0) >= 60.0]
+                if champ_above:
+                    champ_corr = sum(1 for r in champ_above if r.get("is_corroborated", False))
+                    champion_metric = round(champ_corr / len(champ_above), 3)
+                else:
+                    champion_metric = 0.0
+
+                shadow_runs = len(records)
+                shadow_win_rate = round(candidate_metric, 2) if candidate_metric is not None else 0.0
+
+                improved = (candidate_metric >= champion_metric) and (len(above_thresh) >= 1)
+                if not improved:
+                    violations.append(
+                        f"Proposed alert threshold {thresh} failed to improve operational corroboration rate ({candidate_metric:.3f} vs champion {champion_metric:.3f})."
+                    )
+                    status = "FAIL"
+            else:
+                violations.append("No event records or labeled outcomes available for Sentinel evaluation; status marked INCONCLUSIVE.")
+                status = "INCONCLUSIVE"
+                improved = False
+        else:
+            violations.append(
+                f"No credible evaluator implemented for component '{comp}'. Status marked INCONCLUSIVE and promotion prohibited."
+            )
+            status = "INCONCLUSIVE"
+            improved = False
+
         if shortfalls > 0:
             violations.append("Candidate increased liquidity shortfalls under stress scenarios. Promotion prohibited.")
+            status = "FAIL"
 
-        is_promotable = (len(violations) == 0) and improved
+        if status == "PASS" and not is_runtime_integrated:
+            # If evaluation succeeded but live runtime provider is not registered, mark as UNINTEGRATED
+            status = "UNINTEGRATED"
+
+        # Fail closed: promotion requires passing evaluation, runtime integration, and improved metrics
+        is_promotable = (len(violations) == 0) and improved and is_runtime_integrated and (status == "PASS")
+
+        val_dataset = validation_dataset_actual if "validation_dataset_actual" in locals() else validation_dataset_name
+        val_sample_size = validation_sample_size_actual if "validation_sample_size_actual" in locals() else sample_size
 
         report = CandidateValidationReport(
             candidate_id=candidate.candidate_id,
             component=candidate.component,
-            validation_dataset=validation_dataset_name,
-            validation_sample_size=sample_size,
+            validation_dataset=val_dataset,
+            validation_sample_size=val_sample_size,
             champion_metric=champion_metric,
             candidate_metric=candidate_metric,
             metric_name=metric_name,
@@ -111,7 +474,10 @@ class CandidateEvaluationEngine:
             safety_invariants_passed=(len(violations) == 0),
             violations=violations,
             is_promotable=is_promotable,
-            runtime_integrated=True,
+            runtime_integrated=is_runtime_integrated,
+            evaluation_status=status,
+            shadow_runs=shadow_runs,
+            shadow_win_rate=shadow_win_rate,
         )
 
         return report

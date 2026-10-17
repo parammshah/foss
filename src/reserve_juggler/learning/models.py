@@ -37,12 +37,12 @@ class MatchedForecastOutcome:
     predicted_net_flow: float
     predicted_inflow: float
     predicted_outflow: float
-    uncertainty_p05: float
-    uncertainty_p50: float
-    uncertainty_p90: float
-    uncertainty_p95: float
-    uncertainty_p99: float
-    model_version: str
+    uncertainty_p05: Optional[float] = None
+    uncertainty_p50: Optional[float] = None
+    uncertainty_p90: Optional[float] = None
+    uncertainty_p95: Optional[float] = None
+    uncertainty_p99: Optional[float] = None
+    model_version: str = "v1.4.0"
     actual_net_flow: Optional[float] = None
     actual_inflow: Optional[float] = None
     actual_outflow: Optional[float] = None
@@ -96,14 +96,14 @@ class ForecastPerformanceMetrics:
     valid_evaluations: int
     excluded_count: int
     exclusion_reasons: List[str]
-    mape: Optional[float]  # None if all actuals are 0
-    wape: float  # Weighted Absolute Percentage Error
-    mae: float
-    rmse: float
-    interval_coverage_pct: float  # Percent of actuals inside [p05, p95]
-    nominal_confidence: float  # 0.90 for 90%
-    drift_analysis: DriftAnalysisResult
-    status: str  # "STABLE", "DEGRADED", "INCONCLUSIVE"
+    mape: Optional[float] = None  # None if all actuals are 0
+    wape: Optional[float] = None  # None if insufficient samples or undefined
+    mae: Optional[float] = None
+    rmse: Optional[float] = None
+    interval_coverage_pct: Optional[float] = None  # None if no intervals exist
+    nominal_confidence: float = 0.90  # 0.90 for 90%
+    drift_analysis: Optional[DriftAnalysisResult] = None
+    status: str = "INCONCLUSIVE"  # "STABLE", "DEGRADED", "INCONCLUSIVE"
 
     @property
     def drift_detected(self) -> bool:
@@ -120,18 +120,20 @@ class DecisionPerformanceMetrics:
     total_shortfall_amount: float
     hard_gate_pass_rate: float
     hard_gate_status: str  # "PASS", "FAIL", "UNKNOWN", "INCONCLUSIVE"
-    human_override_rate: float
-    human_approval_rate: float
+    human_override_rate: Optional[float] = None
+    human_approval_rate: Optional[float] = None
+    pending_or_unresolved: int = 0
 
 
 @dataclass
 class SentinelPerformanceMetrics:
     total_signals: int
     corroboration_rate: float
-    false_alarm_rate: float
-    precision_status: str  # "UNAVAILABLE_WITHOUT_GROUND_TRUTH" or value
-    precision: Optional[float]
-    alert_counts_by_severity: Dict[str, int]
+    false_alarm_rate: Optional[float] = None
+    precision_status: str = "UNAVAILABLE_WITHOUT_GROUND_TRUTH_LABELS"
+    precision: Optional[float] = None
+    alert_counts_by_severity: Dict[str, int] = field(default_factory=dict)
+    false_alarm_status: str = "UNAVAILABLE_WITHOUT_LABELS"
 
 
 @dataclass
@@ -159,9 +161,35 @@ class CandidateValidationReport:
     metric_improved: bool
     stress_shortfall_count: int
     safety_invariants_passed: bool
-    violations: List[str]
-    is_promotable: bool
-    runtime_integrated: bool = True
+    violations: List[str] = field(default_factory=list)
+    is_promotable: bool = False
+    runtime_integrated: bool = False
+    evaluation_status: str = "PASS"  # "PASS", "FAIL", "INCONCLUSIVE", "UNINTEGRATED"
+    is_runtime_integrated: Optional[bool] = None
+    status: Optional[str] = None
+    shadow_runs: int = 0
+    shadow_win_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.is_runtime_integrated is not None:
+            self.runtime_integrated = self.is_runtime_integrated
+        if self.status is not None:
+            self.evaluation_status = self.status
+        else:
+            self.status = self.evaluation_status
+
+        # Fail-closed promotion eligibility: all criteria must pass
+        if (
+            self.evaluation_status == "PASS"
+            and not self.violations
+            and self.metric_improved
+            and self.runtime_integrated
+            and self.safety_invariants_passed
+            and self.stress_shortfall_count == 0
+        ):
+            self.is_promotable = True
+        else:
+            self.is_promotable = False
 
 
 @dataclass

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from reserve_juggler.contracts import (
     AlternativeAction,
+    ActionType,
     ApprovalStatus,
     DecisionRecord,
     ExecutionOutcome,
@@ -31,6 +32,34 @@ from reserve_juggler.explainability.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_action_type(action_str: str) -> ActionType:
+    """Resolves arbitrary action strings or enum representations into typed ActionType."""
+    normalized = action_str.upper().strip()
+    try:
+        return ActionType(normalized)
+    except ValueError:
+        pass
+    if "CREDIT" in normalized and ("DRAW" in normalized or "BORROW" in normalized):
+        return ActionType.DRAW_CREDIT
+    if "CREDIT" in normalized and "REPAY" in normalized:
+        return ActionType.REPAY_CREDIT
+    if "REPO" in normalized and ("DRAW" in normalized or "BREAK" in normalized):
+        return ActionType.DRAW_REPO_30D
+    if "REPO" in normalized and ("INVEST" in normalized or "BUY" in normalized):
+        return ActionType.INVEST_REPO
+    if "BOND" in normalized and ("INVEST" in normalized or "BUY" in normalized):
+        return ActionType.INVEST_BONDS
+    if "EQUITY" in normalized and ("INVEST" in normalized or "BUY" in normalized):
+        return ActionType.INVEST_EQUITIES
+    if "BOND" in normalized and ("LIQUIDATE" in normalized or "SELL" in normalized or "TRIM" in normalized):
+        return ActionType.LIQUIDATE_BONDS
+    if "EQUITY" in normalized and ("LIQUIDATE" in normalized or "SELL" in normalized or "TRIM" in normalized):
+        return ActionType.LIQUIDATE_EQUITIES
+    if "HOLD" in normalized:
+        return ActionType.HOLD_CASH
+    return ActionType.UNKNOWN
 
 
 class DecisionExplanationService:
@@ -146,7 +175,12 @@ class DecisionExplanationService:
         # 6. Build grounded mathematical narrative
         action_name = decision_record.selected_action.replace("_", " ").title()
         amt_str = f"${decision_record.amount:,.2f}"
-        reserve_str = f"${decision_record.reserve:,.2f}"
+        if decision_record.reserve is not None:
+            reserve_str = f"${decision_record.reserve:,.2f}"
+        else:
+            reserve_str = "UNCONFIGURED"
+            missing_disclosures.append("Protected reserve floor is UNCONFIGURED / UNKNOWN. Mandatory reserve firewall cannot be certified.")
+
         surplus_str = f"${decision_record.eligible_surplus:,.2f}"
         total_cost_str = f"${cost_bd.total_cost:,.2f}"
 
@@ -168,10 +202,16 @@ class DecisionExplanationService:
             f"(Interest: ${cost_bd.interest_cost:,.2f}, Tax: ${cost_bd.tax_impact:,.2f}, Slippage: ${cost_bd.spread_slippage:,.2f})."
         )
 
-        if gate_status_str == "PASS":
-            rationale_lines.append(f"5. Safety Score: Treasury Safety Score stands at {decision_record.treasury_safety_score:.1f}/100. All mandatory safety gates passed.")
+        if decision_record.treasury_safety_score is not None:
+            tss_display = f"{decision_record.treasury_safety_score:.1f}/100"
         else:
-            rationale_lines.append(f"5. Safety Score: TSS={decision_record.treasury_safety_score:.1f}/100. Mandatory safety gates: {gate_status_str}.")
+            tss_display = "UNAVAILABLE"
+            missing_disclosures.append("Treasury Safety Score is UNAVAILABLE due to missing component metrics.")
+
+        if gate_status_str == "PASS":
+            rationale_lines.append(f"5. Safety Score: Treasury Safety Score stands at {tss_display}. All mandatory safety gates passed.")
+        else:
+            rationale_lines.append(f"5. Safety Score: TSS={tss_display}. Mandatory safety gates: {gate_status_str}.")
 
         if alt_comparisons:
             cheapest_alt = min(alt_comparisons, key=lambda a: a.cost_delta_vs_selected)
@@ -191,12 +231,7 @@ class DecisionExplanationService:
             protected_reserve_floor=decision_record.reserve,
             eligible_surplus=decision_record.eligible_surplus,
             treasury_safety_score=decision_record.treasury_safety_score,
-            tss_factors=decision_record.tss_factors or {
-                "liquidity_buffer": 35.0,
-                "volatility_penalty": -5.0,
-                "macro_event_penalty": -8.0,
-                "credit_cushion": 20.0,
-            },
+            tss_factors=decision_record.tss_factors if decision_record.treasury_safety_score is not None else {},
             forecast_context=f_summary,
             cost_breakdown=cost_bd,
             settlement_days=settlement_days,
@@ -280,22 +315,48 @@ class DecisionExplanationService:
                 )
 
         # 2. Revalidation for MODIFIED / OVERRIDDEN Actions
+        original_amount = decision_record.amount
+        original_action = decision_record.selected_action
         final_amount = decision_record.amount
         final_action = decision_record.selected_action
 
-        if action_type in ("MODIFIED", "OVERRIDDEN"):
+        if action_type in ("MODIFIED", "OVERRIDDEN", "APPROVED"):
             candidate_amt = modified_amount if modified_amount is not None else decision_record.amount
             candidate_act = modified_action if modified_action else decision_record.selected_action
 
-            if candidate_amt <= 0:
+            if action_type in ("MODIFIED", "OVERRIDDEN") and candidate_amt <= 0:
                 return (False, "Modified action amount must be strictly positive.", decision_record, None, None)  # type: ignore
 
             # Financial revalidation against authoritative TreasuryState
             if treasury_state:
                 # Check 1: Mandatory Reserve Floor Invariant
-                # If the action would deplete operational cash below protected reserve floor:
-                if "DRAW" not in candidate_act and "HOLD" not in candidate_act:
-                    # Action is an outflow or liquidation
+                if treasury_state.protected_reserve_floor is None:
+                    violation_msg = (
+                        "Revalidation FAILED: Protected reserve floor is UNKNOWN or NOT_CONFIGURED. "
+                        "Prohibiting new allocations or disbursements until reserve floor is established."
+                    )
+                    logger.warning(violation_msg)
+                    return (
+                        False,
+                        violation_msg,
+                        decision_record,
+                        None,
+                        LearningEvent(
+                            event_id=f"EV-REVAL-FAIL-{decision_record.decision_id}",
+                            versioned_event_type="HUMAN_MODIFICATION_REVALIDATION_FAILED",
+                            module="HUMAN_OVERSIGHT",
+                            timestamp=now_iso,
+                            correlation_id=decision_record.decision_id,
+                            payload={"violation": violation_msg, "actor": actor_name},
+                        ),
+                    )
+
+                # Typed action semantics
+                resolved_act = resolve_action_type(candidate_act)
+
+                # Check 1: Mandatory Reserve Floor Invariant for capital deployments
+                is_cash_draw = resolved_act in (ActionType.DRAW_CREDIT, ActionType.DRAW_REPO_30D, ActionType.HOLD_CASH)
+                if not is_cash_draw:
                     projected_cash = treasury_state.available_cash - candidate_amt
                     if projected_cash < treasury_state.protected_reserve_floor:
                         violation_msg = (
@@ -318,12 +379,21 @@ class DecisionExplanationService:
                             ),
                         )
 
-                # Check 2: Asset Availability & Eligibility
-                if decision_record.target_asset:
-                    pos = next((p for p in treasury_state.asset_positions if p.asset_id == decision_record.target_asset), None)
-                    if pos and "LIQUIDATE" in candidate_act and candidate_amt > pos.accessible_liquidity:
+                # Check 2: Asset Availability & Eligibility for liquidation
+                if resolved_act in (ActionType.LIQUIDATE_BONDS, ActionType.LIQUIDATE_EQUITIES, ActionType.LIQUIDATE_REPO):
+                    if decision_record.target_asset:
+                        pos = next((p for p in treasury_state.asset_positions if p.asset_id == decision_record.target_asset), None)
+                        if pos and candidate_amt > pos.accessible_liquidity:
+                            violation_msg = (
+                                f"Revalidation FAILED: Liquidation amount ${candidate_amt:,.2f} exceeds accessible position liquidity (${pos.accessible_liquidity:,.2f})."
+                            )
+                            return (False, violation_msg, decision_record, None, None)  # type: ignore
+
+                # Check 3: Credit Line Availability
+                if resolved_act == ActionType.DRAW_CREDIT:
+                    if candidate_amt > treasury_state.authorized_credit_availability:
                         violation_msg = (
-                            f"Revalidation FAILED: Liquidation amount ${candidate_amt:,.2f} exceeds accessible position liquidity (${pos.accessible_liquidity:,.2f})."
+                            f"Revalidation FAILED: Credit draw ${candidate_amt:,.2f} exceeds authorized credit availability (${treasury_state.authorized_credit_availability:,.2f})."
                         )
                         return (False, violation_msg, decision_record, None, None)  # type: ignore
 
@@ -350,6 +420,7 @@ class DecisionExplanationService:
                     "actor_role": actor_role,
                     "status": action_type,
                     "stated_reason": stated_reason,
+                    "original_amount": original_amount,
                     "is_executed": False,
                     "realized_amount": 0.0,
                     "realized_cost": 0.0,
@@ -381,6 +452,21 @@ class DecisionExplanationService:
             )
 
         # 4. Handle Approved or Revalidated Modified Execution
+        # Mathematically recompute costs using original_amount as baseline
+        ratio = (final_amount / original_amount) if original_amount > 0 else 1.0
+        orig_costs = decision_record.estimated_costs
+        scaled_interest = round(orig_costs.get("interest", 0.0) * ratio, 2)
+        scaled_tax = round(orig_costs.get("tax", 0.0) * ratio, 2)
+        scaled_penalty = round(orig_costs.get("liquidation_penalty", 0.0) * ratio, 2)
+        scaled_base_slippage = round(orig_costs.get("slippage", 0.0) * ratio, 2)
+        
+        base_cost = scaled_interest + scaled_tax + scaled_penalty + scaled_base_slippage
+        if base_cost == 0.0 and orig_costs.get("total", 0.0) > 0.0:
+            base_cost = round(orig_costs.get("total", 0.0) * ratio, 2)
+
+        simulated_cost = round(base_cost * 1.00015, 2)  # Slight simulated execution slippage
+        exec_slippage = round(simulated_cost - base_cost, 2)
+
         decision_record.approval_status = action_type
         decision_record.approved_by = actor_name
         decision_record.approval_role = actor_role
@@ -388,14 +474,13 @@ class DecisionExplanationService:
         decision_record.override_reason = stated_reason if action_type in ("OVERRIDDEN", "MODIFIED") else None
         decision_record.amount = final_amount
         decision_record.selected_action = final_action
-
-        # Calculate simulated costs on final amount
-        base_cost = decision_record.estimated_costs.get("total", 0.0)
-        if decision_record.amount > 0 and final_amount != decision_record.amount:
-            ratio = final_amount / decision_record.amount
-            base_cost *= ratio
-
-        simulated_cost = round(base_cost * 1.00015, 2)  # Slight simulated execution slippage
+        decision_record.estimated_costs = {
+            "total": simulated_cost,
+            "interest": scaled_interest,
+            "tax": scaled_tax,
+            "liquidation_penalty": scaled_penalty,
+            "slippage": round(scaled_base_slippage + exec_slippage, 2),
+        }
 
         outcome = ExecutionOutcome(
             outcome_id=f"OUT-{decision_record.decision_id}",
@@ -406,9 +491,10 @@ class DecisionExplanationService:
             realized_amount=final_amount,
             realized_costs={
                 "total": simulated_cost,
-                "interest": round(decision_record.estimated_costs.get("interest", 0.0) * (final_amount / decision_record.amount if decision_record.amount else 1.0), 2),
-                "tax": round(decision_record.estimated_costs.get("tax", 0.0) * (final_amount / decision_record.amount if decision_record.amount else 1.0), 2),
-                "slippage": round(simulated_cost - base_cost, 2),
+                "interest": scaled_interest,
+                "tax": scaled_tax,
+                "penalty": scaled_penalty,
+                "slippage": round(scaled_base_slippage + exec_slippage, 2),
             },
             errors=[],
             liquidity_shortfall=0.0,
@@ -428,6 +514,7 @@ class DecisionExplanationService:
                 "actor_role": actor_role,
                 "status": action_type,
                 "stated_reason": stated_reason,
+                "original_amount": original_amount,
                 "final_amount": final_amount,
                 "final_action": final_action,
                 "is_executed": True,

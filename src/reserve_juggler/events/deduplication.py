@@ -18,12 +18,17 @@ class EventDeduplicator:
     Retains history across evaluations to calculate reporting velocity and acceleration.
     """
 
-    def __init__(self, similarity_threshold: float = 0.50, ttl_hours: float = 72.0):
+    def __init__(self, similarity_threshold: float = 0.50, ttl_hours: float = 72.0, max_seen_events: int = 5000):
         self.similarity_threshold = similarity_threshold
         self.ttl_hours = ttl_hours
+        self.max_seen_events = max_seen_events
         self._clusters: Dict[str, EventCluster] = {}
-        self._seen_event_ids: Set[str] = set()
+        self._seen_event_timestamps: Dict[str, datetime] = {}
         self._previous_velocity: float = 0.0
+
+    @property
+    def _seen_event_ids(self) -> Set[str]:
+        return set(self._seen_event_timestamps.keys())
 
     def _tokenize(self, text: str) -> Set[str]:
         cleaned = re.sub(r"[^\w\s]", "", text.lower())
@@ -42,7 +47,7 @@ class EventDeduplicator:
         return intersection / union if union > 0 else 0.0
 
     def _evict_stale_clusters(self, now: datetime) -> None:
-        """Evicts clusters older than TTL retention limit."""
+        """Evicts clusters and seen event IDs older than TTL retention limit to ensure bounded index."""
         expired_keys = []
         for cid, cluster in self._clusters.items():
             try:
@@ -53,6 +58,22 @@ class EventDeduplicator:
                 pass
         for k in expired_keys:
             del self._clusters[k]
+
+        # Evict stale seen event IDs
+        cutoff_sec = self.ttl_hours * 3600.0
+        expired_evs = [
+            eid for eid, seen_dt in self._seen_event_timestamps.items()
+            if (now - seen_dt).total_seconds() > cutoff_sec
+        ]
+        for eid in expired_evs:
+            del self._seen_event_timestamps[eid]
+
+        # Enforce hard capacity bound
+        if len(self._seen_event_timestamps) > self.max_seen_events:
+            sorted_eids = sorted(self._seen_event_timestamps.items(), key=lambda x: x[1])
+            excess = len(self._seen_event_timestamps) - self.max_seen_events
+            for eid, _ in sorted_eids[:excess]:
+                del self._seen_event_timestamps[eid]
 
     def cluster_events(self, events: List[RawEventRecord]) -> List[EventCluster]:
         """
@@ -66,9 +87,9 @@ class EventDeduplicator:
         new_events_count = 0
 
         for event in events:
-            if event.event_id in self._seen_event_ids:
+            if event.event_id in self._seen_event_timestamps:
                 continue
-            self._seen_event_ids.add(event.event_id)
+            self._seen_event_timestamps[event.event_id] = now
             new_events_count += 1
 
             ev_title_tokens = self._tokenize(event.title)
@@ -102,17 +123,21 @@ class EventDeduplicator:
                     cluster.canonical_event = event
                     cluster.duplicates.append(old_can)
 
-                # Calculate velocity and acceleration
+                # Calculate velocity and genuine acceleration (change in velocity per unit time)
+                prev_velocity = cluster.reporting_velocity_per_hour
                 try:
                     t_first = datetime.fromisoformat(cluster.first_seen.replace("Z", "+00:00"))
                     t_last = datetime.fromisoformat((event.publication_time or now_iso).replace("Z", "+00:00"))
                     span_hours = max((t_last - t_first).total_seconds() / 3600.0, 0.05)
-                    cluster.reporting_velocity_per_hour = round(cluster.reporting_count / span_hours, 2)
+                    new_velocity = round(cluster.reporting_count / span_hours, 2)
+                    delta_velocity = new_velocity - prev_velocity
+                    cluster.reporting_acceleration = round(delta_velocity / span_hours, 3)
+                    cluster.reporting_velocity_per_hour = new_velocity
                 except Exception:
                     cluster.reporting_velocity_per_hour = float(cluster.reporting_count)
-                cluster.reporting_acceleration = cluster.reporting_velocity_per_hour
+                    cluster.reporting_acceleration = round(cluster.reporting_velocity_per_hour - prev_velocity, 3)
             else:
-                # Create new cluster
+                # Create new cluster with initial acceleration of 0.0 (no rate of change on first report)
                 new_cid = f"CLUSTER-{len(self._clusters) + 1}-{event.event_id}"
                 self._clusters[new_cid] = EventCluster(
                     cluster_id=new_cid,
@@ -121,9 +146,15 @@ class EventDeduplicator:
                     first_seen=event.publication_time or now_iso,
                     last_seen=event.publication_time or now_iso,
                     reporting_count=1,
-                    reporting_acceleration=1.0,
+                    reporting_acceleration=0.0,
                     reporting_velocity_per_hour=1.0,
                 )
+
+        if len(self._seen_event_timestamps) > self.max_seen_events:
+            sorted_eids = sorted(self._seen_event_timestamps.items(), key=lambda x: x[1])
+            excess = len(self._seen_event_timestamps) - self.max_seen_events
+            for eid, _ in sorted_eids[:excess]:
+                del self._seen_event_timestamps[eid]
 
         return list(self._clusters.values())
 
@@ -133,5 +164,5 @@ class EventDeduplicator:
     def reset(self) -> None:
         """Explicitly reset state (only used in test isolation)."""
         self._clusters.clear()
-        self._seen_event_ids.clear()
+        self._seen_event_timestamps.clear()
         self._previous_velocity = 0.0

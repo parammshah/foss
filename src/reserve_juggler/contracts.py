@@ -81,6 +81,20 @@ class GateStatus(str, Enum):
     NOT_EVALUATED = "NOT_EVALUATED"
 
 
+class ActionType(str, Enum):
+    HOLD_CASH = "HOLD_CASH"
+    INVEST_REPO = "INVEST_REPO"
+    INVEST_BONDS = "INVEST_BONDS"
+    INVEST_EQUITIES = "INVEST_EQUITIES"
+    LIQUIDATE_REPO = "LIQUIDATE_REPO"
+    LIQUIDATE_BONDS = "LIQUIDATE_BONDS"
+    LIQUIDATE_EQUITIES = "LIQUIDATE_EQUITIES"
+    DRAW_REPO_30D = "DRAW_REPO_30D"
+    DRAW_CREDIT = "DRAW_CREDIT"
+    REPAY_CREDIT = "REPAY_CREDIT"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass
 class AssetPosition:
     asset_id: str
@@ -115,7 +129,7 @@ class TreasuryState:
     obligations: List[Obligation]
     authorized_credit_availability: float
     data_quality_warnings: List[str] = field(default_factory=list)
-    protected_reserve_floor: float = 0.0
+    protected_reserve_floor: Optional[float] = None
     core_capital_pct: float = 0.70
     hot_capital_pct: float = 0.30
     is_synthetic: bool = False
@@ -171,12 +185,13 @@ class RiskSignal:
     sentiment_score: float = 0.0  # -1.0 to +1.0
     is_duplicate: bool = False
     relevance_to_treasury: float = 0.0  # 0.0 to 1.0
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
 class HardGateOutcome:
     gate_name: str
-    status: GateStatus = GateStatus.PASS
+    status: GateStatus = GateStatus.NOT_EVALUATED
     threshold_value: float = 0.0
     observed_value: float = 0.0
     reason: str = ""
@@ -205,14 +220,14 @@ class DecisionRecord:
     selected_action: str
     target_asset: str
     amount: float
-    reserve: float
-    eligible_surplus: float
-    estimated_costs: Dict[str, float]  # interest, tax, liquidation_penalty, slippage, total
-    hard_gate_outcomes: List[HardGateOutcome]
-    model_versions: Dict[str, str]
-    reason_codes: List[str]
+    reserve: float = 0.0
+    eligible_surplus: float = 0.0
+    estimated_costs: Dict[str, float] = field(default_factory=dict)  # interest, tax, liquidation_penalty, slippage, total
+    hard_gate_outcomes: List[HardGateOutcome] = field(default_factory=list)
+    model_versions: Dict[str, str] = field(default_factory=dict)
+    reason_codes: List[str] = field(default_factory=list)
     alternatives: List[AlternativeAction] = field(default_factory=list)
-    treasury_safety_score: float = 85.0
+    treasury_safety_score: Optional[float] = None
     tss_factors: Dict[str, float] = field(default_factory=dict)
     approval_status: str = ApprovalStatus.PENDING_APPROVAL.value
     approved_by: Optional[str] = None
@@ -234,7 +249,7 @@ class ExecutionOutcome:
     realized_costs: Dict[str, float]  # interest, tax, penalty, slippage, total
     errors: List[str] = field(default_factory=list)
     liquidity_shortfall: float = 0.0
-    settlement_status: str = "SETTLED"  # "PENDING", "SETTLED", "DELAYED", "FAILED", "CANCELLED"
+    settlement_status: str = "PENDING"  # "PENDING", "SETTLED", "DELAYED", "FAILED", "CANCELLED"
     slippage_bps: float = 0.0
 
 

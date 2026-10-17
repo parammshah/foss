@@ -59,10 +59,10 @@ class DecisionExplanation:
     recommended_action: str
     target_asset: str
     recommended_amount: float
-    protected_reserve_floor: float
+    protected_reserve_floor: Optional[float]
     eligible_surplus: float
     # TSS
-    treasury_safety_score: float
+    treasury_safety_score: Optional[float]
     tss_factors: Dict[str, float]
     # Detailed Contexts
     forecast_context: ForecastContextSummary
@@ -71,7 +71,7 @@ class DecisionExplanation:
     settlement_note: str
     hard_gates: List[HardGateOutcome]
     all_hard_gates_passed: bool
-    gate_evaluation_status: str  # "PASS", "FAIL", "NOT_EVALUATED"
+    gate_evaluation_status: str  # "PASS", "FAIL", "NOT_EVALUATED", "UNKNOWN"
     # Grounded Rationale
     primary_justification: str
     grounded_narrative: str
@@ -95,6 +95,6 @@ class HumanActionRecord:
     timestamp: str
     stated_reason: str
     modifications: Dict[str, Any] = field(default_factory=dict)
-    revalidation_passed: bool = True
+    revalidation_passed: bool = False
     revalidation_notes: List[str] = field(default_factory=list)
-    simulated_execution_status: str = "SIMULATED_SUCCESS"
+    simulated_execution_status: str = "PENDING"

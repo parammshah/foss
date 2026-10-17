@@ -24,6 +24,8 @@ def render_forecasts(snapshot: DashboardSnapshot) -> None:
     is_drift = perf.drift_analysis.drift_detected if perf.drift_analysis else False
     d_badge = "badge-critical" if is_drift else "badge-ok"
     mape_str = f"{perf.mape:.1f}%" if perf.mape is not None else "N/A"
+    wape_str = f"({perf.wape:.1f}% WAPE)" if perf.wape is not None else "(N/A WAPE)"
+    coverage_str = f"{perf.interval_coverage_pct:.1f}%" if perf.interval_coverage_pct is not None else "N/A"
     
     st.markdown(
         f"""
@@ -38,11 +40,11 @@ def render_forecasts(snapshot: DashboardSnapshot) -> None:
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
                 <div class='rj-metric-label'>MAPE / WAPE</div>
-                <div class='rj-metric-val' style='font-size: 1.3rem;'>{mape_str} <span style='font-size: 0.8rem; color: #94A3B8;'>({perf.wape:.1f}% WAPE)</span></div>
+                <div class='rj-metric-val' style='font-size: 1.3rem;'>{mape_str} <span style='font-size: 0.8rem; color: #94A3B8;'>{wape_str}</span></div>
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
                 <div class='rj-metric-label'>90% Interval Coverage</div>
-                <div class='rj-metric-val' style='font-size: 1.3rem; color: #10B981;'>{perf.interval_coverage_pct:.1f}%</div>
+                <div class='rj-metric-val' style='font-size: 1.3rem; color: #10B981;'>{coverage_str}</div>
             </div>
         </div>
         """,

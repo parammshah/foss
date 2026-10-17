@@ -7,7 +7,8 @@ safety invariant enforcement (candidate rejections), and audited rollback.
 import pytest
 from datetime import datetime, timezone
 from reserve_juggler.learning.service import LearningService
-from reserve_juggler.learning.models import CandidateStatus
+from reserve_juggler.learning.models import CandidateStatus, CandidateValidationReport
+from reserve_juggler.learning.runtime_registry import GenericRuntimeProvider
 from reserve_juggler.integration.contracts import LearningEvent
 
 
@@ -173,6 +174,9 @@ def test_candidate_promotion_and_authorized_rollback():
     """Tests full candidate promotion lifecycle and subsequent audited rollback."""
     service = LearningService()
 
+    provider = GenericRuntimeProvider("FORECASTING", {"ensemble_combining_weights": {"m1": 0.5, "m2": 0.5}})
+    service.runtime_registry.register_provider("FORECASTING", provider)
+
     # Valid candidate
     cand = service.propose_update(
         component="FORECASTING",
@@ -183,6 +187,20 @@ def test_candidate_promotion_and_authorized_rollback():
         author="Lead Quant",
         holdout_sample_size=50,
         stress_shortfall_count=0,
+    )
+    cand.validation_report = CandidateValidationReport(
+        candidate_id=cand.candidate_id,
+        component=cand.component,
+        validation_dataset="CHRONOLOGICAL_HOLDOUT_30D",
+        validation_sample_size=50,
+        champion_metric=0.12,
+        candidate_metric=0.08,
+        metric_name="wape",
+        metric_improved=True,
+        stress_shortfall_count=0,
+        safety_invariants_passed=True,
+        is_runtime_integrated=True,
+        status="PASS",
     )
     assert cand.status == CandidateStatus.SHADOW_MODE
 
@@ -343,6 +361,8 @@ def test_promotion_updates_operational_runtime_parameters():
     Promoting a candidate must update the actual registered operational runtime parameters.
     """
     service = LearningService()
+    provider = GenericRuntimeProvider("FORECASTING", {"ensemble_combining_weights": {"lstm_weight": 0.5, "arimax_weight": 0.5}})
+    service.runtime_registry.register_provider("FORECASTING", provider)
     initial_rt_val = service.runtime_registry.get_runtime_parameter("FORECASTING", "ensemble_combining_weights")
 
     cand = service.propose_update(
@@ -354,6 +374,20 @@ def test_promotion_updates_operational_runtime_parameters():
         author="Lead Quant",
         holdout_sample_size=30,
         stress_shortfall_count=0,
+    )
+    cand.validation_report = CandidateValidationReport(
+        candidate_id=cand.candidate_id,
+        component=cand.component,
+        validation_dataset="CHRONOLOGICAL_HOLDOUT_30D",
+        validation_sample_size=30,
+        champion_metric=0.12,
+        candidate_metric=0.08,
+        metric_name="wape",
+        metric_improved=True,
+        stress_shortfall_count=0,
+        safety_invariants_passed=True,
+        is_runtime_integrated=True,
+        status="PASS",
     )
 
     ok, msg = service.promote_candidate(

@@ -80,12 +80,12 @@ class SystemPerformanceEvaluator:
                 total_predictions=total_predictions,
                 valid_evaluations=valid_evaluations,
                 excluded_count=excluded_count,
-                exclusion_reasons=exclusion_reasons,
+                exclusion_reasons=exclusion_reasons or [f"Insufficient evaluation sample size ({valid_evaluations} < {self.MIN_SAMPLES_FOR_EVALUATION})."],
                 mape=None,
-                wape=0.0,
-                mae=0.0,
-                rmse=0.0,
-                interval_coverage_pct=0.0,
+                wape=None,
+                mae=None,
+                rmse=None,
+                interval_coverage_pct=None,
                 nominal_confidence=0.90,
                 drift_analysis=DriftAnalysisResult(
                     drift_detected=False,
@@ -122,7 +122,7 @@ class SystemPerformanceEvaluator:
             coverage_pct = (covered / valid_evaluations) * 100.0
 
             # Kolmogorov-Smirnov Drift Test
-            if valid_evaluations >= self.MIN_SAMPLES_DRIFT:
+            if valid_evaluations >= self.MIN_SAMPLES_FOR_DRIFT:
                 mid = valid_evaluations // 2
                 ref_errors = errors[:mid]
                 test_errors = errors[mid:]
@@ -203,12 +203,16 @@ class SystemPerformanceEvaluator:
             approval_events = [e for e in approval_events if e.timestamp <= end_iso]
 
         tot_human = len(approval_events)
-        overrides = sum(
-            1 for e in approval_events if e.payload.get("status") in ("OVERRIDDEN", "MODIFIED", "REJECTED", "CANCELLED")
-        )
-        approvals = sum(1 for e in approval_events if e.payload.get("status") == "APPROVED")
-        override_rate = (overrides / tot_human) if tot_human > 0 else 0.0
-        approval_rate = (approvals / tot_human) if tot_human > 0 else 1.0
+        if tot_human > 0:
+            overrides = sum(
+                1 for e in approval_events if e.payload.get("status") in ("OVERRIDDEN", "MODIFIED", "REJECTED", "CANCELLED")
+            )
+            approvals = sum(1 for e in approval_events if e.payload.get("status") == "APPROVED")
+            override_rate = round(overrides / tot_human, 2)
+            approval_rate = round(approvals / tot_human, 2)
+        else:
+            override_rate = None
+            approval_rate = None
 
         d_metrics = DecisionPerformanceMetrics(
             total_decisions=total_decisions,
@@ -219,8 +223,8 @@ class SystemPerformanceEvaluator:
             total_shortfall_amount=round(total_shortfall_amt, 2),
             hard_gate_pass_rate=round(gate_pass_rate, 3),
             hard_gate_status=gate_status,
-            human_override_rate=round(override_rate, 2),
-            human_approval_rate=round(approval_rate, 2),
+            human_override_rate=override_rate,
+            human_approval_rate=approval_rate,
         )
 
         # 4. Sentinel Evaluation
@@ -234,36 +238,53 @@ class SystemPerformanceEvaluator:
         corroborated_sig = sum(
             1 for e in sentinel_events if e.payload.get("corroboration_status") in ("CORROBORATED", "OFFICIAL")
         )
-        corrob_rate = (corroborated_sig / tot_sig) if tot_sig > 0 else 1.0
+        corrob_rate = round(corroborated_sig / tot_sig, 2) if tot_sig > 0 else 0.0
 
         sev_counts: Dict[str, int] = {}
         for e in sentinel_events:
             sev = e.payload.get("severity", "UNKNOWN")
             sev_counts[sev] = sev_counts.get(sev, 0) + 1
 
+        # Check for ground-truth labelled signals (Part D2)
+        labelled_sentinel = [e for e in sentinel_events if "ground_truth_label" in e.payload]
+        if labelled_sentinel:
+            fp_count = sum(1 for e in labelled_sentinel if e.payload.get("ground_truth_label") == "FALSE_ALARM")
+            tp_count = sum(1 for e in labelled_sentinel if e.payload.get("ground_truth_label") == "REAL_EVENT")
+            tot_lab = len(labelled_sentinel)
+            fa_rate = round(fp_count / tot_lab, 2) if tot_lab > 0 else None
+            prec = round(tp_count / (tp_count + fp_count), 2) if (tp_count + fp_count) > 0 else None
+            prec_status = "CALCULATED_FROM_LABELS"
+            fa_status = "CALCULATED_FROM_LABELS"
+        else:
+            fa_rate = None
+            prec = None
+            prec_status = "UNAVAILABLE_WITHOUT_GROUND_TRUTH_LABELS"
+            fa_status = "UNAVAILABLE_WITHOUT_GROUND_TRUTH_LABELS"
+
         s_metrics = SentinelPerformanceMetrics(
             total_signals=tot_sig,
-            corroboration_rate=round(corrob_rate, 2),
-            false_alarm_rate=round(1.0 - corrob_rate, 2),
-            precision_status="UNAVAILABLE_WITHOUT_GROUND_TRUTH_LABELS",
-            precision=None,
+            corroboration_rate=corrob_rate,
+            false_alarm_rate=fa_rate,
+            precision_status=prec_status,
+            precision=prec,
             alert_counts_by_severity=sev_counts,
+            false_alarm_status=fa_status,
         )
 
-        # 5. Overall Health Synthesis
+        # 5. Overall Health Synthesis (Part D3)
         if total_shortfalls > 0:
             health = "ACTION_REQUIRED"
-        elif f_metrics.drift_analysis.drift_detected or avg_slippage > 50.0:
+        elif (f_metrics.drift_analysis and f_metrics.drift_analysis.drift_detected) or avg_slippage > 50.0:
             health = "WARNING"
-        elif total_decisions < self.MIN_SAMPLES_FOR_EVALUATION:
+        elif f_metrics.status == "INCONCLUSIVE" or total_decisions < self.MIN_SAMPLES_FOR_EVALUATION:
             health = "INCONCLUSIVE"
         else:
             health = "HEALTHY"
 
         inconclusive_reason = None
-        if total_decisions < self.MIN_SAMPLES_FOR_EVALUATION:
+        if f_metrics.status == "INCONCLUSIVE" or total_decisions < self.MIN_SAMPLES_FOR_EVALUATION:
             inconclusive_reason = (
-                f"Sample size ({total_decisions} decisions, {valid_evaluations} forecasts) is below minimal statistical threshold ({self.MIN_SAMPLES_FOR_EVALUATION})."
+                f"Evaluation sample size ({total_decisions} decisions, {valid_evaluations} forecasts) is below minimal statistical threshold ({self.MIN_SAMPLES_FOR_EVALUATION})."
             )
 
         return SystemPerformanceReport(

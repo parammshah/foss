@@ -30,21 +30,25 @@ class SqliteEventStore:
 
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
-        self._shared_conn: Optional[sqlite3.Connection] = None
-        if self.db_path == ":memory:":
-            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
-            self._shared_conn.row_factory = sqlite3.Row
+        self._shared_conn: Optional[sqlite3.Connection] = sqlite3.connect(
+            self.db_path, timeout=10.0, check_same_thread=False
+        )
+        self._shared_conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        if self._shared_conn is None:
+            self._shared_conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
+            self._shared_conn.row_factory = sqlite3.Row
+        return self._shared_conn
+
+    def close(self) -> None:
         if self._shared_conn is not None:
-            return self._shared_conn
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            return conn
-        except sqlite3.Error as e:
-            raise PersistenceError(f"Failed to connect to database at {self.db_path}: {e}") from e
+            try:
+                self._shared_conn.close()
+            except Exception:
+                pass
+            self._shared_conn = None
 
     def _init_db(self) -> None:
         try:
@@ -112,13 +116,14 @@ class SqliteEventStore:
         except sqlite3.Error as e:
             raise PersistenceError(f"Database initialization failed: {e}") from e
 
-    def record_event(self, event: LearningEvent) -> None:
+    def record_event(self, event: LearningEvent, ignore_duplicates: bool = False) -> None:
         """Records a versioned LearningEvent. Raises PersistenceError on failure."""
+        insert_verb = "INSERT OR IGNORE" if ignore_duplicates else "INSERT"
         try:
             with self._get_connection() as conn:
                 conn.execute(
-                    """
-                    INSERT INTO learning_events (
+                    f"""
+                    {insert_verb} INTO learning_events (
                         event_id, versioned_event_type, module, timestamp, correlation_id,
                         payload_json, associated_versions_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?);

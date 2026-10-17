@@ -23,9 +23,9 @@ class EventStore:
         self.persistence_file = persistence_file or ":memory:"
         self.sqlite_store = SqliteEventStore(db_path=self.persistence_file)
 
-    def record(self, event: LearningEvent) -> None:
+    def record(self, event: LearningEvent, ignore_duplicates: bool = False) -> None:
         """Record a versioned LearningEvent. Raises PersistenceError if write fails."""
-        self.sqlite_store.record_event(event)
+        self.sqlite_store.record_event(event, ignore_duplicates=ignore_duplicates)
 
     def get_by_correlation_id(self, correlation_id: str) -> List[LearningEvent]:
         """Retrieve all events related to a single decision or forecast lifecycle."""
@@ -53,3 +53,7 @@ class EventStore:
     def clear(self) -> None:
         """Clear all events (used for test isolation)."""
         self.sqlite_store.clear()
+
+    def close(self) -> None:
+        """Close durable SQLite storage connection."""
+        self.sqlite_store.close()

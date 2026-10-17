@@ -19,7 +19,7 @@ def render_overview(snapshot: DashboardSnapshot) -> None:
     total_assets = sum(p.market_value for p in state.asset_positions)
     total_portfolio = total_assets + state.available_cash
     reserve = state.protected_reserve_floor
-    eligible_surplus = max(0.0, total_portfolio - reserve)
+    eligible_surplus = max(0.0, total_portfolio - reserve) if reserve is not None else 0.0
 
     # 4 Primary Metric Cards
     c1, c2, c3, c4 = st.columns(4)
@@ -35,22 +35,24 @@ def render_overview(snapshot: DashboardSnapshot) -> None:
             unsafe_allow_html=True,
         )
     with c2:
+        res_display = f"${reserve / 1e6:.1f}M" if reserve is not None else "UNCONFIGURED"
         st.markdown(
             f"""
             <div class='rj-metric-tile'>
                 <div class='rj-metric-label'>Protected Reserve Floor</div>
-                <div class='rj-metric-val' style='color: #F59E0B;'>${reserve / 1e6:.1f}M</div>
+                <div class='rj-metric-val' style='color: #F59E0B;'>{res_display}</div>
                 <div class='rj-metric-sub'>Mandatory Capital Firewall</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
     with c3:
+        surp_display = f"${eligible_surplus / 1e6:.1f}M" if reserve is not None else "UNKNOWN"
         st.markdown(
             f"""
             <div class='rj-metric-tile'>
                 <div class='rj-metric-label'>Eligible Surplus Capital</div>
-                <div class='rj-metric-val' style='color: #10B981;'>${eligible_surplus / 1e6:.1f}M</div>
+                <div class='rj-metric-val' style='color: #10B981;'>{surp_display}</div>
                 <div class='rj-metric-sub'>Yield Optimization Pool</div>
             </div>
             """,
@@ -58,12 +60,17 @@ def render_overview(snapshot: DashboardSnapshot) -> None:
         )
     with c4:
         tss = snapshot.latest_decision.treasury_safety_score
-        tss_color = "#10B981" if tss >= 80 else ("#F59E0B" if tss >= 65 else "#EF4444")
+        if tss is not None:
+            tss_color = "#10B981" if tss >= 80 else ("#F59E0B" if tss >= 65 else "#EF4444")
+            tss_display = f"{tss:.1f}/100"
+        else:
+            tss_color = "#94A3B8"
+            tss_display = "UNAVAILABLE"
         st.markdown(
             f"""
             <div class='rj-metric-tile'>
                 <div class='rj-metric-label'>Treasury Safety Score</div>
-                <div class='rj-metric-val' style='color: {tss_color};'>{tss:.1f}/100</div>
+                <div class='rj-metric-val' style='color: {tss_color};'>{tss_display}</div>
                 <div class='rj-metric-sub'>Multi-Factor Risk Health</div>
             </div>
             """,
@@ -174,7 +181,7 @@ def render_overview(snapshot: DashboardSnapshot) -> None:
             f"""
             - **Core Capital ({state.core_capital_pct:.0%}):** ${total_portfolio * state.core_capital_pct / 1e6:.1f}M dedicated to structural reserves, high-quality collateral, and regulatory baseline.
             - **Hot Capital ({state.hot_capital_pct:.0%}):** ${total_portfolio * state.hot_capital_pct / 1e6:.1f}M flexible tactical capital allocated to intraday repo optimization and term yield capture.
-            - **Protected Reserve Floor:** ${reserve / 1e6:.1f}M hard statutory firewall (non-negotiable invariant).
+            - **Protected Reserve Floor:** {res_display} hard statutory firewall (non-negotiable invariant).
             - **Authorized Credit Facility:** ${state.authorized_credit_availability / 1e6:.1f}M standby buffer.
             """
         )

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 from reserve_juggler.contracts import RiskSeverity, RiskSignal, ServiceStatus, TreasuryState
 from reserve_juggler.events.deduplication import EventDeduplicator
 from reserve_juggler.events.interpreter import EventRiskInterpreter
-from reserve_juggler.events.models import RawEventRecord, SentinelEvaluationResult
+from reserve_juggler.events.models import EventCluster, RawEventRecord, SentinelEvaluationResult
 from reserve_juggler.events.sources import EventSource, EventSourceManager, RSSFeedSource, SyntheticEventSource
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,16 @@ class MacroPanicSentinel:
     def add_event_source(self, source: RSSFeedSource) -> None:
         """Register an authorized external feed source (e.g. RSS/API)."""
         self.source_manager.add_live_source(source)
+
+    def process_event(
+        self, event: RawEventRecord, treasury_state: Optional[TreasuryState] = None
+    ) -> RiskSignal:
+        """Processes a single raw event through deduplication and interpretation."""
+        clusters = self.deduplicator.cluster_events([event])
+        if clusters:
+            return self.interpreter.interpret_cluster(clusters[0], treasury_state=treasury_state)
+        cluster = EventCluster(cluster_id=f"CL-{event.event_id}", canonical_event=event)
+        return self.interpreter.interpret_cluster(cluster, treasury_state=treasury_state)
 
     def evaluate(
         self,

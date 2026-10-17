@@ -1,0 +1,10 @@
+# Reserve Juggler — Team 3 Backend Requirements
+# Pure backend services: Event Intelligence, Learning Engine, Governance, Facade & Persistence
+# Does NOT require Streamlit or presentation libraries.
+
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+requests>=2.31.0
+pydantic>=2.0.0
+pytest>=7.4.0

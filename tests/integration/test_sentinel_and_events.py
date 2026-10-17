@@ -162,10 +162,10 @@ def test_rfc2822_date_parsing_and_since_filtering():
     assert "2026-10-02T13:00:00" in parsed_utc
     assert "+00:00" in parsed_utc or "Z" in parsed_utc
 
-    # Malformed date fallback
+    # Malformed date must return None to prevent stale/invalid events from appearing fresh
     bad_date = "invalid-date-string-xyz"
     parsed_bad = parse_rfc_or_iso_datetime(bad_date)
-    assert parsed_bad is not None  # Falls back to now_utc, does not crash
+    assert parsed_bad is None  # Does not substitute now_utc
 
 
 def test_financial_concept_classification():

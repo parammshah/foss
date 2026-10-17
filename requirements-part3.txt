@@ -8,3 +8,4 @@ plotly>=5.18.0
 pydantic>=2.0.0
 pytest>=7.4.0
 requests>=2.31.0
+scipy>=1.10.0

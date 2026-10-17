@@ -15,6 +15,7 @@ Exposed Integration Services:
 
 from __future__ import annotations
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,15 +49,28 @@ class LearningService:
         self.validator = SafetyInvariantValidator()
         self.registry = VersionRegistry(persistence_store=self.store)
         self.runtime_registry = RuntimeComponentRegistry()
-        self.evaluation_engine = CandidateEvaluationEngine(validator=self.validator)
+        self.evaluation_engine = CandidateEvaluationEngine(
+            validator=self.validator,
+            runtime_registry=self.runtime_registry,
+            store=self.store,
+        )
         self._candidates: Dict[str, CandidateUpdate] = {}
 
-    def record(self, event: LearningEvent) -> None:
+        # Recover persisted candidates if durable store exists
+        if hasattr(self.store, "sqlite_store") and self.store.sqlite_store:
+            try:
+                for c in self.store.sqlite_store.get_all_candidates():
+                    if c:
+                        self._candidates[c.candidate_id] = c
+            except Exception as e:
+                logger.debug("Could not recover persisted candidates: %s", e)
+
+    def record(self, event: LearningEvent, ignore_duplicates: bool = False) -> None:
         """
         Record any versioned event in the treasury lifecycle.
         Called by data ingestion, forecasting, TSS, sentinel, decision engine, and human oversight.
         """
-        self.store.record(event)
+        self.store.record(event, ignore_duplicates=ignore_duplicates)
 
     def evaluate_system_performance(
         self, start_iso: Optional[str] = None, end_iso: Optional[str] = None
@@ -91,7 +105,7 @@ class LearningService:
         Propose a candidate model, parameter, or threshold update.
         Initializes validation checks against safety invariants.
         """
-        cid = f"CAND-{component[:4]}-{len(self._candidates)+1:03d}"
+        cid = f"CAND-{component[:4].upper()}-{uuid.uuid4().hex[:6].upper()}"
         now_iso = datetime.now(timezone.utc).isoformat()
         
         # Retrieve current live parameter if not provided
@@ -149,13 +163,14 @@ class LearningService:
                     "violations": violations,
                 },
                 associated_versions=self.registry.get_active_versions(),
-            )
+            ),
+            ignore_duplicates=True,
         )
 
         return candidate
 
     def evaluate_in_shadow_mode(
-        self, candidate_id: str, sample_size: int = 30
+        self, candidate_id: str, sample_size: int = 30, evaluation_records: Optional[List[Dict[str, Any]]] = None
     ) -> CandidateUpdate:
         """
         Executes genuine holdout evaluation comparing candidate vs active champion
@@ -171,6 +186,7 @@ class LearningService:
         report = self.evaluation_engine.evaluate_candidate(
             candidate=candidate,
             sample_size=sample_size,
+            evaluation_records=evaluation_records,
         )
         candidate.validation_report = report
         candidate.holdout_sample_size = report.validation_sample_size
@@ -183,8 +199,8 @@ class LearningService:
             candidate.rejection_reason = "; ".join(report.violations)
         else:
             candidate.status = CandidateStatus.SHADOW_MODE
-            candidate.shadow_mode_runs = sample_size
-            candidate.shadow_win_rate = 0.90 if report.metric_improved else 0.50
+            candidate.shadow_mode_runs = report.shadow_runs
+            candidate.shadow_win_rate = report.shadow_win_rate
 
         # Update in store
         if hasattr(self.store, "sqlite_store"):
@@ -220,6 +236,13 @@ class LearningService:
         if candidate.status == CandidateStatus.REJECTED:
             return (False, f"Cannot promote rejected candidate: {candidate.rejection_reason}")
 
+        # Enforce that component has a registered active runtime consumer
+        if not self.runtime_registry.has_active_provider(candidate.component):
+            return (
+                False,
+                f"Promotion blocked: Component '{candidate.component}' does not have an active registered runtime consumer (UNINTEGRATED).",
+            )
+
         # Check validation report
         if not candidate.validation_report:
             # Auto-evaluate before promotion
@@ -232,13 +255,18 @@ class LearningService:
 
         now_iso = datetime.now(timezone.utc).isoformat()
         version_tag = new_version_tag or f"v{datetime.now().strftime('%Y%m%d%H%M')}"
+        prev_version = self.registry.get_active_versions().get(candidate.component, "v1.0.0")
+        prev_status = candidate.status
 
         # 1. Mutate live operational runtime parameter
         rt_ok, rt_msg, old_val = self.runtime_registry.apply_runtime_update(
             component=candidate.component,
             parameter_key=candidate.parameter_key,
             new_value=candidate.proposed_value,
+            require_active_provider=True,
         )
+        if not rt_ok:
+            return (False, f"Promotion aborted: {rt_msg}")
 
         # 2. Register promotion in version registry
         self.registry.register_promotion(
@@ -255,36 +283,62 @@ class LearningService:
         candidate.promoted_by = approver
         candidate.promotion_role = approver_role
 
-        # Update candidate in store
+        # 3. Transactional update of candidate in durable store
         if hasattr(self.store, "sqlite_store"):
             try:
                 self.store.sqlite_store.save_candidate(candidate)
             except Exception as e:
-                logger.error("Failed to persist candidate: %s", str(e))
+                # Rollback live runtime change and reconcile version and status (Part E3)
+                self.runtime_registry.restore_runtime_state(candidate.component)
+                self.registry._active_versions[candidate.component] = prev_version
+                candidate.status = prev_status
+                candidate.promoted_at = None
+                candidate.promoted_by = None
+                candidate.promotion_role = None
+                logger.error("Audit persistence failed: %s. Rolling back runtime and version state.", str(e))
+                return (False, f"Promotion aborted: durable audit persistence failed: {e}")
 
-        # 3. Record learning event
-        self.record(
-            LearningEvent(
-                event_id=f"EV-PROM-{candidate_id}",
-                versioned_event_type="MODEL_UPDATE_PROMOTED",
-                module="SYSTEM_LEARNING",
-                timestamp=now_iso,
-                correlation_id=candidate_id,
-                payload={
-                    "candidate_id": candidate_id,
-                    "component": candidate.component,
-                    "new_version": version_tag,
-                    "parameter_key": candidate.parameter_key,
-                    "old_value": old_val,
-                    "new_value": candidate.proposed_value,
-                    "runtime_updated": rt_ok,
-                    "approver": approver,
-                    "approver_role": approver_role,
-                    "justification": justification,
-                },
-                associated_versions=self.registry.get_active_versions(),
+        # 4. Record learning event transactionally
+        try:
+            self.record(
+                LearningEvent(
+                    event_id=f"EV-PROM-{candidate_id}",
+                    versioned_event_type="MODEL_UPDATE_PROMOTED",
+                    module="SYSTEM_LEARNING",
+                    timestamp=now_iso,
+                    correlation_id=candidate_id,
+                    payload={
+                        "candidate_id": candidate_id,
+                        "component": candidate.component,
+                        "new_version": version_tag,
+                        "parameter_key": candidate.parameter_key,
+                        "old_value": old_val,
+                        "new_value": candidate.proposed_value,
+                        "runtime_updated": rt_ok,
+                        "approver": approver,
+                        "approver_role": approver_role,
+                        "justification": justification,
+                    },
+                    associated_versions=self.registry.get_active_versions(),
+                )
             )
-        )
+        except Exception as e:
+            self.runtime_registry.restore_runtime_state(candidate.component)
+            self.registry._active_versions[candidate.component] = prev_version
+            candidate.status = prev_status
+            candidate.promoted_at = None
+            candidate.promoted_by = None
+            candidate.promotion_role = None
+            if hasattr(self.store, "sqlite_store"):
+                try:
+                    self.store.sqlite_store.save_candidate(candidate)
+                except Exception:
+                    pass
+            logger.error("Audit event record failed: %s. Rolling back runtime parameter.", str(e))
+            return (False, f"Promotion aborted: durable event persistence failed: {e}")
+
+        # Durably associate version tag with runtime config (Part B2)
+        self.runtime_registry.record_promoted_version(candidate.component, version_tag)
 
         return (True, f"Candidate {candidate_id} successfully promoted to active version {version_tag}. Runtime state updated.")
 
@@ -298,8 +352,23 @@ class LearningService:
     ) -> Tuple[bool, str]:
         """
         Rolls back a subsystem to a prior approved version and restores live runtime parameter state.
+        Fails closed if target_version does not have a restorable runtime configuration (Part E4).
         """
         comp = component.upper()
+
+        # Check target-specific restorable configuration exists before mutating state
+        if not self.runtime_registry.has_version_config(comp, target_version):
+            return (
+                False,
+                f"Rollback rejected: Target version '{target_version}' has no valid restorable runtime configuration for {comp}.",
+            )
+
+        # 1. Restore live operational runtime parameter configuration to requested target version
+        rt_ok, rt_msg = self.runtime_registry.restore_runtime_state(comp, target_version)
+        if not rt_ok:
+            return (False, f"Runtime rollback failed: {rt_msg}")
+
+        # 2. Reconcile version registry
         success, msg = self.registry.rollback(
             component=comp,
             target_version=target_version,
@@ -308,10 +377,12 @@ class LearningService:
             justification=justification,
         )
 
-        if success:
-            # Restore live operational runtime parameter configuration
+        if not success:
+            # Revert runtime state if version governance rejected
             self.runtime_registry.restore_runtime_state(comp)
+            return (False, f"Version rollback failed: {msg}")
 
+        try:
             self.record(
                 LearningEvent(
                     event_id=f"EV-ROLLBACK-{comp}",
@@ -329,8 +400,10 @@ class LearningService:
                     associated_versions=self.registry.get_active_versions(),
                 )
             )
+        except Exception as e:
+            logger.error("Audit logging failed during rollback: %s", e)
 
-        return (success, msg)
+        return (True, f"Component {comp} successfully rolled back to {target_version}. Runtime parameters restored.")
 
     def get_candidate(self, candidate_id: str) -> Optional[CandidateUpdate]:
         return self._candidates.get(candidate_id)

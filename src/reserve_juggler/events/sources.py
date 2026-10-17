@@ -22,13 +22,14 @@ from reserve_juggler.events.models import RawEventRecord
 logger = logging.getLogger(__name__)
 
 
-def parse_rfc_or_iso_datetime(date_str: str) -> str:
+def parse_rfc_or_iso_datetime(date_str: str) -> Optional[str]:
     """
     Parses RFC 2822 dates (e.g. 'Wed, 02 Oct 2026 13:00:00 GMT') or ISO 8601 strings,
     returning a normalized UTC ISO 8601 timestamp string.
+    Returns None if date_str is empty, malformed, or unparseable.
     """
     if not date_str:
-        return datetime.now(timezone.utc).isoformat()
+        return None
 
     clean_str = date_str.strip()
     # Try RFC 2822 first
@@ -50,8 +51,8 @@ def parse_rfc_or_iso_datetime(date_str: str) -> str:
     except Exception:
         pass
 
-    logger.warning("Unparseable date string '%s'; using current UTC time.", date_str)
-    return datetime.now(timezone.utc).isoformat()
+    logger.warning("Unparseable date string '%s'; returning None.", date_str)
+    return None
 
 
 class EventSource(ABC):
@@ -304,7 +305,10 @@ class RSSFeedSource(EventSource):
                 events = self._cached_events
 
         if since_iso:
-            events = [e for e in events if e.publication_time >= since_iso]
+            events = [
+                e for e in events
+                if e.publication_time and e.publication_time != "INVALID_TIMESTAMP" and e.publication_time >= since_iso
+            ]
         return events
 
     def _parse_rss_xml(self, xml_text: str) -> List[RawEventRecord]:
@@ -325,8 +329,9 @@ class RSSFeedSource(EventSource):
                 link = link_elem.text.strip() if link_elem is not None and link_elem.text else None
                 
                 pubdate_elem = item.find("pubDate")
-                raw_pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else now_iso
-                pub_iso = parse_rfc_or_iso_datetime(raw_pub_date)
+                raw_pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else ""
+                parsed_pub = parse_rfc_or_iso_datetime(raw_pub_date)
+                pub_iso = parsed_pub if parsed_pub is not None else "INVALID_TIMESTAMP"
                 
                 guid_elem = item.find("guid")
                 event_id = guid_elem.text.strip() if guid_elem is not None and guid_elem.text else f"RSS-{hash(title)}"

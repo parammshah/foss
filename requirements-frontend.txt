@@ -1,0 +1,6 @@
+# Reserve Juggler — Team 3 Frontend Requirements
+# Legacy Streamlit UI and Interactive Visualization Dependencies
+
+-r requirements-backend.txt
+streamlit>=1.30.0
+plotly>=5.18.0

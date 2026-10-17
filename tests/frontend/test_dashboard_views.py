@@ -2,7 +2,7 @@
 Comprehensive tests for all eight dashboard views and snapshot schemas.
 Verifies complete rendered-page execution, UI pipeline stability,
 edge cases (empty data, missing services, failed gates, inconclusive metrics),
-and AppTest integration.
+and Streamlit AppTest integration.
 """
 
 from __future__ import annotations
@@ -10,15 +10,22 @@ import sys
 from pathlib import Path
 import pytest
 
+_root = str(Path(__file__).resolve().parent.parent.parent)
+_src = str(Path(__file__).resolve().parent.parent.parent / "src")
+_frontend = str(Path(__file__).resolve().parent.parent.parent / "frontend" / "legacy_streamlit")
+for p in (_root, _src, _frontend):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
 from reserve_juggler.integration.facade import ApplicationFacade, DashboardSnapshot
-from reserve_juggler.dashboard.views.overview import render_overview
-from reserve_juggler.dashboard.views.forecasts import render_forecasts
-from reserve_juggler.dashboard.views.portfolio import render_portfolio
-from reserve_juggler.dashboard.views.decision import render_decision
-from reserve_juggler.dashboard.views.stress_lab import render_stress_lab
-from reserve_juggler.dashboard.views.sentinel import render_sentinel
-from reserve_juggler.dashboard.views.learning import render_learning
-from reserve_juggler.dashboard.views.decision_log import render_decision_log
+from views.overview import render_overview
+from views.forecasts import render_forecasts
+from views.portfolio import render_portfolio
+from views.decision import render_decision
+from views.stress_lab import render_stress_lab
+from views.sentinel import render_sentinel
+from views.learning import render_learning
+from views.decision_log import render_decision_log
 
 
 def test_dashboard_snapshot_schema():
@@ -36,6 +43,7 @@ def test_dashboard_snapshot_schema():
     assert isinstance(snapshot.audit_log, list)
     assert isinstance(snapshot.active_candidates, list)
     assert snapshot.data_source_mode in ("SYNTHETIC_DEMO", "LIVE", "UNINTEGRATED")
+    facade.close()
 
 
 def test_all_eight_views_render_via_apptest():
@@ -43,10 +51,9 @@ def test_all_eight_views_render_via_apptest():
     Executes all 8 navigation views using the official Streamlit AppTest framework.
     Guarantees no runtime exceptions, unhandled None attributes, or broken widgets across the app.
     """
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
     from streamlit.testing.v1 import AppTest
 
-    app_path = str(Path(__file__).parent.parent.parent / "src" / "reserve_juggler" / "dashboard" / "app.py")
+    app_path = str(Path(__file__).resolve().parent.parent.parent / "frontend" / "legacy_streamlit" / "app.py")
     at = AppTest.from_file(app_path).run()
     assert len(at.exception) == 0, f"Overview encountered exception: {at.exception}"
 
@@ -78,6 +85,7 @@ def test_forecast_view_edge_case_with_zero_actuals_mape_none():
 
     # Calling render_forecasts directly should not crash
     render_forecasts(snapshot)
+    facade.close()
 
 
 def test_decision_view_edge_case_with_no_alternatives_and_failed_gate():
@@ -93,6 +101,7 @@ def test_decision_view_edge_case_with_no_alternatives_and_failed_gate():
         snapshot.decision_explanation.hard_gates[0].reason = "Mandatory reserve floor violation simulated."
 
     render_decision(snapshot, facade)
+    facade.close()
 
 
 def test_sentinel_view_edge_case_with_zero_signals():
@@ -101,17 +110,45 @@ def test_sentinel_view_edge_case_with_zero_signals():
     snapshot = facade.get_dashboard_snapshot()
 
     snapshot.sentinel_result.active_signals = []
-    snapshot.sentinel_result.aggregate_macro_stress_score = 15.0
+    snapshot.sentinel_result.total_events_processed = 0
+    snapshot.sentinel_result.aggregate_macro_stress_score = 0.0
 
     render_sentinel(snapshot, facade)
+    facade.close()
 
 
 def test_learning_view_edge_case_with_inconclusive_health():
-    """Verifies learning view renders cleanly with INCONCLUSIVE and ACTION_REQUIRED states."""
+    """Verifies learning view handles inconclusive evaluation and empty candidates without crashing."""
     facade = ApplicationFacade(use_synthetic=True)
     snapshot = facade.get_dashboard_snapshot()
 
-    snapshot.system_performance.overall_system_health = "ACTION_REQUIRED"
-    snapshot.system_performance.inconclusive_reason = "Holdout sample size (4) below threshold (10)."
+    snapshot.system_performance.overall_system_health = "INCONCLUSIVE"
+    snapshot.active_candidates = []
 
     render_learning(snapshot, facade)
+    facade.close()
+
+
+def test_all_eight_pages_render_under_populated_and_missing_data_conditions():
+    """
+    Verifies that all 8 views render without exceptions even when snapshot fields are None or empty.
+    """
+    facade = ApplicationFacade(use_synthetic=True)
+    snapshot = facade.get_dashboard_snapshot()
+
+    # Populate with None/empty edge cases
+    snapshot.treasury_state.protected_reserve_floor = None
+    snapshot.latest_decision.treasury_safety_score = None
+    snapshot.active_candidates = []
+    snapshot.audit_log = []
+
+    # Direct rendering execution of all 8 view functions
+    render_overview(snapshot)
+    render_forecasts(snapshot)
+    render_portfolio(snapshot)
+    render_decision(snapshot, facade)
+    render_stress_lab(snapshot, facade)
+    render_sentinel(snapshot, facade)
+    render_learning(snapshot, facade)
+    render_decision_log(snapshot)
+    facade.close()

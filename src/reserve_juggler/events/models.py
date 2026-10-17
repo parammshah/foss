@@ -4,9 +4,8 @@ Data models for the Macro-Panic Sentinel and Financial-Event Monitoring.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from reserve_juggler.integration.contracts import RiskSignal, EventCategory, RiskSeverity
+from reserve_juggler.contracts import RiskSignal, EventCategory, RiskSeverity
 
 
 @dataclass

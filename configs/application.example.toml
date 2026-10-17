@@ -1,0 +1,28 @@
+# Reserve Juggler — Application Configuration Template
+# Copy to application.toml for local production deployment
+
+[application]
+environment = "development"
+mode = "SYNTHETIC_DEMO" # Options: "SYNTHETIC_DEMO", "PRODUCTION"
+service_name = "reserve-juggler-team-3"
+version = "1.0.0"
+
+[database]
+# Path to SQLite database file. Use :memory: for isolated test runs.
+path = "var/reserve_juggler.db"
+timeout_seconds = 10.0
+
+[sentinel]
+alert_threshold = 60.0
+similarity_threshold = 0.50
+critical_threshold = 0.80
+stale_hours_threshold = 48.0
+max_seen_events = 5000
+
+[learning]
+min_validation_sample_size = 10
+auto_shadow_evaluation = true
+
+[logging]
+level = "INFO"
+format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

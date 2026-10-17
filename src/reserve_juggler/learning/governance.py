@@ -90,6 +90,52 @@ class SafetyInvariantValidator:
                 f"Inconclusive holdout data: Sample size ({candidate.holdout_sample_size}) is insufficient for safe statistical validation."
             )
 
+        # 7. Parameter value finiteness and type validation (Part A5)
+        import math
+        def check_val(v: Any, path: str = "") -> List[str]:
+            errs: List[str] = []
+            if isinstance(v, (int, float)):
+                if math.isnan(v):
+                    errs.append(f"Invalid parameter value at {path or 'root'}: NaN is not allowed.")
+                elif math.isinf(v):
+                    errs.append(f"Invalid parameter value at {path or 'root'}: Infinity is not allowed.")
+            elif isinstance(v, dict):
+                for k, sub_v in v.items():
+                    errs.extend(check_val(sub_v, f"{path}.{k}" if path else str(k)))
+            elif isinstance(v, (list, tuple)):
+                for idx, sub_v in enumerate(v):
+                    errs.extend(check_val(sub_v, f"{path}[{idx}]"))
+            return errs
+
+        violations.extend(check_val(candidate.proposed_value))
+
+        # 8. Component and parameter specific range & normalization constraints (Part A5)
+        if candidate.parameter_key == "ensemble_combining_weights":
+            if isinstance(candidate.proposed_value, dict):
+                weights = candidate.proposed_value.values()
+                if any(not isinstance(w, (int, float)) for w in weights):
+                    violations.append("Ensemble combining weights must be numeric.")
+                elif any(w < 0.0 for w in weights):
+                    violations.append("Ensemble combining weights must be non-negative.")
+                elif abs(sum(weights) - 1.0) > 1e-4:
+                    violations.append(
+                        f"Ensemble combining weights must form a convex combination summing to 1.0 (observed sum: {sum(weights):.4f})."
+                    )
+            elif isinstance(candidate.proposed_value, (list, tuple)):
+                if any(not isinstance(w, (int, float)) for w in candidate.proposed_value):
+                    violations.append("Ensemble combining weights must be numeric.")
+                elif any(w < 0.0 for w in candidate.proposed_value):
+                    violations.append("Ensemble combining weights must be non-negative.")
+                elif abs(sum(candidate.proposed_value) - 1.0) > 1e-4:
+                    violations.append(
+                        f"Ensemble combining weights must form a convex combination summing to 1.0 (observed sum: {sum(candidate.proposed_value):.4f})."
+                    )
+
+        # Buffer multipliers must be positive
+        if "multiplier" in param_lower:
+            if isinstance(candidate.proposed_value, (int, float)) and candidate.proposed_value <= 0.0:
+                violations.append(f"Multiplier parameter '{candidate.parameter_key}' must be strictly positive (> 0).")
+
         return (len(violations) == 0, violations)
 
 
@@ -125,6 +171,30 @@ class VersionRegistry:
             k: [v] for k, v in self._active_versions.items()
         }
         self._audit_trail: List[VersionAuditEntry] = []
+
+        # Recover persisted version audits and restore latest approved version
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store") and self.persistence_store.sqlite_store:
+            try:
+                audits = self.persistence_store.sqlite_store.get_version_audits()
+                for a in audits:
+                    entry = VersionAuditEntry(
+                        entry_id=a["entry_id"],
+                        component=a["component"],
+                        previous_version=a["previous_version"],
+                        new_version=a["new_version"],
+                        timestamp=a["timestamp"],
+                        author=a["author"],
+                        approver=a["approver"],
+                        approver_role=a["approver_role"],
+                        action_type=a["action_type"],
+                        justification=a["justification"],
+                    )
+                    self._audit_trail.append(entry)
+                    comp = a["component"].upper()
+                    self._active_versions[comp] = a["new_version"]
+                    self._version_history.setdefault(comp, []).append(a["new_version"])
+            except Exception as e:
+                logger.debug("Could not recover version audits from persistence: %s", e)
 
     def get_active_versions(self) -> Dict[str, str]:
         return dict(self._active_versions)

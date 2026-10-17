@@ -23,6 +23,11 @@ def render_learning(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
     health_badge = "badge-ok" if perf.overall_system_health == "HEALTHY" else (
         "badge-critical" if perf.overall_system_health == "ACTION_REQUIRED" else "badge-high"
     )
+    slippage_str = (
+        f"{perf.decision_metrics.avg_cost_slippage_bps:.1f} bps"
+        if perf.decision_metrics.avg_cost_slippage_bps is not None
+        else "N/A"
+    )
     st.markdown(
         f"""
         <div style='display: flex; gap: 15px; margin-bottom: 20px;'>
@@ -40,7 +45,7 @@ def render_learning(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
                 <div class='rj-metric-label'>Cost Slippage Avg</div>
-                <div class='rj-metric-val' style='font-size: 1.3rem; color: #38BDF8;'>{perf.decision_metrics.avg_cost_slippage_bps:.1f} bps</div>
+                <div class='rj-metric-val' style='font-size: 1.3rem; color: #38BDF8;'>{slippage_str}</div>
             </div>
         </div>
         """,

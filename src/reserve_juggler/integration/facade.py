@@ -66,11 +66,19 @@ class ApplicationFacade:
 
     FACADE_VERSION = "1.0.0"
 
-    def __init__(self, persistence_file: Optional[str] = None, use_synthetic: bool = True):
-        self.use_synthetic = use_synthetic
-        mode_str = "SYNTHETIC_DEMO" if use_synthetic else "PRODUCTION"
+    def __init__(self, persistence_file: Optional[str] = None, use_synthetic: Optional[bool] = None):
+        import os
+        if use_synthetic is None:
+            # Production-safe default (Part G1): explicit opt-in or environment variable
+            env_mode = os.environ.get("RESERVE_JUGGLER_MODE", "").upper()
+            env_synth = os.environ.get("RESERVE_JUGGLER_USE_SYNTHETIC", "").lower()
+            self.use_synthetic = (env_mode == "SYNTHETIC_DEMO") or (env_synth in ("1", "true", "yes"))
+        else:
+            self.use_synthetic = use_synthetic
 
-        self.sentinel = MacroPanicSentinel(use_synthetic_mode=use_synthetic)
+        mode_str = "SYNTHETIC_DEMO" if self.use_synthetic else "PRODUCTION"
+
+        self.sentinel = MacroPanicSentinel(use_synthetic_mode=self.use_synthetic)
         self.learning_service = LearningService(persistence_file=persistence_file)
         self.explanation_service = DecisionExplanationService()
         self.team1_adapter = Team1DataForecastAdapter(mode=mode_str)
@@ -82,15 +90,35 @@ class ApplicationFacade:
         self._incident_log: List[Dict[str, Any]] = []
         self._latest_decision_record: Optional[DecisionRecord] = None
 
-        self._bootstrap_demo_telemetry()
+        # Register live Sentinel runtime provider
+        from reserve_juggler.learning.runtime_registry import SentinelRuntimeProvider
+        self.learning_service.runtime_registry.register_provider(
+            "SENTINEL_RISK", SentinelRuntimeProvider(self.sentinel)
+        )
+
+        if self.use_synthetic:
+            self._bootstrap_demo_telemetry()
+
+    def get_integration_status(self) -> str:
+        """
+        Returns UNINTEGRATED if external adapters are not connected,
+        otherwise SYNTHETIC_DEMO or LIVE.
+        """
+        if not self.team1_adapter.is_connected or not self.team2_adapter.is_connected:
+            return "UNINTEGRATED"
+        return "SYNTHETIC_DEMO" if self.use_synthetic else "LIVE"
+
+    @property
+    def data_source_mode(self) -> str:
+        return self.get_integration_status()
 
     def _bootstrap_demo_telemetry(self) -> None:
-        """Seeds initial verified telemetry into SQLite event store."""
+        """Seeds initial verified illustrative telemetry into event store (Demo Mode Only)."""
         now = datetime.now(timezone.utc).isoformat()
         
         # Historical Decision 1
         d1_id = "DEC-HIST-001"
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-D1",
                 versioned_event_type="DECISION_GENERATED",
@@ -104,11 +132,13 @@ class ApplicationFacade:
                     "amount": 10_000_000.0,
                     "estimated_costs": {"total": 5_200.0},
                     "gate_outcomes": [{"gate_name": "MandatoryReserveFloorGate", "status": "PASS"}],
+                    "is_synthetic": True,
                 },
                 associated_versions={"decision_engine": "v1.2.0"},
-            )
+            ),
+            ignore_duplicates=True,
         )
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-O1",
                 versioned_event_type="OUTCOME_OBSERVED",
@@ -120,23 +150,31 @@ class ApplicationFacade:
                     "realized_costs": {"total": 5_240.0},
                     "liquidity_shortfall": 0.0,
                     "settlement_status": "SETTLED",
+                    "is_synthetic": True,
                 },
-            )
+            ),
+            ignore_duplicates=True,
         )
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-H1",
                 versioned_event_type="HUMAN_APPROVAL_RECORDED",
                 module="HUMAN_OVERSIGHT",
                 timestamp=now,
                 correlation_id=d1_id,
-                payload={"status": "APPROVED", "actor_name": "Chief Treasurer", "stated_reason": "Standard operational liquidity draw."},
-            )
+                payload={
+                    "status": "APPROVED",
+                    "actor_name": "Chief Treasurer",
+                    "stated_reason": "Standard operational liquidity draw.",
+                    "is_synthetic": True,
+                },
+            ),
+            ignore_duplicates=True,
         )
 
         # Historical Decision 2
         d2_id = "DEC-HIST-002"
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-D2",
                 versioned_event_type="DECISION_GENERATED",
@@ -150,11 +188,13 @@ class ApplicationFacade:
                     "amount": 12_000_000.0,
                     "estimated_costs": {"total": 14_000.0},
                     "gate_outcomes": [{"gate_name": "MandatoryReserveFloorGate", "status": "PASS"}],
+                    "is_synthetic": True,
                 },
                 associated_versions={"decision_engine": "v1.2.0"},
-            )
+            ),
+            ignore_duplicates=True,
         )
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-O2",
                 versioned_event_type="OUTCOME_OBSERVED",
@@ -166,30 +206,38 @@ class ApplicationFacade:
                     "realized_costs": {"total": 14_110.0},
                     "liquidity_shortfall": 0.0,
                     "settlement_status": "SETTLED",
+                    "is_synthetic": True,
                 },
-            )
+            ),
+            ignore_duplicates=True,
         )
-        self.learning_service.record(
+        self.learning_service.store.record(
             LearningEvent(
                 event_id="EV-H2",
                 versioned_event_type="HUMAN_APPROVAL_RECORDED",
                 module="HUMAN_OVERSIGHT",
                 timestamp=now,
                 correlation_id=d2_id,
-                payload={"status": "APPROVED", "actor_name": "Senior Cash Manager", "stated_reason": "Portfolio duration rebalancing."},
-            )
+                payload={
+                    "status": "APPROVED",
+                    "actor_name": "Senior Cash Manager",
+                    "stated_reason": "Portfolio duration rebalancing.",
+                    "is_synthetic": True,
+                },
+            ),
+            ignore_duplicates=True,
         )
 
-        # Pre-seed a candidate update in shadow mode
+        # Pre-seed a candidate update in shadow mode as an explicit demo fixture (Part G2)
         self.learning_service.propose_update(
             component="FORECASTING",
             parameter_key="ensemble_combining_weights",
             proposed_value={"lstm_weight": 0.45, "arimax_weight": 0.55},
             current_value={"lstm_weight": 0.50, "arimax_weight": 0.50},
-            description="Re-weight ARIMAX for tighter confidence intervals during volatile trading hours.",
-            author="Quant Research Team",
-            holdout_evaluation_score=0.92,
-            holdout_sample_size=40,
+            description="[DEMO FIXTURE] Re-weight ARIMAX for tighter confidence intervals during volatile trading hours.",
+            author="Quant Research Team (Demo)",
+            holdout_evaluation_score=0.0,
+            holdout_sample_size=0,
             stress_shortfall_count=0,
         )
 
@@ -369,3 +417,8 @@ class ApplicationFacade:
             credit_unavailable=credit_unavailable,
             equity_drawdown_pct=equity_drawdown_pct,
         )
+
+    def close(self) -> None:
+        """Closes all underlying persistent resources and connections."""
+        if hasattr(self, "learning_service") and hasattr(self.learning_service, "store"):
+            self.learning_service.store.close()

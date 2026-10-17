@@ -10,7 +10,7 @@ import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from reserve_juggler.events.models import EventCluster, RawEventRecord
-from reserve_juggler.integration.contracts import (
+from reserve_juggler.contracts import (
     EventCategory, RiskSeverity, RiskSignal, TreasuryState
 )
 
@@ -105,19 +105,27 @@ class EventRiskInterpreter:
         else:
             base_confidence = min(0.65, base_confidence)
 
-        # Staleness check
+        # Staleness and timestamp validity check
+        if not canonical.publication_time or canonical.publication_time in ("INVALID_TIMESTAMP", "UNKNOWN"):
+            return 0.05
+
         try:
             from reserve_juggler.events.sources import parse_rfc_or_iso_datetime
             now = datetime.now(timezone.utc)
             pub_iso = parse_rfc_or_iso_datetime(canonical.publication_time)
+            if not pub_iso:
+                return 0.05
             pub_dt = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
             age_hours = (now - pub_dt).total_seconds() / 3600.0
-            if age_hours > self.stale_hours_threshold:
+            if age_hours < -0.1:
+                # Future-dated timestamp anomaly
+                base_confidence = min(0.20, base_confidence)
+            elif age_hours > self.stale_hours_threshold:
                 # Decay confidence for stale reports
                 decay = math.exp(-0.05 * (age_hours - self.stale_hours_threshold))
                 base_confidence *= max(0.2, decay)
         except Exception:
-            pass
+            return 0.05
 
         return round(min(1.0, max(0.05, base_confidence)), 3)
 
@@ -138,6 +146,9 @@ class EventRiskInterpreter:
         corroboration = self.evaluate_corroboration(cluster)
         confidence = self.calculate_confidence(cluster, corroboration)
 
+        # Check for invalid timestamp
+        is_invalid_ts = not canonical.publication_time or canonical.publication_time in ("INVALID_TIMESTAMP", "UNKNOWN")
+
         # Category base risk
         category_weights = {
             EventCategory.BANKING_STRESS.value: 0.85,
@@ -151,7 +162,6 @@ class EventRiskInterpreter:
         base_cat_weight = category_weights.get(canonical.category, 0.40)
 
         # Critical: Separate Sentiment from Risk
-        # Sentiment indicates market tone, but severity requires tangible event impact
         sentiment_penalty = max(0.0, -canonical.sentiment_score * 0.20)
         
         # Raw severity
@@ -163,14 +173,20 @@ class EventRiskInterpreter:
 
         # Map to scenario tags
         scenario_tags = []
-        if canonical.category == EventCategory.MONETARY_POLICY.value:
-            scenario_tags.append("RATES_UP_50BP")
-        if canonical.category in (EventCategory.BANKING_STRESS.value, EventCategory.WITHDRAWAL_ACCELERATION.value):
-            scenario_tags.extend(["DEPOSIT_RUN_SIM", "REPO_SQUEEZE_100BP"])
-        if canonical.category == EventCategory.MARKET_SHOCK.value:
-            scenario_tags.append("BOND_YIELD_SPIKE_40BP")
+        if not is_invalid_ts:
+            if canonical.category == EventCategory.MONETARY_POLICY.value:
+                scenario_tags.append("RATES_UP_50BP")
+            if canonical.category in (EventCategory.BANKING_STRESS.value, EventCategory.WITHDRAWAL_ACCELERATION.value):
+                scenario_tags.extend(["DEPOSIT_RUN_SIM", "REPO_SQUEEZE_100BP"])
+            if canonical.category == EventCategory.MARKET_SHOCK.value:
+                scenario_tags.append("BOND_YIELD_SPIKE_40BP")
 
-        severity_level = self.determine_severity_level(raw_severity)
+        warnings: List[str] = []
+        if is_invalid_ts:
+            severity_level = RiskSeverity.LOW_CONFIDENCE.value
+            warnings.append(f"INVALID_TIMESTAMP: Publication timestamp '{canonical.publication_time}' is malformed or missing; decayed confidence.")
+        else:
+            severity_level = self.determine_severity_level(raw_severity)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         evidence_text = (
@@ -195,4 +211,5 @@ class EventRiskInterpreter:
             sentiment_score=canonical.sentiment_score,
             is_duplicate=False,
             relevance_to_treasury=relevance,
+            warnings=warnings,
         )

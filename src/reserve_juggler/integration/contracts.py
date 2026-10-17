@@ -4,6 +4,7 @@ Imports directly from canonical reserve_juggler.contracts to maintain a single s
 """
 
 from reserve_juggler.contracts import (
+    ActionType,
     ApprovalStatus,
     AssetPosition,
     AlternativeAction,

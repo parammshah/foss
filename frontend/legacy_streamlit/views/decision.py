@@ -74,14 +74,30 @@ def render_decision(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
 
         st.markdown("### 🛡️ Hard Safety Gates Evaluation")
         for gate in exp.hard_gates:
-            icon = "✅" if gate.passed else "❌"
-            badge = "badge-ok" if gate.passed else "badge-critical"
+            from reserve_juggler.contracts import GateStatus
+            if gate.status == GateStatus.PASS or (hasattr(gate, "passed") and gate.passed and gate.status not in (GateStatus.NOT_EVALUATED, GateStatus.UNKNOWN)):
+                icon = "✅"
+                badge = "badge-ok"
+                status_text = "PASSED"
+            elif gate.status == GateStatus.FAIL:
+                icon = "❌"
+                badge = "badge-critical"
+                status_text = "FAILED"
+            elif gate.status == GateStatus.NOT_EVALUATED:
+                icon = "⚪"
+                badge = "badge-neutral"
+                status_text = "NOT_EVALUATED"
+            else:
+                icon = "❓"
+                badge = "badge-neutral"
+                status_text = "UNKNOWN"
+
             st.markdown(
                 f"""
                 <div style='padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; margin-bottom: 6px;'>
                     <div style='display: flex; justify-content: space-between;'>
                         <span style='font-weight: 600; font-size: 0.84rem;'>{icon} {gate.gate_name}</span>
-                        <span class='{badge}'>{'PASSED' if gate.passed else 'FAILED'}</span>
+                        <span class='{badge}'>{status_text}</span>
                     </div>
                     <div style='font-size: 0.76rem; color: #94A3B8; margin-top: 2px;'>{gate.reason}</div>
                 </div>
@@ -114,7 +130,7 @@ def render_decision(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
     st.markdown("<div class='rj-card'>", unsafe_allow_html=True)
     st.markdown("### ✍️ Human-in-the-Loop Oversight & Approval Workflow")
     st.markdown(
-        "<p style='color: #94A3B8; font-size: 0.85rem;'>Enforces role-based permissions. All executed actions run in simulated execution mode with comprehensive audit trail logging.</p>",
+        "<p style='color: #94A3B8; font-size: 0.85rem;'><b>Simulated Role Selection (Demo Mode):</b> Real enterprise SSO/IAM authentication provider is unintegrated. Role permissions are enforced by backend service methods.</p>",
         unsafe_allow_html=True,
     )
 
@@ -124,7 +140,7 @@ def render_decision(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
             actor_name = st.text_input("Authorizer Name", value="Jane Doe, CFA")
         with fb:
             actor_role = st.selectbox(
-                "Authorizer Role",
+                "Authorizer Role (Simulated Demo)",
                 [r.value for r in UserRole],
                 index=2,  # HEAD_OF_TREASURY default
             )

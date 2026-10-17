@@ -4,6 +4,8 @@ Main Streamlit Application.
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
 import streamlit as st
 
 # Must be very first Streamlit command
@@ -14,25 +16,49 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from reserve_juggler.dashboard.styles import CUSTOM_CSS
-from reserve_juggler.dashboard.views.decision import render_decision
-from reserve_juggler.dashboard.views.decision_log import render_decision_log
-from reserve_juggler.dashboard.views.forecasts import render_forecasts
-from reserve_juggler.dashboard.views.learning import render_learning
-from reserve_juggler.dashboard.views.overview import render_overview
-from reserve_juggler.dashboard.views.portfolio import render_portfolio
-from reserve_juggler.dashboard.views.sentinel import render_sentinel
-from reserve_juggler.dashboard.views.stress_lab import render_stress_lab
+_this_dir = str(Path(__file__).resolve().parent)
+_src_dir = str(Path(__file__).resolve().parent.parent.parent / "src")
+_root_dir = str(Path(__file__).resolve().parent.parent.parent)
+for p in (_this_dir, _src_dir, _root_dir):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from views.decision import render_decision
+    from views.decision_log import render_decision_log
+    from views.forecasts import render_forecasts
+    from views.learning import render_learning
+    from views.overview import render_overview
+    from views.portfolio import render_portfolio
+    from views.sentinel import render_sentinel
+    from views.stress_lab import render_stress_lab
+    from styles import CUSTOM_CSS
+except ImportError:
+    from frontend.legacy_streamlit.views.decision import render_decision
+    from frontend.legacy_streamlit.views.decision_log import render_decision_log
+    from frontend.legacy_streamlit.views.forecasts import render_forecasts
+    from frontend.legacy_streamlit.views.learning import render_learning
+    from frontend.legacy_streamlit.views.overview import render_overview
+    from frontend.legacy_streamlit.views.portfolio import render_portfolio
+    from frontend.legacy_streamlit.views.sentinel import render_sentinel
+    from frontend.legacy_streamlit.views.stress_lab import render_stress_lab
+    from frontend.legacy_streamlit.styles import CUSTOM_CSS
+
 from reserve_juggler.integration.facade import ApplicationFacade
 
 # Inject Custom Dark Mode Glassmorphism Styling
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
+import os
+
 @st.cache_resource
 def get_facade() -> ApplicationFacade:
-    """Singleton application facade instance."""
-    return ApplicationFacade(use_synthetic=True)
+    """Singleton application facade instance with configurable data source mode."""
+    mode_env = os.environ.get("RESERVE_JUGGLER_MODE", "SYNTHETIC_DEMO").upper()
+    use_synthetic = (mode_env != "PRODUCTION")
+    db_path = os.environ.get("RESERVE_JUGGLER_DB_PATH", "reserve_juggler.db")
+    return ApplicationFacade(persistence_file=db_path, use_synthetic=use_synthetic)
 
 
 def main() -> None:
