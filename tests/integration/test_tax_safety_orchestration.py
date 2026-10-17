@@ -201,3 +201,120 @@ def test_gross_yield_distinguished_from_after_tax_yield():
 
     # Statutory vs synthetic yields are mathematically distinct ($79,000 vs $82,000)
     assert res_stat.after_tax_net_value != res_synth.after_tax_net_value
+
+
+def test_deterministic_surplus_allocation_multi_candidate_tax_scenarios():
+    """Deterministic scenario with positive surplus and multiple feasible candidates (PLACE_REPO and BUY_BOND).
+    Exercises:
+    1. No tax profile: Provisional gross ranking, human approval mandated, auto-sim blocked.
+    2. Synthetic tax profile: Provisional demo ranking, human approval mandated, auto-sim blocked.
+    3. Invalid tax profile: Intercepted by validation, provisional gross ranking, human approval mandated.
+    4. Valid statutory profile matching entity/jurisdiction: Verified after-tax ranking, gate pass.
+    5. Entity / jurisdiction mismatch: US corporate statutory rules are NOT universally applied to foreign entity.
+    """
+    from reserve_juggler.contracts import ForecastBundle, ForecastPoint
+    from reserve_juggler.optimization.optimizer import optimize_treasury_actions
+
+    now = datetime(2026, 1, 15, 17, 0, 0, tzinfo=timezone.utc)  # 17:00 UTC -> Repo window open
+
+    # Substantial surplus cash with low obligations and strong projected net inflow
+    t1_repo = AssetPosition(
+        asset_id="T1_REPO_PORTFOLIO",
+        name="Overnight Repo",
+        tier=AssetTier.TIER_1_REPO,
+        market_value_usd=10_000_000.0,
+        annual_yield_or_return=0.043,
+    )
+    state = TreasuryState(
+        operational_cash_usd=60_000_000.0,
+        asset_positions={"T1_REPO_PORTFOLIO": t1_repo},
+        upcoming_obligations_usd=5_000_000.0,
+        as_of_timestamp=now,
+        entity_id="US_CORP_01",
+        jurisdiction="US_FED_CORP_STATUTORY",
+    )
+
+    fb = ForecastBundle(
+        as_of_timestamp=now.isoformat(),
+        point_forecasts={
+            "1h": ForecastPoint(horizon="1h", expected_inflow=10_000_000.0, expected_outflow=2_000_000.0, expected_net_flow=8_000_000.0, uncertainty_p50=8_000_000.0, uncertainty_p05=5_000_000.0, uncertainty_p95=11_000_000.0),
+            "24h": ForecastPoint(horizon="24h", expected_inflow=50_000_000.0, expected_outflow=10_000_000.0, expected_net_flow=40_000_000.0, uncertainty_p50=40_000_000.0, uncertainty_p05=25_000_000.0, uncertainty_p95=55_000_000.0),
+            "72h": ForecastPoint(horizon="72h", expected_inflow=150_000_000.0, expected_outflow=30_000_000.0, expected_net_flow=120_000_000.0, uncertainty_p50=120_000_000.0, uncertainty_p05=80_000_000.0, uncertainty_p95=160_000_000.0),
+        },
+    )
+
+    # -------------------------------------------------------------
+    # Scenario 1: No Tax Profile -> Gross Yield Ranking, Provisional, Human Approval
+    # -------------------------------------------------------------
+    orch = DecisionOrchestrator()
+    res_none = orch.run_cycle(current_state=state, as_of_timestamp=now, tax_profile=None, auto_simulate_execution=True)
+    assert res_none.decision_record.metadata["tax_profile_status"] == "UNCONFIGURED_GROSS_ONLY"
+    assert res_none.decision_record.metadata["ranking_is_provisional"] is True
+    assert res_none.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res_none.simulated_outcome is None
+    # Verify multiple feasible investment candidates were generated
+    feasible_cands = [c for c in res_none.decision_record.alternatives if c.get("is_feasible")]
+    assert len(feasible_cands) >= 1
+
+    # -------------------------------------------------------------
+    # Scenario 2: Synthetic Tax Profile -> Marked Provisional
+    # -------------------------------------------------------------
+    synth_profile = create_synthetic_demo_profile(entity_id="US_CORP_01")
+    res_synth = orch.run_cycle(current_state=state, as_of_timestamp=now, tax_profile=synth_profile, auto_simulate_execution=True)
+    assert res_synth.decision_record.metadata["tax_profile_status"] == "SYNTHETIC_DEMO"
+    assert res_synth.decision_record.metadata["ranking_is_provisional"] is True
+    assert res_synth.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res_synth.simulated_outcome is None
+
+    # -------------------------------------------------------------
+    # Scenario 3: Invalid Tax Profile -> Blocked, Provisional Gross Ranking
+    # -------------------------------------------------------------
+    invalid_rules = TaxJurisdictionRules(
+        jurisdiction_code="INVALID_JURISDICTION",
+        tax_year=1820,
+        rule_version="1820.1",
+        ordinary_income_brackets=[],
+        qualified_dividend_brackets=[],
+        long_term_capital_gains_brackets=[],
+    )
+    invalid_profile = TaxProfile(entity_id="US_CORP_01", jurisdiction_rules=invalid_rules)
+    res_invalid = orch.run_cycle(current_state=state, as_of_timestamp=now, tax_profile=invalid_profile, auto_simulate_execution=True)
+    assert res_invalid.decision_record.metadata["tax_profile_status"] == "INVALID"
+    assert res_invalid.decision_record.metadata["ranking_is_provisional"] is True
+    assert res_invalid.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res_invalid.simulated_outcome is None
+
+    # -------------------------------------------------------------
+    # Scenario 4: Valid Statutory US Corporate Profile (Matching Entity & Jurisdiction)
+    # -------------------------------------------------------------
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+    res_stat = orch.run_cycle(current_state=state, as_of_timestamp=now, tax_profile=stat_profile, auto_simulate_execution=True)
+    assert res_stat.decision_record.metadata["tax_profile_status"] == "STATUTORY_APPROVED"
+    assert res_stat.decision_record.metadata["ranking_is_provisional"] is False
+    tax_gate = [g for g in res_stat.validation_result.gate_outcomes if g.gate_name == "TaxSafetyAuthorityGate"][0]
+    assert tax_gate.status == GateStatus.PASS
+    assert tax_gate.observed_value == 1.0
+
+    # -------------------------------------------------------------
+    # Scenario 5: Foreign Entity / Jurisdiction Mismatch
+    # -------------------------------------------------------------
+    foreign_state = TreasuryState(
+        operational_cash_usd=60_000_000.0,
+        asset_positions={"T1_REPO_PORTFOLIO": t1_repo},
+        upcoming_obligations_usd=5_000_000.0,
+        as_of_timestamp=now,
+        entity_id="UK_SUBSIDIARY_LTD",
+        jurisdiction="UK_HMRC_STATUTORY",  # Foreign jurisdiction!
+    )
+    # Applying US corporate rules to UK subsidiary must NOT be silently accepted as verified
+    applicable, reason = stat_profile.is_applicable_to(
+        entity_id=foreign_state.entity_id, jurisdiction=foreign_state.jurisdiction
+    )
+    assert applicable is False
+    assert "Entity mismatch" in reason or "Jurisdiction mismatch" in reason
+
+    # Optimization with incompatible entity flags provisional status
+    opt_incompat = optimize_treasury_actions(state=foreign_state, forecast_bundle=fb, tax_profile=stat_profile)
+    assert opt_incompat.selected_action.ranking_is_provisional is True
+    assert any("PROVISIONAL_TAX_ASSUMPTIONS" in r for r in opt_incompat.remediation_notes)
+

@@ -91,6 +91,8 @@ def optimize_treasury_actions(
     available_cash = max(0.0, float(state.available_cash))
     credit_avail = max(0.0, float(state.credit_availability))
     credit_apr = float(getattr(state, "credit_apr", 0.12))
+    target_entity = getattr(state, "entity_id", None)
+    target_jurisdiction = getattr(state, "jurisdiction", None)
 
     # Determine repo sweep window status
     if repo_sweep_window_open is not None:
@@ -255,6 +257,8 @@ def optimize_treasury_actions(
                 gross_revenue=0.0,
                 financing_costs=bridge_interest,
                 tax_profile=tax_profile,
+                target_entity_id=target_entity,
+                target_jurisdiction=target_jurisdiction,
             )
 
             funded_amount = bridge_draw_amount
@@ -395,6 +399,8 @@ def optimize_treasury_actions(
                 gross_revenue=0.0,
                 transaction_fees=penalty,
                 tax_profile=tax_profile,
+                target_entity_id=target_entity,
+                target_jurisdiction=target_jurisdiction,
             )
 
             timing_safe = settlement_delay <= earliest_due_hours
@@ -805,6 +811,8 @@ def optimize_treasury_actions(
                 instrument_id="OVERNIGHT_REPO",
                 tax_profile=tax_profile,
                 explicit_income_type=IncomeType.INTEREST,
+                target_entity_id=target_entity,
+                target_jurisdiction=target_jurisdiction,
             )
 
             if not is_window_open:
@@ -956,6 +964,8 @@ def optimize_treasury_actions(
                     instrument_id="SOVEREIGN_2Y",
                     tax_profile=tax_profile,
                     explicit_income_type=IncomeType.INTEREST,
+                    target_entity_id=target_entity,
+                    target_jurisdiction=target_jurisdiction,
                 )
 
                 # Quantified monetary duration risk cost: principal * duration * 50bps rate shock
@@ -1074,6 +1084,8 @@ def optimize_treasury_actions(
                     instrument_id="EQUITY_INDEX",
                     tax_profile=tax_profile,
                     explicit_income_type=IncomeType.DIVIDEND,
+                    target_entity_id=target_entity,
+                    target_jurisdiction=target_jurisdiction,
                 )
 
                 # Quantified monetary volatility downside risk: principal * (volatility * sqrt(1/12))

@@ -111,6 +111,8 @@ def evaluate_tax_adjusted_value(
     tax_profile: Optional[TaxProfile] = None,
     explicit_income_type: Optional[IncomeType] = None,
     cost_basis: Optional[float] = None,
+    target_entity_id: Optional[str] = None,
+    target_jurisdiction: Optional[str] = None,
 ) -> TaxAdjustedValueResult:
     """Evaluate expected after-tax net value after financing costs, fees, and liquidity losses.
 
@@ -177,6 +179,32 @@ def evaluate_tax_adjusted_value(
             ranking_is_provisional=True,
             warnings=[
                 f"INVALID_TAX_PROFILE: {'; '.join(val_errors)}. "
+                "Net-of-tax optimization blocked; defaulted to provisional gross yield ranking."
+            ],
+        )
+
+    # Case 2b: Entity or Jurisdiction Incompatibility -> Profile must match target entity/jurisdiction
+    applicable, mismatch_reason = tax_profile.is_applicable_to(
+        entity_id=target_entity_id, jurisdiction=target_jurisdiction
+    )
+    if not applicable:
+        net_pre_tax_value = gross_revenue - financing_costs - transaction_fees - liquidation_losses
+        return TaxAdjustedValueResult(
+            gross_revenue=gross_revenue,
+            financing_costs=financing_costs,
+            transaction_fees=transaction_fees,
+            liquidation_losses=liquidation_losses,
+            net_pre_tax_value=net_pre_tax_value,
+            tax_liability=0.0,
+            tax_shield=0.0,
+            after_tax_net_value=net_pre_tax_value,
+            effective_tax_rate=0.0,
+            marginal_tax_rate=0.0,
+            jurisdiction_version="JURISDICTION_MISMATCH",
+            has_missing_classification=True,
+            ranking_is_provisional=True,
+            warnings=[
+                f"INCOMPATIBLE_TAX_PROFILE: {mismatch_reason} "
                 "Net-of-tax optimization blocked; defaulted to provisional gross yield ranking."
             ],
         )

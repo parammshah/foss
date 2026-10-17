@@ -134,6 +134,27 @@ class TaxProfile:
             errors.append(f"accumulated_capital_losses ({self.accumulated_capital_losses}) cannot be negative.")
         return errors
 
+    def is_applicable_to(
+        self, entity_id: Optional[str] = None, jurisdiction: Optional[str] = None
+    ) -> tuple[bool, Optional[str]]:
+        """Verify that the tax profile matches the required corporate entity and legal jurisdiction.
+
+        Statutory rules are not universally applicable to all legal entities or foreign jurisdictions.
+        """
+        if entity_id and self.entity_id and entity_id.strip().upper() != self.entity_id.strip().upper():
+            return (
+                False,
+                f"Entity mismatch: Profile entity '{self.entity_id}' does not match target entity '{entity_id}'.",
+            )
+        if jurisdiction and self.jurisdiction_rules.jurisdiction_code:
+            if jurisdiction.strip().upper() != self.jurisdiction_rules.jurisdiction_code.strip().upper():
+                return (
+                    False,
+                    f"Jurisdiction mismatch: Profile rules '{self.jurisdiction_rules.jurisdiction_code}' "
+                    f"do not match target jurisdiction '{jurisdiction}'. Statutory rules are jurisdiction-specific.",
+                )
+        return True, None
+
 
 def create_statutory_us_corp_profile(
     entity_id: str = "US_CORP_01", tax_year: int = 2026
