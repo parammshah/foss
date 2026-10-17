@@ -146,7 +146,7 @@ class SqliteEventStore:
                         event.event_id,
                         event.versioned_event_type,
                         event.module,
-                        event.timestamp,
+                        event.timestamp.isoformat() if hasattr(event.timestamp, "isoformat") else str(event.timestamp),
                         event.correlation_id,
                         json.dumps(event.payload),
                         json.dumps(event.associated_versions),

@@ -512,12 +512,23 @@ class TreasuryState(CanonicalBaseModel):
             # Credit
             cred = data.get("emergency_credit_available_usd")
             if cred is None:
-                cred = data.get("authorized_credit_availability", 50_000_000.0)
+                cred = data.get("authorized_credit_availability")
+            if cred is None:
+                cred = data.get("available_credit_usd", 50_000_000.0)
             data["emergency_credit_available_usd"] = float(cred)
             data["authorized_credit_availability"] = float(cred)
 
             # Obligations
             obls = data.get("obligations") or data.get("future_obligations") or []
+            if not obls and data.get("upcoming_obligations_usd"):
+                obls = [
+                    Obligation(
+                        obligation_id="OBL-AUTO-01",
+                        amount_usd=float(data["upcoming_obligations_usd"]),
+                        is_mandatory=True,
+                        is_settled=False,
+                    )
+                ]
             data["obligations"] = obls
             data["future_obligations"] = obls
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from reserve_juggler.contracts import (
     DataQualityStatus,
@@ -194,7 +197,8 @@ class ForecastService:
         horizons = horizons_hours or list(self.suites.keys()) or DEFAULT_HORIZONS
 
         if self._historical_df is None or not self.suites:
-            raise ValueError("ForecastService must be fit() with historical data before forecasting.")
+            logger.warning("ForecastService has not been fit; generating conservative fallback bundle.")
+            return self.generate_fallback_bundle(as_of_utc, horizons)
 
         # Cut off historical data strictly at as_of_timestamp (Zero future leakage!)
         ts_col = self._historical_df[TIMESTAMP_COL]

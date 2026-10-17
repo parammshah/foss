@@ -75,10 +75,10 @@ class IndependentConstraintValidator:
     def validate_proposal(
         self,
         state: TreasuryState,
-        proposal: DecisionRecord,
-        forecast_bundle: ForecastBundle,
-        risk_signals: Sequence[RiskSignal],
-        stress_regime: str,
+        proposal: Any,
+        forecast_bundle: Optional[ForecastBundle] = None,
+        risk_signals: Sequence[RiskSignal] = (),
+        stress_regime: str = "NORMAL",
     ) -> ValidationResult:
         reasons: List[str] = []
         gates: List[HardGateOutcome] = []
@@ -87,8 +87,10 @@ class IndependentConstraintValidator:
         shortfall = 0.0
 
         # Gate 1: Customer Obligations & Immediate Payout Protection
-        committed_obligations = sum(
-            ob.amount_usd for ob in state.obligations if ob.is_mandatory and not ob.is_settled
+        committed_obligations = (
+            sum(ob.amount_usd for ob in state.obligations if ob.is_mandatory and not ob.is_settled)
+            if state.obligations
+            else max(0.0, getattr(state, "upcoming_obligations_usd", 0.0))
         )
         available_cash = max(0.0, state.operational_cash_usd)
 
@@ -101,7 +103,22 @@ class IndependentConstraintValidator:
             for k in ["BUY", "INVEST", "SWEEP", "PLACE_REPO"]
         )
 
-        if is_investment:
+        if available_cash < committed_obligations:
+            shortfall_amt = committed_obligations - available_cash
+            shortfall = max(shortfall, shortfall_amt)
+            reasons.append(
+                f"Immediate liquidity shortfall: available cash (${available_cash:,.2f}) cannot cover committed obligations (${committed_obligations:,.2f}). Deficit: ${shortfall_amt:,.2f}."
+            )
+            gates.append(
+                HardGateOutcome(
+                    gate_name="CustomerObligationsProtectionGate",
+                    status=GateStatus.FAIL,
+                    threshold_value=committed_obligations,
+                    observed_value=available_cash,
+                    reason=f"Immediate liquidity shortfall of ${shortfall_amt:,.2f}.",
+                )
+            )
+        elif is_investment:
             cash_after_investment = available_cash - proposed_amount
             if cash_after_investment < committed_obligations:
                 shortfall_amt = committed_obligations - cash_after_investment
@@ -136,7 +153,7 @@ class IndependentConstraintValidator:
                     status=GateStatus.PASS,
                     threshold_value=committed_obligations,
                     observed_value=available_cash,
-                    reason="No discretionary cash reduction proposed.",
+                    reason="No discretionary cash reduction proposed and obligations covered.",
                 )
             )
 
