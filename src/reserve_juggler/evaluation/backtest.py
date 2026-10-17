@@ -28,6 +28,7 @@ from reserve_juggler.forecasting.baseline import (
 )
 from reserve_juggler.forecasting.ml_model import RidgeMLModel
 from reserve_juggler.forecasting.or_ensemble import ORConstrainedEnsemble
+from reserve_juggler.forecasting.uncertainty import ORScenarioReconciler
 
 
 @dataclass
@@ -44,6 +45,10 @@ class BacktestHorizonComparison:
     or_ensemble_wape: float
     or_ensemble_weights: Dict[str, float]
     sample_count: int
+    picp_80: Optional[float] = None
+    pinball_p10: Optional[float] = None
+    pinball_p90: Optional[float] = None
+    calibration_error_80: Optional[float] = None
 
 
 @dataclass
@@ -55,21 +60,24 @@ class BacktestReport:
 
     def summary(self) -> str:
         lines = [
-            "=" * 78,
+            "=" * 98,
             f"CHRONOLOGICAL ROLLING-ORIGIN BACKTEST RESULTS ({self.start_timestamp} -> {self.end_timestamp})",
-            "=" * 78,
-            f"{'Target':<12} {'Horizon':<8} {'Recent MAE':<14} {'Seasonal MAE':<14} {'ML MAE':<14} {'OR Ensemble MAE':<16}",
-            "-" * 78,
+            "=" * 98,
+            f"{'Target':<14} {'Horizon':<8} {'Recent MAE':<14} {'Seasonal MAE':<14} {'ML MAE':<14} {'OR Ensemble MAE':<16} {'WAPE':<8} {'PICP 80%':<10}",
+            "-" * 98,
         ]
         for h in self.horizon_results:
+            picp_str = f"{h.picp_80:.1%}" if h.picp_80 is not None else "N/A"
             lines.append(
-                f"{h.target_variable:<12} {h.horizon_hours:<8} "
+                f"{h.target_variable:<14} {h.horizon_hours:<8} "
                 f"${h.recent_baseline_mae:<13,.0f} "
                 f"${h.seasonal_baseline_mae:<13,.0f} "
                 f"${h.ridge_ml_mae:<13,.0f} "
-                f"${h.or_ensemble_mae:<15,.0f}"
+                f"${h.or_ensemble_mae:<15,.0f} "
+                f"{h.or_ensemble_wape:<7.2%} "
+                f"{picp_str:<10}"
             )
-        lines.append("=" * 78)
+        lines.append("=" * 98)
         return "\n".join(lines)
 
 
@@ -89,13 +97,13 @@ class RollingOriginBacktest:
         df: pd.DataFrame,
         target_cols: Optional[List[str]] = None,
         horizons: Optional[List[int]] = None,
-        initial_train_size: int = 300,
+        initial_train_size: int = 500,
         roll_step_hours: int = 24,
-        max_evaluations: int = 15,
+        max_evaluations: int = 20,
     ) -> BacktestReport:
-        """Run chronological backtest."""
+        """Run chronological backtest without lookahead leakage."""
         targets = target_cols or [DEPOSITS_COL, WITHDRAWALS_COL]
-        test_horizons = horizons or [1, 6, 24]
+        test_horizons = horizons or [1, 6, 24, 48, 72]
 
         clean_df = df.copy()
         if not pd.api.types.is_datetime64_any_dtype(clean_df[TIMESTAMP_COL]):
@@ -127,6 +135,8 @@ class RollingOriginBacktest:
                 p_seasonals: List[float] = []
                 p_mls: List[float] = []
                 p_ensembles: List[float] = []
+                p_p10s: List[float] = []
+                p_p90s: List[float] = []
                 latest_weights: Dict[str, float] = {}
 
                 for origin_idx in origin_indices:
@@ -135,7 +145,7 @@ class RollingOriginBacktest:
                     actual_val = float(clean_df.loc[target_idx, target])
                     target_ts = clean_df.loc[target_idx, TIMESTAMP_COL]
 
-                    # Slice strictly up to origin (no leakage!)
+                    # Slice strictly up to origin (no future data leakage!)
                     train_data = clean_df.iloc[:origin_idx].reset_index(drop=True)
                     train_features = featured_all.iloc[:origin_idx].reset_index(drop=True)
 
@@ -148,7 +158,6 @@ class RollingOriginBacktest:
                     pred_seasonal = float(seasonal_model.predict(pd.Timestamp(target_ts))[0])
 
                     # 3. Ridge ML Model
-                    # Target shifted by h
                     y_shifted = train_data[target].shift(-h).dropna()
                     X_aligned = train_features.loc[y_shifted.index, feature_cols]
                     ml_model = RidgeMLModel(alpha=10.0).fit(X_aligned, y_shifted)
@@ -156,8 +165,7 @@ class RollingOriginBacktest:
                     pred_ml = float(ml_model.predict(origin_feat)[0])
 
                     # 4. OR Constrained Ensemble
-                    # Fit ensemble on recent validation window inside train data
-                    val_window = min(72, len(y_shifted) // 3)
+                    val_window = min(96, max(12, len(y_shifted) // 4))
                     val_idx = y_shifted.index[-val_window:]
 
                     val_y = y_shifted.loc[val_idx].values
@@ -168,7 +176,6 @@ class RollingOriginBacktest:
                     val_pred_sea = seasonal_model.predict(pd.DatetimeIndex(val_ts))
                     val_pred_ml = ml_model.predict(val_X)
 
-
                     Y_hat_val = np.column_stack([val_pred_rec, val_pred_sea, val_pred_ml])
                     ensemble = ORConstrainedEnsemble().fit(
                         Y_hat=Y_hat_val,
@@ -178,13 +185,23 @@ class RollingOriginBacktest:
                     pred_ens = float(ensemble.predict(np.array([[pred_recent, pred_seasonal, pred_ml]]))[0])
                     latest_weights = ensemble.get_weights_summary()
 
+                    # Uncertainty quantiles
+                    val_ens_preds = ensemble.predict(Y_hat_val)
+                    residuals = val_y - val_ens_preds
+                    p10_res = float(np.percentile(residuals, 10))
+                    p90_res = float(np.percentile(residuals, 90))
+                    p10_val = max(0.0, pred_ens + p10_res)
+                    p90_val = max(p10_val, pred_ens + p90_res)
+
                     y_trues.append(actual_val)
                     p_recents.append(pred_recent)
                     p_seasonals.append(pred_seasonal)
                     p_mls.append(pred_ml)
                     p_ensembles.append(pred_ens)
+                    p_p10s.append(p10_val)
+                    p_p90s.append(p90_val)
 
-                    # Publish individual evaluation event
+                    # Publish evaluation event
                     evt = LearningEvent(
                         event_id=f"eval_{uuid.uuid4().hex[:8]}",
                         event_type="forecast_evaluated",
@@ -201,6 +218,8 @@ class RollingOriginBacktest:
                             "seasonal_pred_usd": pred_seasonal,
                             "ml_pred_usd": pred_ml,
                             "ensemble_pred_usd": pred_ens,
+                            "p10_usd": p10_val,
+                            "p90_usd": p90_val,
                         },
                     )
                     self.publisher.publish(evt)
@@ -209,7 +228,7 @@ class RollingOriginBacktest:
                 m_rec = evaluate_forecast_suite(y_trues, p_recents)
                 m_sea = evaluate_forecast_suite(y_trues, p_seasonals)
                 m_ml = evaluate_forecast_suite(y_trues, p_mls)
-                m_ens = evaluate_forecast_suite(y_trues, p_ensembles)
+                m_ens = evaluate_forecast_suite(y_trues, p_ensembles, p_p10s, p_p90s)
 
                 comp = BacktestHorizonComparison(
                     horizon_hours=h,
@@ -224,6 +243,10 @@ class RollingOriginBacktest:
                     or_ensemble_wape=m_ens["wape"],
                     or_ensemble_weights=latest_weights,
                     sample_count=len(y_trues),
+                    picp_80=m_ens.get("picp_80"),
+                    pinball_p10=m_ens.get("pinball_p10"),
+                    pinball_p90=m_ens.get("pinball_p90"),
+                    calibration_error_80=m_ens.get("calibration_error_80"),
                 )
                 horizon_comparisons.append(comp)
 

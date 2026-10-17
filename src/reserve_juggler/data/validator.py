@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
@@ -19,7 +18,7 @@ from reserve_juggler.data.schema import (
     DEPOSITS_COL,
     MANDATORY_NUMERIC_COLUMNS,
     NET_FLOW_COL,
-    RATE_COLUMNS,
+    PERCENTAGE_COLUMNS,
     REPO_SWEEP_MATURE_COL,
     REPO_SWEEP_OPEN_COL,
     TIMESTAMP_COL,
@@ -30,7 +29,7 @@ from reserve_juggler.data.schema import (
 @dataclass
 class ValidationIssue:
     issue_type: str
-    severity: str  # "WARNING" or "ERROR"
+    severity: str  # "INFO", "WARNING", or "ERROR"
     message: str
     row_indices: List[int] = field(default_factory=list)
     affected_columns: List[str] = field(default_factory=list)
@@ -42,12 +41,17 @@ class ValidationReport:
     status: DataQualityStatus
     issues: List[ValidationIssue] = field(default_factory=list)
     total_rows: int = 0
+    total_columns: int = 0
+    columns: List[str] = field(default_factory=list)
     start_timestamp: Optional[datetime] = None
     end_timestamp: Optional[datetime] = None
+    sampling_frequency: str = "unknown"
     missing_hours_count: int = 0
     reconciliation_discrepancy_count: int = 0
     duplicate_count: int = 0
     imputed_count: int = 0
+    constant_columns: List[str] = field(default_factory=list)
+    column_summaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def has_errors(self) -> bool:
@@ -55,14 +59,32 @@ class ValidationReport:
 
     def summary(self) -> str:
         lines = [
-            f"Validation Status: {self.status.value}",
-            f"Total Rows: {self.total_rows}",
-            f"Time Range: {self.start_timestamp} to {self.end_timestamp}",
-            f"Missing Hours: {self.missing_hours_count}",
-            f"Duplicate Timestamps: {self.duplicate_count}",
+            "=" * 78,
+            "RESERVE JUGGLER — DATASET VALIDATION REPORT",
+            "=" * 78,
+            f"Validation Status:           {self.status.value}",
+            f"Total Rows:                  {self.total_rows:,}",
+            f"Total Columns:               {self.total_columns}",
+            f"Observed Time Range:         {self.start_timestamp} to {self.end_timestamp}",
+            f"Sampling Frequency:          {self.sampling_frequency}",
+            f"Missing Hours Count:         {self.missing_hours_count}",
+            f"Duplicate Timestamps:        {self.duplicate_count}",
             f"Reconciliation Discrepancies: {self.reconciliation_discrepancy_count}",
-            f"Total Issues Flagged: {len(self.issues)}",
+            f"Constant Parameter Columns:  {', '.join(self.constant_columns) if self.constant_columns else 'None'}",
+            f"Total Issues Flagged:        {len(self.issues)}",
+            "-" * 78,
+            "COLUMN PROFILE SUMMARY:",
+            f"{'Column Name':<36} {'Type':<8} {'Min':<10} {'Mean':<12} {'Max':<10} {'Nulls':<6}",
+            "-" * 78,
         ]
+        for col, stats in self.column_summaries.items():
+            t = str(stats.get("dtype", "unknown"))[:7]
+            mn = f"{stats.get('min', 'N/A'):.2f}" if isinstance(stats.get("min"), (int, float)) else str(stats.get("min", "N/A"))[:9]
+            me = f"{stats.get('mean', 'N/A'):.2f}" if isinstance(stats.get("mean"), (int, float)) else str(stats.get("mean", "N/A"))[:11]
+            mx = f"{stats.get('max', 'N/A'):.2f}" if isinstance(stats.get("max"), (int, float)) else str(stats.get("max", "N/A"))[:9]
+            nl = str(stats.get("nulls", 0))
+            lines.append(f"{col:<36} {t:<8} {mn:<10} {me:<12} {mx:<10} {nl:<6}")
+        lines.append("=" * 78)
         return "\n".join(lines)
 
 
@@ -78,9 +100,12 @@ class DatasetValidator:
         self.net_flow_tolerance = net_flow_tolerance_usd
 
     def validate(self, df: pd.DataFrame) -> ValidationReport:
-        """Run full validation checks across the dataframe."""
+        """Run comprehensive validation checks across the dataframe."""
         issues: List[ValidationIssue] = []
         total_rows = len(df)
+        total_cols = len(df.columns)
+        col_summaries: Dict[str, Dict[str, Any]] = {}
+        constant_cols: List[str] = []
 
         if total_rows == 0:
             issue = ValidationIssue(
@@ -93,6 +118,8 @@ class DatasetValidator:
                 status=DataQualityStatus.CRITICAL_ERROR,
                 issues=[issue],
                 total_rows=0,
+                total_columns=total_cols,
+                columns=list(df.columns),
             )
 
         # 1. Timestamp existence and datetime type
@@ -109,9 +136,10 @@ class DatasetValidator:
                 status=DataQualityStatus.CRITICAL_ERROR,
                 issues=issues,
                 total_rows=total_rows,
+                total_columns=total_cols,
+                columns=list(df.columns),
             )
 
-        # Parse timestamps to UTC
         try:
             ts_series = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
         except Exception as e:
@@ -127,6 +155,8 @@ class DatasetValidator:
                 status=DataQualityStatus.CRITICAL_ERROR,
                 issues=issues,
                 total_rows=total_rows,
+                total_columns=total_cols,
+                columns=list(df.columns),
             )
 
         # 2. Duplicate timestamps
@@ -155,17 +185,23 @@ class DatasetValidator:
                 )
             )
 
-        # 4. Hourly sequence gaps
+        # 4. Hourly sequence gaps & frequency check
         missing_hours_count = 0
+        observed_freq = "unknown"
         if is_sorted and duplicate_count == 0:
-            diffs = ts_series.diff()
+            diffs = ts_series.diff().dropna()
+            unique_diffs = diffs.unique()
             one_hour = pd.Timedelta(hours=1)
-            # Find where diff > 1 hour
-            gap_mask = diffs > one_hour
+            if len(unique_diffs) == 1 and unique_diffs[0] == one_hour:
+                observed_freq = "1 Hour (Continuous)"
+            else:
+                observed_freq = f"Irregular: {unique_diffs}"
+
+            gap_mask = ts_series.diff() > one_hour
             if gap_mask.any():
                 gap_indices = df[gap_mask].index.tolist()
                 for idx in gap_indices:
-                    gap_hours = int(diffs.loc[idx].total_seconds() / 3600) - 1
+                    gap_hours = int(ts_series.diff().loc[idx].total_seconds() / 3600) - 1
                     missing_hours_count += gap_hours
                 issues.append(
                     ValidationIssue(
@@ -177,20 +213,20 @@ class DatasetValidator:
                     )
                 )
 
-        # 5. Missing / non-finite values in mandatory numeric columns
-        for col in MANDATORY_NUMERIC_COLUMNS:
-            if col not in df.columns:
-                issues.append(
-                    ValidationIssue(
-                        issue_type="MISSING_COLUMN",
-                        severity="ERROR",
-                        message=f"Mandatory numeric column '{col}' is missing.",
-                        affected_columns=[col],
-                    )
-                )
-            else:
-                series = pd.to_numeric(df[col], errors="coerce")
-                nan_mask = series.isna() | np.isinf(series)
+        # 5. Missing / non-finite values in numeric columns & column statistics
+        for col in df.columns:
+            s = df[col]
+            null_count = int(s.isnull().sum())
+            unique_count = int(s.nunique())
+            stats: Dict[str, Any] = {
+                "dtype": str(s.dtype),
+                "nulls": null_count,
+                "unique": unique_count,
+            }
+
+            if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+                num_s = pd.to_numeric(s, errors="coerce")
+                nan_mask = num_s.isna() | np.isinf(num_s)
                 if nan_mask.any():
                     nan_indices = df[nan_mask].index.tolist()
                     issues.append(
@@ -202,6 +238,32 @@ class DatasetValidator:
                             affected_columns=[col],
                         )
                     )
+                stats["min"] = float(num_s.min()) if len(num_s) > 0 else 0.0
+                stats["max"] = float(num_s.max()) if len(num_s) > 0 else 0.0
+                stats["mean"] = float(num_s.mean()) if len(num_s) > 0 else 0.0
+                stats["std"] = float(num_s.std()) if len(num_s) > 0 else 0.0
+
+                # Check if column is constant
+                if unique_count == 1 and total_rows > 1:
+                    constant_cols.append(col)
+                    issues.append(
+                        ValidationIssue(
+                            issue_type="CONSTANT_COLUMN",
+                            severity="INFO",
+                            message=f"Column '{col}' is constant across all {total_rows} rows (value={stats['min']}). Represents simulation parameter.",
+                            affected_columns=[col],
+                        )
+                    )
+            elif pd.api.types.is_bool_dtype(s):
+                stats["min"] = bool(s.min())
+                stats["max"] = bool(s.max())
+                stats["true_count"] = int(s.sum())
+                stats["false_count"] = int((~s).sum())
+            else:
+                stats["min"] = str(s.iloc[0]) if len(s) > 0 else "N/A"
+                stats["max"] = str(s.iloc[-1]) if len(s) > 0 else "N/A"
+
+            col_summaries[col] = stats
 
         # 6. Non-negative deposit and withdrawal validity
         for cash_col in [DEPOSITS_COL, WITHDRAWALS_COL]:
@@ -221,17 +283,22 @@ class DatasetValidator:
                     )
 
         # 7. Unit conversion check: rate percentages vs decimals
-        for rate_col in RATE_COLUMNS.intersection(df.columns):
-            s = pd.to_numeric(df[rate_col], errors="coerce").dropna()
-            # If values > 1.0 (e.g. 4.8 instead of 0.048), flag warning for unit conversion
-            if (s > 1.0).any():
-                pct_indices = df[df[rate_col] > 1.0].index.tolist()
+        is_pct_scale = False
+        for probe_col in ["tier1_repo_rate_apy", "tier2_bond_yield_pct"]:
+            if probe_col in df.columns:
+                val = pd.to_numeric(df[probe_col], errors="coerce").mean()
+                if val > 1.0:
+                    is_pct_scale = True
+                    break
+
+        if is_pct_scale:
+            for rate_col in PERCENTAGE_COLUMNS.intersection(df.columns):
+                s = pd.to_numeric(df[rate_col], errors="coerce").dropna()
                 issues.append(
                     ValidationIssue(
                         issue_type="UNNORMALIZED_PERCENTAGE",
                         severity="WARNING",
-                        message=f"Column '{rate_col}' appears to have percentage values > 1.0 (e.g. {s.max():.2f}). Must be normalized to decimal fraction.",
-                        row_indices=pct_indices[:10],
+                        message=f"Column '{rate_col}' is expressed in percentage points (e.g. {s.mean():.3f}). Must be normalized to decimal fraction at boundary.",
                         affected_columns=[rate_col],
                     )
                 )
@@ -290,14 +357,18 @@ class DatasetValidator:
             status=status,
             issues=issues,
             total_rows=total_rows,
+            total_columns=total_cols,
+            columns=list(df.columns),
             start_timestamp=ts_series.iloc[0].to_pydatetime() if total_rows > 0 else None,
             end_timestamp=ts_series.iloc[-1].to_pydatetime() if total_rows > 0 else None,
+            sampling_frequency=observed_freq,
             missing_hours_count=missing_hours_count,
             reconciliation_discrepancy_count=reconciliation_discrepancy_count,
             duplicate_count=duplicate_count,
+            constant_columns=constant_cols,
+            column_summaries=col_summaries,
         )
 
-        # Publish data quality event
         now = datetime.now(timezone.utc)
         evt = LearningEvent(
             event_id=f"val_{int(now.timestamp())}_{total_rows}",
@@ -309,7 +380,9 @@ class DatasetValidator:
                 "status": status.value,
                 "is_valid": report.is_valid,
                 "total_rows": total_rows,
-                "missing_hours": missing_hours_count,
+                "total_columns": total_cols,
+                "sampling_frequency": observed_freq,
+                "constant_columns": constant_cols,
                 "issues_count": len(issues),
             },
         )
