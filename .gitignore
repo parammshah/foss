@@ -1,23 +1,172 @@
-# Byte-compiled / optimized / DLL files
+
+# ==========================================
+# RESERVE JUGGLER — GIT IGNORE
+# ==========================================
+
+# ---------- Python ----------
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyd
+*.so
+.python-version
 
-# Pytest & Coverage
+# Packaging / build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-env/
+
+# Python tooling
 .pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
+nosetests.xml
+test-results/
+junit.xml
 
-# Local databases and runtime state
+# ---------- Environment variables & secrets ----------
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Credentials and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+secrets.*
+!.env.example
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# ---------- Local databases and runtime data ----------
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
-var/*.db
-var/*.sqlite
-var/*.sqlite3
-!var/.gitkeep
+*.sqlite-shm
+*.sqlite-wal
 
-# Environment and secrets
-.env
-*.local
+# Local runtime state
+var/
+runtime/
+runtime_data/
+local_data/
+instance/
+
+# ---------- Logs and temporary files ----------
 *.log
+logs/
+log/
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+*.orig
+*.old
+*.pid
+
+# ---------- Python application caches ----------
+.cache/
+cache/
+.streamlit/cache/
+
+# ---------- Node.js / frontend ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Build outputs
+.next/
+.nuxt/
+.output/
+out/
+dist/
+build/
+coverage/
+
+# Local frontend environment files
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Frontend tooling caches
+.vite/
+.turbo/
+.eslintcache/
+
+# ---------- Generated model artifacts ----------
+# Remove these entries if the files are intentionally version-controlled.
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+
+# ---------- IDEs ----------
+.vscode/
+.idea/
+*.sublime-workspace
+*.code-workspace
+
+# ---------- Operating system ----------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---------- Archives and downloaded artifacts ----------
+# Keep source datasets and intentional release artifacts explicitly tracked.
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+*.download
+*.part
+
+# ---------- Local configuration overrides ----------
+config.local.*
+settings.local.*
