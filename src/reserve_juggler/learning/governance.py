@@ -1,14 +1,14 @@
 """
 Governance, Safety Invariants, and Version Rollback Registry.
-Enforces hard safety gates and invariants for all candidate system updates.
+Enforces non-negotiable safety rules on candidate updates and records audited rollback history.
 """
 
 from __future__ import annotations
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from reserve_juggler.learning.models import CandidateStatus, CandidateUpdate
+from reserve_juggler.learning.models import CandidateUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class SafetyInvariantValidator:
         "ignore_credit_limit",
         "force_unverified_liquidation",
         "disable_firewall",
+        "reduce_reserve",
     ]
 
     ALLOWED_COMPONENTS = {
@@ -111,7 +112,8 @@ class VersionRegistry:
     Tracks version lineage and rollback history for all subsystems.
     """
 
-    def __init__(self):
+    def __init__(self, persistence_store: Optional[Any] = None):
+        self.persistence_store = persistence_store
         self._active_versions: Dict[str, str] = {
             "FORECASTING": "v1.4.0",
             "DECISION_OPTIMIZER": "v1.2.0",
@@ -128,7 +130,7 @@ class VersionRegistry:
         return dict(self._active_versions)
 
     def get_active_version(self, component: str) -> str:
-        return self._active_versions.get(component, "v1.0.0")
+        return self._active_versions.get(component.upper(), "v1.0.0")
 
     def register_promotion(
         self,
@@ -140,13 +142,14 @@ class VersionRegistry:
         justification: str,
     ) -> None:
         """Register a promoted candidate as the new active version."""
-        prev = self._active_versions.get(component, "v1.0.0")
-        self._active_versions[component] = new_version
-        self._version_history.setdefault(component, []).append(new_version)
+        comp = component.upper()
+        prev = self._active_versions.get(comp, "v1.0.0")
+        self._active_versions[comp] = new_version
+        self._version_history.setdefault(comp, []).append(new_version)
 
         entry = VersionAuditEntry(
             entry_id=f"AUD-{len(self._audit_trail)+1}",
-            component=component,
+            component=comp,
             previous_version=prev,
             new_version=new_version,
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -158,6 +161,23 @@ class VersionRegistry:
         )
         self._audit_trail.append(entry)
 
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store"):
+            try:
+                self.persistence_store.sqlite_store.save_version_audit({
+                    "entry_id": entry.entry_id,
+                    "component": entry.component,
+                    "previous_version": entry.previous_version,
+                    "new_version": entry.new_version,
+                    "timestamp": entry.timestamp,
+                    "author": entry.author,
+                    "approver": entry.approver,
+                    "approver_role": entry.approver_role,
+                    "action_type": entry.action_type,
+                    "justification": entry.justification,
+                })
+            except Exception as e:
+                logger.error("Failed to persist version audit: %s", str(e))
+
     def rollback(
         self,
         component: str,
@@ -167,20 +187,20 @@ class VersionRegistry:
         justification: str,
     ) -> Tuple[bool, str]:
         """Roll back an active component to a previously approved version."""
-        # Role permission check: Only HEAD_OF_TREASURY or RISK_OFFICER can rollback
+        comp = component.upper()
         if approver_role not in ("HEAD_OF_TREASURY", "RISK_OFFICER", "AUDITOR"):
             return (False, f"Permission Denied: Role '{approver_role}' cannot authorize model rollback.")
 
-        history = self._version_history.get(component, [])
+        history = self._version_history.get(comp, [])
         if target_version not in history:
-            return (False, f"Target version '{target_version}' not found in approved version history for {component}.")
+            return (False, f"Target version '{target_version}' not found in approved version history for {comp}.")
 
-        prev = self._active_versions.get(component, "v1.0.0")
-        self._active_versions[component] = target_version
+        prev = self._active_versions.get(comp, "v1.0.0")
+        self._active_versions[comp] = target_version
 
         entry = VersionAuditEntry(
             entry_id=f"AUD-{len(self._audit_trail)+1}",
-            component=component,
+            component=comp,
             previous_version=prev,
             new_version=target_version,
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -191,7 +211,25 @@ class VersionRegistry:
             justification=justification,
         )
         self._audit_trail.append(entry)
-        return (True, f"Successfully rolled back {component} from {prev} to {target_version}.")
+
+        if self.persistence_store and hasattr(self.persistence_store, "sqlite_store"):
+            try:
+                self.persistence_store.sqlite_store.save_version_audit({
+                    "entry_id": entry.entry_id,
+                    "component": entry.component,
+                    "previous_version": entry.previous_version,
+                    "new_version": entry.new_version,
+                    "timestamp": entry.timestamp,
+                    "author": entry.author,
+                    "approver": entry.approver,
+                    "approver_role": entry.approver_role,
+                    "action_type": entry.action_type,
+                    "justification": entry.justification,
+                })
+            except Exception as e:
+                logger.error("Failed to persist version audit: %s", str(e))
+
+        return (True, f"Successfully rolled back {comp} from {prev} to {target_version}.")
 
     def get_audit_trail(self) -> List[VersionAuditEntry]:
         return list(self._audit_trail)

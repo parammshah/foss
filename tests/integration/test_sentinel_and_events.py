@@ -23,7 +23,7 @@ def test_sentinel_evaluates_synthetic_mode_successfully():
     result = sentinel.evaluate(treasury_state=treasury_state)
 
     assert result is not None
-    assert result.mode == "SYNTHETIC_LAB"
+    assert result.mode in ("SYNTHETIC_DEMO", "SYNTHETIC_LAB")
     assert result.system_status == "OK"
     assert len(result.active_signals) > 0
     assert 0.0 <= result.aggregate_macro_stress_score <= 100.0
@@ -147,3 +147,96 @@ def test_rss_feed_failure_resilience():
     )
     events = bad_source.fetch_events()
     assert events == []  # Gracefully returns empty, does not raise exception
+    assert bad_source.status == "UNAVAILABLE"
+    assert bad_source.last_error is not None
+
+
+def test_rfc2822_date_parsing_and_since_filtering():
+    """Verifies RFC 2822 RSS pubDate parsing, timezone normalization, and since_iso filtering."""
+    from reserve_juggler.events.sources import parse_rfc_or_iso_datetime
+
+    # Valid RFC 2822 date
+    rfc_date = "Wed, 02 Oct 2026 13:00:00 GMT"
+    parsed_utc = parse_rfc_or_iso_datetime(rfc_date)
+    assert parsed_utc is not None
+    assert "2026-10-02T13:00:00" in parsed_utc
+    assert "+00:00" in parsed_utc or "Z" in parsed_utc
+
+    # Malformed date fallback
+    bad_date = "invalid-date-string-xyz"
+    parsed_bad = parse_rfc_or_iso_datetime(bad_date)
+    assert parsed_bad is not None  # Falls back to now_utc, does not crash
+
+
+def test_financial_concept_classification():
+    """Verifies deterministic concept classification, sentiment scoring, and market tagging."""
+    from reserve_juggler.events.classifier import FinancialEventClassifier
+
+    classifier = FinancialEventClassifier()
+
+    # Rate hike headline
+    res_rate = classifier.classify(
+        title="Federal Reserve Unexpectedly Raises Benchmark Policy Rate by 75 bps",
+        summary="FOMC acts aggressively against persistent core inflation pressures.",
+    )
+    assert res_rate["category"] == "MONETARY_POLICY"
+    assert res_rate["sentiment_score"] < -0.2
+    assert "RATES" in res_rate["affected_markets"]
+    assert "SOVEREIGN_BONDS" in res_rate["affected_markets"]
+
+    # Bank failure / run headline
+    res_bank = classifier.classify(
+        title="Regulators Take Possession of Troubled Regional Bank Following Massive Deposit Run",
+        summary="Emergency weekend resolution after depositors withdrew $42 billion in 24 hours.",
+    )
+    assert res_bank["category"] == "BANKING_STRESS"
+    assert res_bank["severity"] == "CRITICAL"
+    assert res_bank["sentiment_score"] < -0.6
+    assert "CASH" in res_bank["affected_markets"]
+
+
+def test_stateful_deduplication_velocity_across_multiple_evaluations():
+    """
+    Verifies that EventDeduplicator persists history across evaluations,
+    calculates reporting velocity, and does not reset between calls.
+    """
+    dedup = EventDeduplicator()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+
+    ev = RawEventRecord(
+        event_id="EV-INITIAL",
+        source="REUTERS",
+        title="Sovereign Bond Yields Spike 40 bps Across 10-Year Benchmark Curve",
+        summary="Global fixed income rout deepens on higher inflation forecasts.",
+        publication_time=now,
+        ingestion_time=now,
+        category="MARKET_SHOCK",
+        affected_markets=["SOVEREIGN_BONDS"],
+    )
+
+    # First evaluation
+    clusters_1 = dedup.cluster_events([ev])
+    assert len(clusters_1) == 1
+    assert clusters_1[0].reporting_velocity_per_hour == 1.0
+
+    # Repeat syndicated wire 10 minutes later (in same deduplicator instance)
+    ten_min_later = (now_dt + timedelta(minutes=10)).isoformat()
+    ev_repeat = RawEventRecord(
+        event_id="EV-WIRE-COPY",
+        source="SYNDICATED_WIRE",
+        title="Sovereign Bond Yields Spike 40 bps on Fixed Income Curve",
+        summary="Global bond selloff escalates as yields touch multi-year highs.",
+        publication_time=ten_min_later,
+        ingestion_time=ten_min_later,
+        category="MARKET_SHOCK",
+        affected_markets=["SOVEREIGN_BONDS"],
+    )
+
+    clusters_2 = dedup.cluster_events([ev_repeat])
+    # The duplicate is recognized and clustered with prior history
+    assert len(clusters_2) == 1
+    assert clusters_2[0].reporting_count == 2
+    # Velocity increases to > 1.0/hr because 2 events arrived in a 10-minute span
+    assert clusters_2[0].reporting_velocity_per_hour > 1.0
+

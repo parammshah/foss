@@ -7,14 +7,17 @@ Used for local testing, demo scenarios, and interface isolation.
 from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
-from reserve_juggler.integration.contracts import (
+from reserve_juggler.contracts import (
     AssetPosition,
     AlternativeAction,
     DecisionRecord,
     ForecastBundle,
+    ForecastPoint,
+    GateStatus,
     HardGateOutcome,
     HorizonForecast,
     Obligation,
+    ServiceStatus,
     TreasuryState,
 )
 
@@ -26,7 +29,6 @@ def create_mock_treasury_state(
     """Generates a realistic multi-asset TreasuryState."""
     now = as_of_iso or datetime.now(timezone.utc).isoformat()
 
-    # Base assets
     assets = [
         AssetPosition(
             asset_id="CASH-USD-FED",
@@ -135,6 +137,8 @@ def create_mock_treasury_state(
         protected_reserve_floor=25_000_000.0,
         core_capital_pct=0.75,
         hot_capital_pct=0.25,
+        is_synthetic=True,
+        source_status=ServiceStatus.SYNTHETIC_DEMO,
     )
 
 
@@ -144,6 +148,7 @@ def create_mock_forecast_bundle(
 ) -> ForecastBundle:
     """Generates realistic multi-horizon forecasts with uncertainty intervals."""
     now = as_of_iso or datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
 
     multiplier = 1.0
     if scenario == "BANKING_STRESS":
@@ -152,55 +157,75 @@ def create_mock_forecast_bundle(
         multiplier = 1.6
 
     forecasts = {
-        "1h": HorizonForecast(
+        "1h": ForecastPoint(
             horizon="1h",
+            target_timestamp=(now_dt + timedelta(hours=1)).isoformat(),
             expected_inflow=3_000_000.0,
             expected_outflow=5_000_000.0 * multiplier,
             expected_net_flow=(3_000_000.0 - 5_000_000.0 * multiplier),
             uncertainty_p05=-(7_500_000.0 * multiplier),
             uncertainty_p50=(3_000_000.0 - 5_000_000.0 * multiplier),
+            uncertainty_p90=-1_000_000.0,
             uncertainty_p95=1_000_000.0,
+            uncertainty_p99=2_000_000.0,
             confidence_score=0.92,
+            model_version="v2.1",
         ),
-        "6h": HorizonForecast(
+        "6h": ForecastPoint(
             horizon="6h",
+            target_timestamp=(now_dt + timedelta(hours=6)).isoformat(),
             expected_inflow=8_000_000.0,
             expected_outflow=16_000_000.0 * multiplier,
             expected_net_flow=(8_000_000.0 - 16_000_000.0 * multiplier),
             uncertainty_p05=-(22_000_000.0 * multiplier),
             uncertainty_p50=(8_000_000.0 - 16_000_000.0 * multiplier),
+            uncertainty_p90=-4_000_000.0,
             uncertainty_p95=-2_000_000.0,
+            uncertainty_p99=-500_000.0,
             confidence_score=0.88,
+            model_version="v2.1",
         ),
-        "24h": HorizonForecast(
+        "24h": ForecastPoint(
             horizon="24h",
+            target_timestamp=(now_dt + timedelta(hours=24)).isoformat(),
             expected_inflow=18_000_000.0,
             expected_outflow=32_000_000.0 * multiplier,
             expected_net_flow=(18_000_000.0 - 32_000_000.0 * multiplier),
             uncertainty_p05=-(42_000_000.0 * multiplier),
             uncertainty_p50=(18_000_000.0 - 32_000_000.0 * multiplier),
+            uncertainty_p90=-9_000_000.0,
             uncertainty_p95=-5_000_000.0,
+            uncertainty_p99=-2_000_000.0,
             confidence_score=0.84,
+            model_version="v2.1",
         ),
-        "48h": HorizonForecast(
+        "48h": ForecastPoint(
             horizon="48h",
+            target_timestamp=(now_dt + timedelta(hours=48)).isoformat(),
             expected_inflow=35_000_000.0,
             expected_outflow=50_000_000.0 * multiplier,
             expected_net_flow=(35_000_000.0 - 50_000_000.0 * multiplier),
             uncertainty_p05=-(65_000_000.0 * multiplier),
             uncertainty_p50=(35_000_000.0 - 50_000_000.0 * multiplier),
+            uncertainty_p90=-15_000_000.0,
             uncertainty_p95=-10_000_000.0,
+            uncertainty_p99=-5_000_000.0,
             confidence_score=0.78,
+            model_version="v2.1",
         ),
-        "72h": HorizonForecast(
+        "72h": ForecastPoint(
             horizon="72h",
+            target_timestamp=(now_dt + timedelta(hours=72)).isoformat(),
             expected_inflow=52_000_000.0,
             expected_outflow=70_000_000.0 * multiplier,
             expected_net_flow=(52_000_000.0 - 70_000_000.0 * multiplier),
             uncertainty_p05=-(88_000_000.0 * multiplier),
             uncertainty_p50=(52_000_000.0 - 70_000_000.0 * multiplier),
+            uncertainty_p90=-18_000_000.0,
             uncertainty_p95=-12_000_000.0,
+            uncertainty_p99=-6_000_000.0,
             confidence_score=0.72,
+            model_version="v2.1",
         ),
     }
 
@@ -214,6 +239,8 @@ def create_mock_forecast_bundle(
         },
         quality_status="HIGH",
         model_versions={"deposit_model": "v2.1", "ensemble_combiner": "v1.4"},
+        is_synthetic=True,
+        source_status=ServiceStatus.SYNTHETIC_DEMO,
     )
 
 
@@ -228,21 +255,21 @@ def create_mock_decision_record(
     gates = [
         HardGateOutcome(
             gate_name="MandatoryReserveFloorGate",
-            passed=True,
+            status=GateStatus.PASS,
             threshold_value=25_000_000.0,
             observed_value=35_000_000.0,
             reason="Post-action cash and intraday liquidity exceed mandatory statutory floor.",
         ),
         HardGateOutcome(
             gate_name="CreditAvailabilityGate",
-            passed=True,
+            status=GateStatus.PASS,
             threshold_value=50_000_000.0,
             observed_value=50_000_000.0,
             reason="Authorized credit facility fully intact.",
         ),
         HardGateOutcome(
             gate_name="AssetEligibilityGate",
-            passed=True,
+            status=GateStatus.PASS,
             threshold_value=1.0,
             observed_value=1.0,
             reason="Selected asset qualifies under Basel III High-Quality Liquid Assets (HQLA) Level 1.",
@@ -258,6 +285,7 @@ def create_mock_decision_record(
             settlement_horizon_hours=2,
             rejection_reason="Commitment fee and draw spread exceed repo financing cost by 45 bps.",
             net_yield_impact=-0.0045,
+            is_feasible=False,
         ),
         AlternativeAction(
             action_type="LIQUIDATE_SOVEREIGN_BOND",
@@ -267,6 +295,7 @@ def create_mock_decision_record(
             settlement_horizon_hours=24,
             rejection_reason="T+1 settlement latency creates timing gap for T+0 intraday clearing obligations.",
             net_yield_impact=-0.0036,
+            is_feasible=False,
         ),
         AlternativeAction(
             action_type="HOLD_CASH_AND_DEFICIT",
@@ -276,6 +305,7 @@ def create_mock_decision_record(
             settlement_horizon_hours=0,
             rejection_reason="Incurs daylight overdraft penalty fees and impairs Treasury Safety Score.",
             net_yield_impact=-0.0150,
+            is_feasible=False,
         ),
     ]
 
@@ -305,4 +335,6 @@ def create_mock_decision_record(
             "macro_event_penalty": -7.0,
             "credit_cushion": 20.0,
         },
+        is_synthetic=True,
+        source_status=ServiceStatus.SYNTHETIC_DEMO,
     )

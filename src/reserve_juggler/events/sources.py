@@ -1,23 +1,57 @@
 """
 Modular event sources for Macro-Panic Sentinel.
-Supports external RSS/API feeds with rate limiting and secure credential access,
-along with an explicitly labeled synthetic-event mode for test and offline resilience.
+Supports external RSS/API feeds with RFC 2822 date parsing, deterministic classification,
+rate limiting, and explicit status labeling (LIVE, PARTIAL, SYNTHETIC_DEMO, FALLBACK, UNAVAILABLE).
 """
 
 from __future__ import annotations
+import email.utils
 import logging
 import os
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 import requests
 
+from reserve_juggler.contracts import EventCategory, ServiceStatus
+from reserve_juggler.events.classifier import FinancialEventClassifier
 from reserve_juggler.events.models import RawEventRecord
-from reserve_juggler.integration.contracts import EventCategory
 
 logger = logging.getLogger(__name__)
+
+
+def parse_rfc_or_iso_datetime(date_str: str) -> str:
+    """
+    Parses RFC 2822 dates (e.g. 'Wed, 02 Oct 2026 13:00:00 GMT') or ISO 8601 strings,
+    returning a normalized UTC ISO 8601 timestamp string.
+    """
+    if not date_str:
+        return datetime.now(timezone.utc).isoformat()
+
+    clean_str = date_str.strip()
+    # Try RFC 2822 first
+    try:
+        parsed_dt = email.utils.parsedate_to_datetime(clean_str)
+        if parsed_dt.tzinfo is None:
+            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        return parsed_dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+
+    # Try ISO format
+    try:
+        iso_str = clean_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+
+    logger.warning("Unparseable date string '%s'; using current UTC time.", date_str)
+    return datetime.now(timezone.utc).isoformat()
 
 
 class EventSource(ABC):
@@ -72,7 +106,10 @@ class SyntheticEventSource(EventSource):
 
     def fetch_events(self, since_iso: Optional[str] = None) -> List[RawEventRecord]:
         base_events = list(self._scenario_library.get(self.scenario_name, []))
-        return base_events + list(self._custom_events)
+        all_events = base_events + list(self._custom_events)
+        if since_iso:
+            all_events = [e for e in all_events if e.publication_time >= since_iso]
+        return all_events
 
     def _build_scenario_library(self) -> Dict[str, List[RawEventRecord]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -195,8 +232,8 @@ class SyntheticEventSource(EventSource):
 
 class RSSFeedSource(EventSource):
     """
-    Authorized RSS feed source with secure rate-limiting and connection resilience.
-    Uses public RSS endpoints (e.g. Central Bank feeds, SEC, Federal Reserve).
+    Authorized RSS feed source with RFC 2822 parsing, concept classification,
+    rate-limiting, and error tracking.
     """
 
     def __init__(
@@ -216,6 +253,9 @@ class RSSFeedSource(EventSource):
         self.timeout_seconds = timeout_seconds
         self._last_fetch_time: float = 0.0
         self._cached_events: List[RawEventRecord] = []
+        self.classifier = FinancialEventClassifier()
+        self.last_error: Optional[str] = None
+        self.is_failing: bool = False
 
     @property
     def source_name(self) -> str:
@@ -225,33 +265,47 @@ class RSSFeedSource(EventSource):
     def is_synthetic(self) -> bool:
         return False
 
+    @property
+    def status(self) -> str:
+        if self.is_failing:
+            return "UNAVAILABLE"
+        if self._last_fetch_time > 0:
+            return "LIVE"
+        return "READY"
+
     def fetch_events(self, since_iso: Optional[str] = None) -> List[RawEventRecord]:
         now_ts = time.time()
         # Rate limit check
         if now_ts - self._last_fetch_time < self.rate_limit_seconds and self._cached_events:
             logger.info("Serving RSS events from cache to respect rate limit for %s", self._name)
-            return self._cached_events
+            events = self._cached_events
+        else:
+            headers = {
+                "User-Agent": "ReserveJuggler-MacroSentinel/1.0 (+https://internal.treasury/bot)",
+                "Accept": "application/rss+xml, application/xml, text/xml",
+            }
+            
+            token = os.environ.get(f"{self._name.upper()}_API_KEY")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
 
-        headers = {
-            "User-Agent": "ReserveJuggler-MacroSentinel/1.0 (+https://internal.treasury/bot)",
-            "Accept": "application/rss+xml, application/xml, text/xml",
-        }
-        
-        # Check for optional API token in env
-        token = os.environ.get(f"{self._name.upper()}_API_KEY")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+            try:
+                resp = requests.get(self.feed_url, headers=headers, timeout=self.timeout_seconds)
+                resp.raise_for_status()
+                events = self._parse_rss_xml(resp.text)
+                self._cached_events = events
+                self._last_fetch_time = now_ts
+                self.last_error = None
+                self.is_failing = False
+            except Exception as e:
+                self.last_error = str(e)
+                self.is_failing = True
+                logger.warning("Failed to fetch RSS from %s: %s. Returning cached/empty.", self.feed_url, str(e))
+                events = self._cached_events
 
-        try:
-            resp = requests.get(self.feed_url, headers=headers, timeout=self.timeout_seconds)
-            resp.raise_for_status()
-            events = self._parse_rss_xml(resp.text)
-            self._cached_events = events
-            self._last_fetch_time = now_ts
-            return events
-        except Exception as e:
-            logger.warning("Failed to fetch RSS from %s: %s. Returning cached/empty.", self.feed_url, str(e))
-            return self._cached_events
+        if since_iso:
+            events = [e for e in events if e.publication_time >= since_iso]
+        return events
 
     def _parse_rss_xml(self, xml_text: str) -> List[RawEventRecord]:
         events: List[RawEventRecord] = []
@@ -271,24 +325,30 @@ class RSSFeedSource(EventSource):
                 link = link_elem.text.strip() if link_elem is not None and link_elem.text else None
                 
                 pubdate_elem = item.find("pubDate")
-                pub_time = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else now_iso
+                raw_pub_date = pubdate_elem.text.strip() if pubdate_elem is not None and pubdate_elem.text else now_iso
+                pub_iso = parse_rfc_or_iso_datetime(raw_pub_date)
                 
                 guid_elem = item.find("guid")
                 event_id = guid_elem.text.strip() if guid_elem is not None and guid_elem.text else f"RSS-{hash(title)}"
                 
+                # First-pass concept classification and sentiment
+                classified_cat, affected, sentiment, conf_status = self.classifier.classify(title + " " + summary)
+                if classified_cat == EventCategory.GENERAL_NEWS.value and self.category != EventCategory.MONETARY_POLICY.value:
+                    classified_cat = self.category
+
                 events.append(
                     RawEventRecord(
                         event_id=str(event_id),
                         source=self._name,
                         title=title,
                         summary=summary,
-                        publication_time=pub_time,
+                        publication_time=pub_iso,
                         ingestion_time=now_iso,
-                        category=self.category,
-                        affected_markets=["RATES", "MARKETS"],
+                        category=classified_cat,
+                        affected_markets=affected,
                         evidence_url=link,
                         source_credibility=self.default_credibility,
-                        sentiment_score=0.0,
+                        sentiment_score=sentiment,
                     )
                 )
         except Exception as e:
@@ -297,33 +357,50 @@ class RSSFeedSource(EventSource):
 
 
 class EventSourceManager:
-    """Manages active event sources, prioritizing reliability and synthetic fallback."""
+    """Manages active event sources, prioritizing reliability and truthful status reporting."""
 
     def __init__(self, use_synthetic: bool = True):
         self.use_synthetic = use_synthetic
         self.synthetic_source = SyntheticEventSource(scenario_name="NORMAL")
-        self.live_sources: List[EventSource] = []
+        self.live_sources: List[RSSFeedSource] = []
+        self.status = ServiceStatus.SYNTHETIC_DEMO if use_synthetic else ServiceStatus.UNAVAILABLE
+        self.last_sync_time: Optional[str] = None
+        self.source_errors: Dict[str, str] = {}
 
     def set_mode(self, use_synthetic: bool) -> None:
         self.use_synthetic = use_synthetic
+        self.status = ServiceStatus.SYNTHETIC_DEMO if use_synthetic else ServiceStatus.LIVE
 
-    def add_live_source(self, source: EventSource) -> None:
+    def add_live_source(self, source: RSSFeedSource) -> None:
         self.live_sources.append(source)
 
-    def fetch_all_events(self) -> List[RawEventRecord]:
+    def fetch_all_events(self, since_iso: Optional[str] = None) -> List[RawEventRecord]:
+        self.last_sync_time = datetime.now(timezone.utc).isoformat()
+        self.source_errors.clear()
+
         if self.use_synthetic:
-            return self.synthetic_source.fetch_events()
+            self.status = ServiceStatus.SYNTHETIC_DEMO
+            return self.synthetic_source.fetch_events(since_iso=since_iso)
 
-        # Try live sources, fall back to synthetic if empty or failed
+        if not self.live_sources:
+            self.status = ServiceStatus.UNAVAILABLE
+            return []
+
         collected: List[RawEventRecord] = []
-        for src in self.live_sources:
-            try:
-                evs = src.fetch_events()
-                collected.extend(evs)
-            except Exception as e:
-                logger.error("Source %s failed: %s", src.source_name, str(e))
+        failing_count = 0
 
-        if not collected:
-            logger.info("No live events retrieved; falling back to synthetic fallback events.")
-            return self.synthetic_source.fetch_events()
+        for src in self.live_sources:
+            evs = src.fetch_events(since_iso=since_iso)
+            if src.is_failing and src.last_error:
+                failing_count += 1
+                self.source_errors[src.source_name] = src.last_error
+            collected.extend(evs)
+
+        if failing_count == 0:
+            self.status = ServiceStatus.LIVE
+        elif failing_count < len(self.live_sources):
+            self.status = ServiceStatus.PARTIAL
+        else:
+            self.status = ServiceStatus.UNAVAILABLE
+
         return collected

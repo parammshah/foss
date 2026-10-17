@@ -131,7 +131,7 @@ def render_decision(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
         with fc:
             decision_action = st.selectbox(
                 "Workflow Decision",
-                ["APPROVE_RECOMMENDATION", "MODIFY_AMOUNT_OR_ASSET", "OVERRIDE_AND_CANCEL", "REJECT_DECISION"],
+                ["APPROVE_RECOMMENDATION", "MODIFY_AMOUNT_OR_ASSET", "CANCEL_ACTION", "REJECT_DECISION"],
             )
 
         reason = st.text_area("Audit Justification / Stated Rationale", "Reviewed and verified against intraday clearing liquidity schedule.")
@@ -147,7 +147,7 @@ def render_decision(snapshot: DashboardSnapshot, facade: ApplicationFacade) -> N
             action_map = {
                 "APPROVE_RECOMMENDATION": ApprovalStatus.APPROVED.value,
                 "MODIFY_AMOUNT_OR_ASSET": ApprovalStatus.MODIFIED.value,
-                "OVERRIDE_AND_CANCEL": ApprovalStatus.OVERRIDDEN.value,
+                "CANCEL_ACTION": ApprovalStatus.CANCELLED.value,
                 "REJECT_DECISION": ApprovalStatus.REJECTED.value,
             }
             mapped_action = action_map[decision_action]

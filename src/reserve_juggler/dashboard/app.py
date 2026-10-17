@@ -107,6 +107,37 @@ def main() -> None:
     # Fetch snapshot
     snapshot = facade.get_dashboard_snapshot()
 
+    # Data Source Banner
+    ds_mode = snapshot.data_source_mode
+    if ds_mode == "SYNTHETIC_DEMO":
+        st.markdown(
+            """
+            <div style='background: rgba(99, 102, 241, 0.15); border: 1px solid #6366F1; border-radius: 6px; padding: 6px 12px; margin-bottom: 12px; font-size: 0.8rem; color: #C7D2FE; display: flex; justify-content: space-between;'>
+                <span><b>Data Source:</b> SYNTHETIC_DEMO (Synthetic Demo Fixtures Active)</span>
+                <span>Team 1 & 2 Modules: UNINTEGRATED (Stand-alone Mode)</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif ds_mode == "LIVE":
+        st.markdown(
+            """
+            <div style='background: rgba(16, 185, 129, 0.15); border: 1px solid #10B981; border-radius: 6px; padding: 6px 12px; margin-bottom: 12px; font-size: 0.8rem; color: #A7F3D0;'>
+                <b>Data Source:</b> LIVE (Connected to Authoritative Production Services)
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div style='background: rgba(239, 68, 68, 0.15); border: 1px solid #EF4444; border-radius: 6px; padding: 6px 12px; margin-bottom: 12px; font-size: 0.8rem; color: #FECACA;'>
+                <b>Data Source:</b> {ds_mode} (Production Mode — Core Services Unintegrated)
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     # Route page rendering
     if "Overview" in chosen_page:
         render_overview(snapshot)

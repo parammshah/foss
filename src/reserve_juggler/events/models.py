@@ -34,6 +34,7 @@ class EventCluster:
     last_seen: str = ""
     reporting_count: int = 1
     reporting_acceleration: float = 0.0  # Events per hour acceleration
+    reporting_velocity_per_hour: float = 1.0
 
 
 @dataclass

@@ -21,7 +21,9 @@ def render_forecasts(snapshot: DashboardSnapshot) -> None:
 
     # Model Status and Quality Bar
     q_badge = "badge-ok" if bundle.quality_status == "HIGH" else "badge-high"
-    d_badge = "badge-critical" if perf.drift_detected else "badge-ok"
+    is_drift = perf.drift_analysis.drift_detected if perf.drift_analysis else False
+    d_badge = "badge-critical" if is_drift else "badge-ok"
+    mape_str = f"{perf.mape:.1f}%" if perf.mape is not None else "N/A"
     
     st.markdown(
         f"""
@@ -32,11 +34,11 @@ def render_forecasts(snapshot: DashboardSnapshot) -> None:
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
                 <div class='rj-metric-label'>System Drift Status</div>
-                <div style='margin-top: 6px;'><span class='{d_badge}'>{'DRIFT DETECTED' if perf.drift_detected else 'STABLE NO DRIFT'}</span></div>
+                <div style='margin-top: 6px;'><span class='{d_badge}'>{'DRIFT DETECTED' if is_drift else 'STABLE NO DRIFT'}</span></div>
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
-                <div class='rj-metric-label'>Mean Absolute % Error (MAPE)</div>
-                <div class='rj-metric-val' style='font-size: 1.3rem;'>{perf.mape:.1f}%</div>
+                <div class='rj-metric-label'>MAPE / WAPE</div>
+                <div class='rj-metric-val' style='font-size: 1.3rem;'>{mape_str} <span style='font-size: 0.8rem; color: #94A3B8;'>({perf.wape:.1f}% WAPE)</span></div>
             </div>
             <div class='rj-card' style='flex: 1; margin-bottom: 0;'>
                 <div class='rj-metric-label'>90% Interval Coverage</div>

@@ -107,15 +107,17 @@ class EventRiskInterpreter:
 
         # Staleness check
         try:
+            from reserve_juggler.events.sources import parse_rfc_or_iso_datetime
             now = datetime.now(timezone.utc)
-            pub_dt = datetime.fromisoformat(canonical.publication_time.replace("Z", "+00:00"))
+            pub_iso = parse_rfc_or_iso_datetime(canonical.publication_time)
+            pub_dt = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
             age_hours = (now - pub_dt).total_seconds() / 3600.0
             if age_hours > self.stale_hours_threshold:
                 # Decay confidence for stale reports
                 decay = math.exp(-0.05 * (age_hours - self.stale_hours_threshold))
                 base_confidence *= max(0.2, decay)
         except Exception:
-            pass  # Keep base confidence if timestamp unparseable
+            pass
 
         return round(min(1.0, max(0.05, base_confidence)), 3)
 

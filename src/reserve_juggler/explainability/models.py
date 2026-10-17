@@ -1,12 +1,17 @@
 """
 Data models for Decision Explanation and Human Oversight.
+Ensures zero fabricated fallbacks and accurate quantile terminology.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from reserve_juggler.integration.contracts import (
-    AlternativeAction, HardGateOutcome, UserRole, ApprovalStatus
+from reserve_juggler.contracts import (
+    AlternativeAction,
+    ApprovalStatus,
+    GateStatus,
+    HardGateOutcome,
+    UserRole,
 )
 
 
@@ -21,13 +26,18 @@ class CostBreakdown:
 
 @dataclass
 class ForecastContextSummary:
-    horizon_1h_flow: float
-    horizon_6h_flow: float
-    horizon_24h_flow: float
-    interval_p05: float
-    interval_p95: float
-    forecast_confidence: float
+    is_available: bool
+    horizon_1h_flow: Optional[float]
+    horizon_6h_flow: Optional[float]
+    horizon_24h_flow: Optional[float]
+    interval_p05: Optional[float]
+    interval_p95: Optional[float]
+    forecast_confidence: Optional[float]
     quality_status: str
+    quantile_description: str = (
+        "Quantiles represent cumulative cash flow distribution percentiles (P05 lower tail, P95 upper tail), "
+        "not bank survival probabilities."
+    )
 
 
 @dataclass
@@ -61,6 +71,7 @@ class DecisionExplanation:
     settlement_note: str
     hard_gates: List[HardGateOutcome]
     all_hard_gates_passed: bool
+    gate_evaluation_status: str  # "PASS", "FAIL", "NOT_EVALUATED"
     # Grounded Rationale
     primary_justification: str
     grounded_narrative: str
@@ -69,6 +80,9 @@ class DecisionExplanation:
     # Lineage
     model_versions: Dict[str, str]
     policy_reference: str
+    governance_notice: str = (
+        "Internal governance decision support. Does not constitute statutory regulatory certification."
+    )
 
 
 @dataclass
@@ -77,8 +91,10 @@ class HumanActionRecord:
     decision_id: str
     actor_name: str
     actor_role: str
-    action_type: str  # "APPROVED", "REJECTED", "MODIFIED", "OVERRIDDEN"
+    action_type: str  # "APPROVED", "REJECTED", "MODIFIED", "CANCELLED", "OVERRIDDEN"
     timestamp: str
     stated_reason: str
     modifications: Dict[str, Any] = field(default_factory=dict)
+    revalidation_passed: bool = True
+    revalidation_notes: List[str] = field(default_factory=list)
     simulated_execution_status: str = "SIMULATED_SUCCESS"

@@ -3,7 +3,7 @@ Macro-Panic Sentinel Service.
 External financial-event intelligence and real-time stress signal evaluation.
 
 Interface:
-    MacroPanicSentinel.evaluate(as_of_timestamp: str, treasury_state: Optional[TreasuryState]) -> SentinelEvaluationResult
+    MacroPanicSentinel.evaluate(as_of_timestamp, treasury_state) -> SentinelEvaluationResult
 Version: 1.0.0
 """
 
@@ -12,11 +12,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from reserve_juggler.contracts import RiskSeverity, RiskSignal, ServiceStatus, TreasuryState
 from reserve_juggler.events.deduplication import EventDeduplicator
 from reserve_juggler.events.interpreter import EventRiskInterpreter
 from reserve_juggler.events.models import RawEventRecord, SentinelEvaluationResult
-from reserve_juggler.events.sources import EventSource, EventSourceManager, SyntheticEventSource
-from reserve_juggler.integration.contracts import RiskSeverity, RiskSignal, TreasuryState
+from reserve_juggler.events.sources import EventSource, EventSourceManager, RSSFeedSource, SyntheticEventSource
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,8 @@ class MacroPanicSentinel:
     def __init__(
         self,
         use_synthetic_mode: bool = True,
-        similarity_threshold: float = 0.55,
-        critical_threshold: float = 0.85,
+        similarity_threshold: float = 0.50,
+        critical_threshold: float = 0.80,
     ):
         self.use_synthetic_mode = use_synthetic_mode
         self.source_manager = EventSourceManager(use_synthetic=use_synthetic_mode)
@@ -56,12 +56,15 @@ class MacroPanicSentinel:
         """Inject a custom synthetic event into the event stream."""
         self.source_manager.synthetic_source.inject_event(event)
 
-    def add_event_source(self, source: EventSource) -> None:
+    def add_event_source(self, source: RSSFeedSource) -> None:
         """Register an authorized external feed source (e.g. RSS/API)."""
         self.source_manager.add_live_source(source)
 
     def evaluate(
-        self, as_of_timestamp: Optional[str] = None, treasury_state: Optional[TreasuryState] = None
+        self,
+        as_of_timestamp: Optional[str] = None,
+        treasury_state: Optional[TreasuryState] = None,
+        since_iso: Optional[str] = None,
     ) -> SentinelEvaluationResult:
         """
         Evaluate external financial intelligence as of a given timestamp against treasury state.
@@ -69,6 +72,7 @@ class MacroPanicSentinel:
         Args:
             as_of_timestamp: ISO 8601 evaluation timestamp (defaults to UTC now).
             treasury_state: Current TreasuryState to compute exposure relevance.
+            since_iso: Optional lower timestamp bound for incremental event ingestion.
 
         Returns:
             SentinelEvaluationResult containing active signals, stress score, and recommended scenarios.
@@ -78,14 +82,16 @@ class MacroPanicSentinel:
 
         # 1. Ingest raw events
         try:
-            raw_events = self.source_manager.fetch_all_events()
+            raw_events = self.source_manager.fetch_all_events(since_iso=since_iso)
+            if self.source_manager.source_errors:
+                for src_name, err in self.source_manager.source_errors.items():
+                    warnings.append(f"Source '{src_name}' error: {err}")
         except Exception as e:
             logger.error("Event ingestion failed: %s. Using emergency fallback.", str(e))
             raw_events = []
-            warnings.append(f"Primary feed ingestion failed: {str(e)}")
+            warnings.append(f"Feed ingestion error: {str(e)}")
 
-        # 2. Deduplicate and cluster
-        self.deduplicator.reset()
+        # 2. Stateful Deduplicate and cluster (Does NOT reset between evaluations to track velocity)
         clusters = self.deduplicator.cluster_events(raw_events)
         total_duplicates = sum(len(c.duplicates) for c in clusters)
 
@@ -109,11 +115,10 @@ class MacroPanicSentinel:
         # 4. Aggregate Macro Stress Score (0 to 100)
         macro_stress_score = min(100.0, round(severity_points, 1))
 
-        # Default scenario recommendations if severe stress detected
         if macro_stress_score >= 60.0 and not recommended_scenarios:
             recommended_scenarios.add("COMBINED_LIQUIDITY_SQUEEZE")
 
-        mode_str = "SYNTHETIC_LAB" if self.use_synthetic_mode else "LIVE"
+        mode_str = self.source_manager.status.value
         status_str = "OK" if not warnings else "DEGRADED_OFFLINE"
 
         result = SentinelEvaluationResult(

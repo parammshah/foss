@@ -10,25 +10,28 @@ Version: 1.0.0
 
 from __future__ import annotations
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from reserve_juggler.events.models import SentinelEvaluationResult
-from reserve_juggler.events.sentinel import MacroPanicSentinel
-from reserve_juggler.explainability.models import DecisionExplanation
-from reserve_juggler.explainability.service import DecisionExplanationService
-from reserve_juggler.integration.adapters import Team1DataForecastAdapter, Team2DecisionRiskAdapter
-from reserve_juggler.integration.contracts import (
+from reserve_juggler.contracts import (
     ApprovalStatus,
     DecisionRecord,
     ExecutionOutcome,
     ForecastBundle,
     LearningEvent,
     RiskSignal,
+    ServiceStatus,
     TreasuryState,
     UserRole,
 )
+from reserve_juggler.events.models import SentinelEvaluationResult
+from reserve_juggler.events.sentinel import MacroPanicSentinel
+from reserve_juggler.explainability.models import DecisionExplanation
+from reserve_juggler.explainability.service import DecisionExplanationService
+from reserve_juggler.integration.adapters import Team1DataForecastAdapter, Team2DecisionRiskAdapter
+from reserve_juggler.integration.stress_engine import StressLabSimulationEngine
 from reserve_juggler.learning.models import CandidateUpdate, SystemPerformanceReport
 from reserve_juggler.learning.service import LearningService
 
@@ -50,6 +53,7 @@ class DashboardSnapshot:
     decision_explanation: DecisionExplanation
     system_performance: SystemPerformanceReport
     active_scenario: str
+    data_source_mode: str  # "SYNTHETIC_DEMO", "LIVE", "PARTIAL", "UNINTEGRATED"
     audit_log: List[Dict[str, Any]] = field(default_factory=list)
     incident_log: List[Dict[str, Any]] = field(default_factory=list)
     active_candidates: List[CandidateUpdate] = field(default_factory=list)
@@ -63,25 +67,28 @@ class ApplicationFacade:
     FACADE_VERSION = "1.0.0"
 
     def __init__(self, persistence_file: Optional[str] = None, use_synthetic: bool = True):
+        self.use_synthetic = use_synthetic
+        mode_str = "SYNTHETIC_DEMO" if use_synthetic else "PRODUCTION"
+
         self.sentinel = MacroPanicSentinel(use_synthetic_mode=use_synthetic)
         self.learning_service = LearningService(persistence_file=persistence_file)
         self.explanation_service = DecisionExplanationService()
-        self.team1_adapter = Team1DataForecastAdapter()
-        self.team2_adapter = Team2DecisionRiskAdapter()
+        self.team1_adapter = Team1DataForecastAdapter(mode=mode_str)
+        self.team2_adapter = Team2DecisionRiskAdapter(mode=mode_str)
+        self.stress_engine = StressLabSimulationEngine()
 
         self.current_scenario: str = "NORMAL"
         self._audit_trail: List[Dict[str, Any]] = []
         self._incident_log: List[Dict[str, Any]] = []
         self._latest_decision_record: Optional[DecisionRecord] = None
 
-        # Seed with initial simulated learning events to provide rich baseline telemetry
         self._bootstrap_demo_telemetry()
 
     def _bootstrap_demo_telemetry(self) -> None:
-        """Seeds demo history with realistic matched events and audit entries."""
+        """Seeds initial verified telemetry into SQLite event store."""
         now = datetime.now(timezone.utc).isoformat()
         
-        # Decision 1
+        # Historical Decision 1
         d1_id = "DEC-HIST-001"
         self.learning_service.record(
             LearningEvent(
@@ -96,6 +103,7 @@ class ApplicationFacade:
                     "target_asset": "REPO-30D-GCF",
                     "amount": 10_000_000.0,
                     "estimated_costs": {"total": 5_200.0},
+                    "gate_outcomes": [{"gate_name": "MandatoryReserveFloorGate", "status": "PASS"}],
                 },
                 associated_versions={"decision_engine": "v1.2.0"},
             )
@@ -126,7 +134,7 @@ class ApplicationFacade:
             )
         )
 
-        # Decision 2
+        # Historical Decision 2
         d2_id = "DEC-HIST-002"
         self.learning_service.record(
             LearningEvent(
@@ -141,6 +149,7 @@ class ApplicationFacade:
                     "target_asset": "SOV-UST-2Y",
                     "amount": 12_000_000.0,
                     "estimated_costs": {"total": 14_000.0},
+                    "gate_outcomes": [{"gate_name": "MandatoryReserveFloorGate", "status": "PASS"}],
                 },
                 associated_versions={"decision_engine": "v1.2.0"},
             )
@@ -184,16 +193,15 @@ class ApplicationFacade:
             stress_shortfall_count=0,
         )
 
-        # Initial audit log
         self._audit_trail.append({
             "timestamp": now,
             "action": "SYSTEM_INITIALIZED",
             "actor": "System Bootstrap",
-            "details": "Reserve Juggler Team 3 Services loaded in hackathon demonstration mode.",
+            "details": f"Reserve Juggler loaded in mode '{'SYNTHETIC_DEMO' if self.use_synthetic else 'PRODUCTION'}'.",
         })
 
     def switch_scenario(self, scenario_name: str) -> None:
-        """Switch active operational scenario (e.g. NORMAL, BANKING_STRESS, RATE_HIKE_SHOCK)."""
+        """Switch active operational scenario."""
         self.current_scenario = scenario_name
         self.sentinel.set_synthetic_scenario(scenario_name)
         self._audit_trail.append({
@@ -204,9 +212,7 @@ class ApplicationFacade:
         })
 
     def get_dashboard_snapshot(self, as_of_timestamp: Optional[str] = None) -> DashboardSnapshot:
-        """
-        Gathers real-time cross-team snapshot for the dashboard.
-        """
+        """Gathers real-time cross-team snapshot for the dashboard."""
         now_iso = as_of_timestamp or datetime.now(timezone.utc).isoformat()
 
         # 1. Team 1 State & Forecasts
@@ -219,7 +225,7 @@ class ApplicationFacade:
         for sig in sentinel_result.active_signals:
             self.learning_service.record(
                 LearningEvent(
-                    event_id=f"EV-SIG-{sig.signal_id}",
+                    event_id=f"EV-SIG-{sig.signal_id}-{uuid.uuid4().hex[:6]}",
                     versioned_event_type="MACRO_SIGNAL_GENERATED",
                     module="SENTINEL",
                     timestamp=now_iso,
@@ -234,7 +240,9 @@ class ApplicationFacade:
             )
 
         # 3. Team 2 Decision Generation
-        if self._latest_decision_record is None or self._latest_decision_record.approval_status != ApprovalStatus.PENDING.value:
+        if self._latest_decision_record is None or self._latest_decision_record.approval_status not in (
+            ApprovalStatus.PENDING_APPROVAL.value, "PENDING"
+        ):
             decision_record, dec_event = self.team2_adapter.compute_next_best_action(
                 treasury_state=treasury_state,
                 forecast_bundle=forecast_bundle,
@@ -257,6 +265,14 @@ class ApplicationFacade:
         # 5. System Learning Performance
         perf_report = self.learning_service.evaluate_system_performance()
 
+        # Overall data source mode
+        if self.use_synthetic:
+            ds_mode = "SYNTHETIC_DEMO"
+        elif self.team1_adapter.is_connected and self.team2_adapter.is_connected:
+            ds_mode = "LIVE"
+        else:
+            ds_mode = "UNINTEGRATED"
+
         return DashboardSnapshot(
             snapshot_version=self.FACADE_VERSION,
             as_of_timestamp=now_iso,
@@ -267,6 +283,7 @@ class ApplicationFacade:
             decision_explanation=explanation,
             system_performance=perf_report,
             active_scenario=self.current_scenario,
+            data_source_mode=ds_mode,
             audit_log=list(self._audit_trail),
             incident_log=list(self._incident_log),
             active_candidates=self.learning_service.get_all_candidates(),
@@ -281,9 +298,14 @@ class ApplicationFacade:
         modified_amount: Optional[float] = None,
         modified_action: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Processes human approval, modification, or rejection."""
+        """
+        Processes human approval, modification, or cancellation with live revalidation
+        against current TreasuryState.
+        """
         if not self._latest_decision_record:
             return (False, "No pending decision available to act upon.")
+
+        current_state = self.team1_adapter.get_treasury_state(scenario=self.current_scenario)
 
         success, msg, updated_dec, outcome, learning_ev = self.explanation_service.execute_human_workflow(
             decision_record=self._latest_decision_record,
@@ -293,31 +315,33 @@ class ApplicationFacade:
             stated_reason=stated_reason,
             modified_amount=modified_amount,
             modified_action=modified_action,
+            treasury_state=current_state,
         )
 
         if success:
             self._latest_decision_record = updated_dec
-            self.learning_service.record(learning_ev)
+            if learning_ev:
+                self.learning_service.record(learning_ev)
             
-            # Record simulated execution outcome in event store
-            self.learning_service.record(
-                LearningEvent(
-                    event_id=f"EV-OUT-{outcome.outcome_id}",
-                    versioned_event_type="OUTCOME_OBSERVED",
-                    module="EXECUTION",
-                    timestamp=outcome.execution_timestamp,
-                    correlation_id=outcome.correlation_id,
-                    payload={
-                        "realized_amount": outcome.realized_amount,
-                        "realized_costs": outcome.realized_costs,
-                        "liquidity_shortfall": outcome.liquidity_shortfall,
-                        "settlement_status": outcome.settlement_status,
-                    },
+            if outcome and outcome.settlement_status not in ("CANCELLED", "REJECTED"):
+                self.learning_service.record(
+                    LearningEvent(
+                        event_id=f"EV-OUT-{outcome.outcome_id}",
+                        versioned_event_type="OUTCOME_OBSERVED",
+                        module="EXECUTION",
+                        timestamp=outcome.execution_timestamp,
+                        correlation_id=outcome.correlation_id,
+                        payload={
+                            "realized_amount": outcome.realized_amount,
+                            "realized_costs": outcome.realized_costs,
+                            "liquidity_shortfall": outcome.liquidity_shortfall,
+                            "settlement_status": outcome.settlement_status,
+                        },
+                    )
                 )
-            )
 
             self._audit_trail.append({
-                "timestamp": outcome.execution_timestamp,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "action": f"DECISION_{action_type}",
                 "actor": f"{actor_name} ({actor_role})",
                 "details": f"Decision {updated_dec.decision_id}: {msg}. Reason: '{stated_reason}'",
@@ -331,39 +355,17 @@ class ApplicationFacade:
         rate_shock_bps: float = 0.0,
         repo_delay_days: int = 0,
         credit_unavailable: bool = False,
+        equity_drawdown_pct: float = 0.0,
     ) -> Dict[str, Any]:
         """
-        Runs on-demand stress lab simulation comparing strategies under combined shocks.
+        Runs on-demand stress lab simulation comparing 3 strategies under identical shocks.
         """
-        state = self.team1_adapter.get_treasury_state()
-        cash = state.available_cash
-        assets_value = sum(p.market_value for p in state.asset_positions)
-        reserve = state.protected_reserve_floor
-
-        # Apply deposit shock
-        simulated_outflow = 15_000_000.0 * (1.0 + deposit_shock_pct / 100.0)
-        
-        # Apply bond yield rate shock to sovereign bonds
-        bond_loss = 0.0
-        if rate_shock_bps > 0:
-            for p in state.asset_positions:
-                if p.asset_class == "SOVEREIGN_BONDS":
-                    # loss = value * duration * delta_y
-                    bond_loss += p.market_value * p.duration_years * (rate_shock_bps / 10000.0)
-
-        remaining_cash = cash - simulated_outflow
-        shortfall = max(0.0, reserve - remaining_cash)
-
-        return {
-            "deposit_shock_pct": deposit_shock_pct,
-            "rate_shock_bps": rate_shock_bps,
-            "repo_delay_days": repo_delay_days,
-            "credit_unavailable": credit_unavailable,
-            "simulated_outflow": round(simulated_outflow, 2),
-            "bond_mtm_loss": round(bond_loss, 2),
-            "post_shock_cash": round(remaining_cash, 2),
-            "reserve_floor": round(reserve, 2),
-            "is_shortfall": shortfall > 0,
-            "shortfall_amount": round(shortfall, 2),
-            "recommended_hedge": "DRAW_REPO_OVN" if not credit_unavailable else "LIQUIDATE_UST_2Y",
-        }
+        state = self.team1_adapter.get_treasury_state(scenario=self.current_scenario)
+        return self.stress_engine.run_simulation(
+            base_treasury_state=state,
+            deposit_shock_pct=deposit_shock_pct,
+            rate_shock_bps=rate_shock_bps,
+            repo_delay_days=repo_delay_days,
+            credit_unavailable=credit_unavailable,
+            equity_drawdown_pct=equity_drawdown_pct,
+        )
