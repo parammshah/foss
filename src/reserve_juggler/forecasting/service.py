@@ -91,12 +91,14 @@ class ForecastService:
 
         target_horizons = horizons or DEFAULT_HORIZONS
         n_total = len(df)
-        n_val = max(4, int(n_total * val_split_ratio))
-        if n_val >= n_total - 2:
-            n_val = max(2, n_total // 4)
+        max_h = max(target_horizons) if target_horizons else 72
+        # Ensure validation split contains enough rows to evaluate max horizon
+        min_val_needed = max_h + 24
+        n_val = max(min_val_needed, int(n_total * val_split_ratio))
+        if n_val >= n_total - 24:
+            n_val = max(4, n_total // 4)
         train_df = df.iloc[:-n_val].reset_index(drop=True)
         val_df = df.iloc[-n_val:].reset_index(drop=True)
-
 
         # Generate features with zero lookahead leakage
         featured_all = self.feature_engineer.create_features(df)
@@ -114,7 +116,6 @@ class ForecastService:
             suite.wid_seasonal.fit(train_df, WITHDRAWALS_COL)
 
             # Prepare ML targets shifted by horizon h
-            # At row t, target is value at t+h
             y_dep_train = train_df[DEPOSITS_COL].shift(-h).dropna()
             X_dep_train = featured_train.loc[y_dep_train.index, feature_cols]
             suite.dep_ml.fit(X_dep_train, y_dep_train)
@@ -134,34 +135,44 @@ class ForecastService:
             pred_dep_ml = suite.dep_ml.predict(X_val)
 
             Y_hat_dep = np.column_stack([pred_dep_recent, pred_dep_seasonal, pred_dep_ml])
-            suite.dep_or_ensemble.fit(
-                Y_hat=Y_hat_dep,
-                y_true=y_dep_val.values,
-                model_names=["recent_avg", "seasonal", "ridge_ml"],
-            )
+            if len(y_dep_val) >= 4:
+                suite.dep_or_ensemble.fit(
+                    Y_hat=Y_hat_dep,
+                    y_true=y_dep_val.values,
+                    model_names=["recent_avg", "seasonal", "ridge_ml"],
+                )
+                ens_pred_dep = suite.dep_or_ensemble.predict(Y_hat_dep)
+            else:
+                suite.dep_or_ensemble.weights = np.array([0.05, 0.70, 0.25])
+                suite.dep_or_ensemble.is_fitted = True
+                ens_pred_dep = Y_hat_dep @ suite.dep_or_ensemble.weights if len(Y_hat_dep) > 0 else np.array([])
 
             y_wid_val = val_df[WITHDRAWALS_COL].shift(-h).dropna()
             pred_wid_recent = val_df[WITHDRAWALS_COL].shift(1).rolling(24, min_periods=1).mean().bfill().loc[val_idx].values
             pred_wid_seasonal = suite.wid_seasonal.predict(pd.DatetimeIndex(target_ts_val))
-
             pred_wid_ml = suite.wid_ml.predict(X_val)
 
             Y_hat_wid = np.column_stack([pred_wid_recent, pred_wid_seasonal, pred_wid_ml])
-            suite.wid_or_ensemble.fit(
-                Y_hat=Y_hat_wid,
-                y_true=y_wid_val.values,
-                model_names=["recent_avg", "seasonal", "ridge_ml"],
-            )
+            if len(y_wid_val) >= 4:
+                suite.wid_or_ensemble.fit(
+                    Y_hat=Y_hat_wid,
+                    y_true=y_wid_val.values,
+                    model_names=["recent_avg", "seasonal", "ridge_ml"],
+                )
+                ens_pred_wid = suite.wid_or_ensemble.predict(Y_hat_wid)
+            else:
+                suite.wid_or_ensemble.weights = np.array([0.05, 0.70, 0.25])
+                suite.wid_or_ensemble.is_fitted = True
+                ens_pred_wid = Y_hat_wid @ suite.wid_or_ensemble.weights if len(Y_hat_wid) > 0 else np.array([])
 
             # Fit OR uncertainty quantiles on validation ensemble residuals
-            ens_pred_dep = suite.dep_or_ensemble.predict(Y_hat_dep)
-            ens_pred_wid = suite.wid_or_ensemble.predict(Y_hat_wid)
-            suite.reconciler.fit_residuals(
-                true_deposits=y_dep_val.values,
-                pred_deposits=ens_pred_dep,
-                true_withdrawals=y_wid_val.values,
-                pred_withdrawals=ens_pred_wid,
-            )
+            if len(y_dep_val) >= 4 and len(y_wid_val) >= 4:
+                suite.reconciler.fit_residuals(
+                    true_deposits=y_dep_val.values,
+                    pred_deposits=ens_pred_dep,
+                    true_withdrawals=y_wid_val.values,
+                    pred_withdrawals=ens_pred_wid,
+                )
 
             suite.is_fitted = True
             self.suites[h] = suite
@@ -329,6 +340,7 @@ class ForecastService:
         self,
         as_of_timestamp: datetime,
         horizons_hours: Optional[List[int]] = None,
+        horizons: Optional[List[int]] = None,
         reason: str = "Primary model inputs unavailable or stale; using conservative fallback policy.",
     ) -> ForecastBundle:
         """Generates an ultra-conservative fallback forecast bundle when primary feeds fail.
@@ -337,10 +349,10 @@ class ForecastService:
         - Deflates deposit forecasts by 25% (understates incoming liquidity).
         - Inflates withdrawal forecasts by 25% (overstates outgoing liability).
         - Expands P95/P99 net outflow buffers by 50%.
-        - Sets reliability_tier='UNCALIBRATED', is_fallback=True, and status=SUSPECT.
+        - Sets reliability_tier='UNCALIBRATED', is_fallback=True, and status=DEGRADED.
         """
         as_of_utc = ensure_utc(as_of_timestamp)
-        horizons = horizons_hours or DEFAULT_HORIZONS
+        horizons = horizons_hours or horizons or DEFAULT_HORIZONS
 
         # Base nominal values from historical average or safe bank defaults
         base_dep = 8_000_000.0  # Conservative estimate

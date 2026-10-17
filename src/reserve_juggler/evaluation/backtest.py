@@ -223,7 +223,7 @@ class RollingOriginBacktest:
                     pred_ml = float(ml_model.predict(origin_feat)[0])
 
                     # 4. OR Constrained Ensemble
-                    val_window = min(96, max(24, len(y_shifted) // 4))
+                    val_window = min(336, max(72, len(y_shifted) // 4))
                     val_idx = y_shifted.index[-val_window:]
 
                     val_y = y_shifted.loc[val_idx].values
@@ -244,16 +244,27 @@ class RollingOriginBacktest:
                     latest_weights = ensemble.get_weights_summary()
 
                     # 5. Chronological Multi-Level Uncertainty Calibration
+                    # Conformal finite-sample adjusted residual quantiles
                     val_ens_preds = ensemble.predict(Y_hat_val)
                     residuals = val_y - val_ens_preds
                     last_cal_size = len(residuals)
+                    sorted_res = np.sort(residuals)
 
-                    res_p025 = float(np.percentile(residuals, 2.5))
-                    res_p10 = float(np.percentile(residuals, 10.0))
-                    res_p25 = float(np.percentile(residuals, 25.0))
-                    res_p75 = float(np.percentile(residuals, 75.0))
-                    res_p90 = float(np.percentile(residuals, 90.0))
-                    res_p975 = float(np.percentile(residuals, 97.5))
+                    def get_conformal_quantile(q: float) -> float:
+                        if last_cal_size == 0:
+                            return 0.0
+                        if q >= 0.50:
+                            idx = min(last_cal_size - 1, max(0, int(np.ceil((last_cal_size + 1) * q)) - 1))
+                        else:
+                            idx = max(0, min(last_cal_size - 1, int(np.floor((last_cal_size + 1) * q))))
+                        return float(sorted_res[idx])
+
+                    res_p025 = get_conformal_quantile(0.025)
+                    res_p10 = get_conformal_quantile(0.10)
+                    res_p25 = get_conformal_quantile(0.25)
+                    res_p75 = get_conformal_quantile(0.75)
+                    res_p90 = get_conformal_quantile(0.90)
+                    res_p975 = get_conformal_quantile(0.975)
 
                     lb025 = max(0.0, pred_ens + res_p025)
                     lb10 = max(lb025, pred_ens + res_p10)
