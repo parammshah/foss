@@ -1,0 +1,6 @@
+# Team 2: Treasury Safety Score, Capital Firewall, Tax-Aware OR & Next Best Action Engine
+pydantic>=2.0.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+numpy>=1.24.0
+scipy>=1.10.0
