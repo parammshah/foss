@@ -1,0 +1,191 @@
+Loading and preprocessing dataset from: /Users/paramshah/Downloads/treasury_4tier_dataset.csv
+============================================================================================================
+HOLDOUT SPECIFICATION:
+  Total Dataset Observations : 8760 hours
+  Pre-Holdout History        : Rows 0 to 8039 (Start: 2026-01-01 00:00:00+00:00)
+  Holdout Window             : Rows 8040 to 8759 (720 hours)
+  Holdout Start Timestamp    : 2026-12-02 00:00:00+00:00
+  Holdout End Timestamp      : 2026-12-31 23:00:00+00:00
+============================================================================================================
+
+============================================================================================================
+CHRONOLOGICAL ROLLING-ORIGIN BACKTEST RESULTS (2026-12-02 00:00:00+00:00 -> 2026-12-31 00:00:00+00:00)
+Total Origins: 27 | Final Holdout Reserved: 0 Hours
+============================================================================================================
+Target         Horizon  Recent MAE     Seasonal MAE   ML MAE         OR Ensemble MAE  WAPE     PICP 80%   PICP 95%  
+-------------------------------------------------------------------------------------------------------------------
+deposits_usd   1        $4,523,426     $303,499       $411,988       $401,190         7.11%   100.0%     100.0%    
+deposits_usd   6        $2,462,438     $839,574       $902,223       $889,142         11.20%  74.1%      92.6%     
+deposits_usd   24       $3,997,629     $319,592       $706,219       $481,612         7.81%   85.2%      100.0%    
+deposits_usd   48       $3,999,823     $322,128       $626,052       $525,384         8.52%   88.9%      100.0%    
+deposits_usd   72       $3,983,343     $336,826       $565,513       $351,743         5.69%   92.6%      100.0%    
+withdrawals_usd 1        $4,575,019     $348,306       $482,637       $416,038         7.12%   100.0%     100.0%    
+withdrawals_usd 6        $3,837,784     $375,696       $584,289       $451,882         6.86%   100.0%     100.0%    
+withdrawals_usd 24       $3,938,448     $416,483       $574,848       $484,256         7.47%   96.3%      100.0%    
+withdrawals_usd 48       $3,957,020     $428,488       $590,155       $508,684         7.87%   96.3%      100.0%    
+withdrawals_usd 72       $3,944,530     $433,256       $901,002       $476,362         7.35%   100.0%     100.0%    
+===================================================================================================================
+
+===================================================================================================================
+DETAILED HOLDOUT RESULTS BY HORIZON & TARGET:
+===================================================================================================================
+
+Target: deposits_usd   | Horizon:  1 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$4,523,425.73 | WAPE=80.14%
+  Time-of-Week Seasonal   : MAE=$303,499.30   | WAPE=5.38%
+  Ridge ML Model          : MAE=$411,987.58   | WAPE=7.30%
+  OR Constrained Ensemble : MAE=$401,190.31   | WAPE=7.11%
+  OR Model Weights        : {'recent_avg': 0.01819606321072467, 'seasonal': 0.10807741790898766, 'ridge_ml': 0.8737265188802877}
+  50% Interval (Target 50%): PICP=70.4% | Width=$1,108,664
+  80% Interval (Target 80%): PICP=100.0% | Width=$2,314,877 | Winkler Score=$2,314,877
+  95% Interval (Target 95%): PICP=100.0% | Width=$3,933,947
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: deposits_usd   | Horizon:  6 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$2,462,438.07 | WAPE=31.02%
+  Time-of-Week Seasonal   : MAE=$839,573.96   | WAPE=10.58%
+  Ridge ML Model          : MAE=$902,223.05   | WAPE=11.37%
+  OR Constrained Ensemble : MAE=$889,141.90   | WAPE=11.20%
+  OR Model Weights        : {'recent_avg': 0.007534690750517681, 'seasonal': 0.5456194510508885, 'ridge_ml': 0.4468458581985938}
+  50% Interval (Target 50%): PICP=29.6% | Width=$1,098,444
+  80% Interval (Target 80%): PICP=74.1% | Width=$2,200,101 | Winkler Score=$3,910,238
+  95% Interval (Target 95%): PICP=92.6% | Width=$4,311,195
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: deposits_usd   | Horizon: 24 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,997,629.01 | WAPE=64.79%
+  Time-of-Week Seasonal   : MAE=$319,592.09   | WAPE=5.18%
+  Ridge ML Model          : MAE=$706,218.93   | WAPE=11.45%
+  OR Constrained Ensemble : MAE=$481,611.81   | WAPE=7.81%
+  OR Model Weights        : {'recent_avg': 8.606693795125183e-19, 'seasonal': 0.7852300575989315, 'ridge_ml': 0.2147699424010685}
+  50% Interval (Target 50%): PICP=48.1% | Width=$1,041,508
+  80% Interval (Target 80%): PICP=85.2% | Width=$2,113,450 | Winkler Score=$2,481,306
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,375,438
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: deposits_usd   | Horizon: 48 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,999,823.03 | WAPE=64.84%
+  Time-of-Week Seasonal   : MAE=$322,127.95   | WAPE=5.22%
+  Ridge ML Model          : MAE=$626,052.48   | WAPE=10.15%
+  OR Constrained Ensemble : MAE=$525,383.65   | WAPE=8.52%
+  OR Model Weights        : {'recent_avg': 1.4360141665524371e-18, 'seasonal': 0.966742614739084, 'ridge_ml': 0.03325738526091615}
+  50% Interval (Target 50%): PICP=55.6% | Width=$1,110,356
+  80% Interval (Target 80%): PICP=88.9% | Width=$2,241,210 | Winkler Score=$2,548,982
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,491,703
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: deposits_usd   | Horizon: 72 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,983,343.42 | WAPE=64.41%
+  Time-of-Week Seasonal   : MAE=$336,826.42   | WAPE=5.45%
+  Ridge ML Model          : MAE=$565,513.09   | WAPE=9.14%
+  OR Constrained Ensemble : MAE=$351,742.95   | WAPE=5.69%
+  OR Model Weights        : {'recent_avg': 0.006711063639872654, 'seasonal': 0.8817236077417225, 'ridge_ml': 0.1115653286184049}
+  50% Interval (Target 50%): PICP=66.7% | Width=$973,559
+  80% Interval (Target 80%): PICP=92.6% | Width=$2,070,852 | Winkler Score=$2,267,317
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,246,573
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: withdrawals_usd | Horizon:  1 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$4,575,019.14 | WAPE=78.24%
+  Time-of-Week Seasonal   : MAE=$348,305.73   | WAPE=5.96%
+  Ridge ML Model          : MAE=$482,637.41   | WAPE=8.25%
+  OR Constrained Ensemble : MAE=$416,038.24   | WAPE=7.12%
+  OR Model Weights        : {'recent_avg': 0.0, 'seasonal': 0.2785609682707235, 'ridge_ml': 0.7214390317292765}
+  50% Interval (Target 50%): PICP=63.0% | Width=$1,085,816
+  80% Interval (Target 80%): PICP=100.0% | Width=$2,338,606 | Winkler Score=$2,338,606
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,452,331
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: withdrawals_usd | Horizon:  6 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,837,784.16 | WAPE=58.29%
+  Time-of-Week Seasonal   : MAE=$375,696.09   | WAPE=5.71%
+  Ridge ML Model          : MAE=$584,288.62   | WAPE=8.87%
+  OR Constrained Ensemble : MAE=$451,881.81   | WAPE=6.86%
+  OR Model Weights        : {'recent_avg': 5.726490804578333e-18, 'seasonal': 0.3668577526394929, 'ridge_ml': 0.6331422473605071}
+  50% Interval (Target 50%): PICP=63.0% | Width=$1,065,527
+  80% Interval (Target 80%): PICP=100.0% | Width=$2,340,075 | Winkler Score=$2,340,075
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,865,595
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: withdrawals_usd | Horizon: 24 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,938,448.15 | WAPE=60.74%
+  Time-of-Week Seasonal   : MAE=$416,483.38   | WAPE=6.42%
+  Ridge ML Model          : MAE=$574,848.34   | WAPE=8.87%
+  OR Constrained Ensemble : MAE=$484,256.32   | WAPE=7.47%
+  OR Model Weights        : {'recent_avg': 4.937766488851818e-19, 'seasonal': 0.19025006813392492, 'ridge_ml': 0.809749931866075}
+  50% Interval (Target 50%): PICP=66.7% | Width=$1,051,725
+  80% Interval (Target 80%): PICP=96.3% | Width=$2,228,266 | Winkler Score=$2,405,097
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,372,453
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: withdrawals_usd | Horizon: 48 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,957,019.72 | WAPE=61.21%
+  Time-of-Week Seasonal   : MAE=$428,487.65   | WAPE=6.63%
+  Ridge ML Model          : MAE=$590,155.46   | WAPE=9.13%
+  OR Constrained Ensemble : MAE=$508,683.97   | WAPE=7.87%
+  OR Model Weights        : {'recent_avg': 0.0, 'seasonal': 0.36380878881841144, 'ridge_ml': 0.6361912111815886}
+  50% Interval (Target 50%): PICP=63.0% | Width=$1,061,774
+  80% Interval (Target 80%): PICP=96.3% | Width=$2,288,809 | Winkler Score=$2,495,833
+  95% Interval (Target 95%): PICP=100.0% | Width=$4,916,631
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)
+
+Target: withdrawals_usd | Horizon: 72 Hours | Holdout Origins: 27 | Unique Target Timestamps: 27
+  Recent Average Baseline : MAE=$3,944,529.66 | WAPE=60.90%
+  Time-of-Week Seasonal   : MAE=$433,256.46   | WAPE=6.69%
+  Ridge ML Model          : MAE=$901,001.86   | WAPE=13.91%
+  OR Constrained Ensemble : MAE=$476,362.04   | WAPE=7.35%
+  OR Model Weights        : {'recent_avg': 2.229138417575157e-18, 'seasonal': 0.7071091697929099, 'ridge_ml': 0.29289083020709006}
+  50% Interval (Target 50%): PICP=59.3% | Width=$1,070,649
+  80% Interval (Target 80%): PICP=100.0% | Width=$2,341,956 | Winkler Score=$2,341,956
+  95% Interval (Target 95%): PICP=100.0% | Width=$5,544,292
+  Calibration Residuals    : N=336
+  Holdout Regime Breakdown:
+    - high_withdrawal           : N= 0 | Insufficient evidence (N < 10)
+    - large_negative_net_flow   : N= 0 | Insufficient evidence (N < 10)
+    - repo_sweep_window         : N= 0 | Insufficient evidence (N < 10)
+    - repo_maturity_settlement  : N= 0 | Insufficient evidence (N < 10)

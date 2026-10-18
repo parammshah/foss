@@ -1,0 +1,57 @@
+# ==========================================
+# RESERVE JUGGLER — MASTER INTEGRATION GITIGNORE
+# ==========================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.python-version
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.hypothesis/
+
+# Persistence & Local State
+var/*.sqlite
+var/*.db
+*.sqlite
+*.db
+!var/.gitkeep
+
+# Operating system & IDEs
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

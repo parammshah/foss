@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>(reserve*juggler) — Autonomous Treasury Intelligence</title>
+  <meta name="description" content="Autonomous two-sided liquidity choreography, 15-hour overnight repo protection, and zero-penalty arbitrage." />
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- GSAP 3.12 Core -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+
+  <!-- Modular Design System -->
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/components.css?v=3" />
+  <link rel="stylesheet" href="css/landing.css" />
+</head>
+
+<body class="landing-page min-h-screen relative flex flex-col justify-between selection:bg-[#0088A3] selection:text-[#FFFFFF]">
+
+  <!-- ================= CONTINUOUS FLOWING 3D CURRENCY NOTES BACKGROUND ================= -->
+  <div class="currency-stream-container">
+    <canvas id="currencyCanvas"></canvas>
+  </div>
+
+  <!-- Matte Atmospheric Overlay (Clean, zero muddy gradients) -->
+  <div class="landing-ambient-overlay"></div>
+
+  <!-- ================= FOREGROUND EDITORIAL CONTENT ================= -->
+  <div class="landing-content flex-1 flex flex-col justify-between min-h-screen px-6 lg:px-16 py-6 max-w-[1720px] mx-auto w-full">
+
+    <!-- ================= EDITORIAL TOP NAVBAR ================= -->
+    <header class="flex items-center justify-between py-3 border-b editorial-nav" style="border-color: var(--border-color);">
+      <!-- Brand Logo -->
+      <a href="index.html" class="flex items-center gap-1.5 cursor-pointer select-none group text-decoration-none">
+        <span class="font-mono text-lg muted-text">(</span>
+        <span class="font-extrabold text-xl tracking-tight heading-text">reserve</span>
+        <span class="font-mono text-lg transition-transform duration-500 group-hover:rotate-180" style="color: var(--cyan-primary);">*</span>
+        <span class="font-extrabold text-xl tracking-tight heading-text">juggler</span>
+        <span class="font-mono text-lg muted-text">)</span>
+        <span class="ml-2 pill-badge font-bold pill-badge-cyan text-[10px]">
+          Core
+        </span>
+      </a>
+
+      <!-- Minimalist Navigation Links -->
+      <nav class="hidden md:flex items-center gap-8 text-xs font-mono secondary-text">
+        <a href="platform.html" class="hover:text-cyan-600 dark:hover:text-white transition-colors">The System</a>
+        <a href="platform.html" class="hover:text-cyan-600 dark:hover:text-white transition-colors">Overnight Repo</a>
+        <a href="platform.html" class="hover:text-cyan-600 dark:hover:text-white transition-colors">SVB Stress Lab</a>
+        <a href="platform.html" class="hover:text-cyan-600 dark:hover:text-white transition-colors">4-Tier Vaults</a>
+        <a href="platform.html" class="hover:text-cyan-600 dark:hover:text-white transition-colors">Auditable Ledger</a>
+      </nav>
+
+      <!-- Right Action & Theme Toggle -->
+      <div class="flex items-center gap-3 text-xs font-mono">
+        <div class="hidden sm:flex items-center gap-1.5 text-emerald-500 text-[11px] font-bold">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 pulse-dot"></span>
+          <span>L3 Desk Active</span>
+        </div>
+
+        <!-- Segmented Light/Dark Mode Toggle (Default: Light Active, Zero Emojis) -->
+        <div class="theme-toggle-segmented" role="radiogroup" aria-label="Theme Selection">
+          <button type="button" onclick="setAppTheme('light')" id="themeBtnLight" class="theme-seg-btn active" title="Light Mode">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" stroke-width="2"></circle><path stroke-linecap="round" stroke-width="2" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+            <span>Light</span>
+          </button>
+          <button type="button" onclick="setAppTheme('dark')" id="themeBtnDark" class="theme-seg-btn" title="Dark Mode">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+            <span>Dark</span>
+          </button>
+        </div>
+
+        <!-- Distinctive Recognizable Demo Flow Button (Electric Indigo Gradient) -->
+        <button onclick="openPsWalkthroughModal()" class="demo-flow-btn py-1.5 px-3.5 text-xs rounded-xl flex items-center gap-1.5 shadow-md" title="Interactive Problem Statement Treasury Lifecycle Walkthrough">
+          <span class="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
+          <span>Demo Flow</span>
+        </button>
+
+        <a href="platform.html" class="curved-btn py-1.5 px-4 text-xs font-bold heading-text hover:border-cyan-500">
+          Get me in &rarr;
+        </a>
+      </div>
+    </header>
+
+    <!-- ================= MAIN EDITORIAL HERO SPLIT ================= -->
+    <main class="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-12 items-center py-8 lg:py-14">
+
+      <!-- LEFT COLUMN: EDITORIAL STATEMENT (Clean, polished, institutional) -->
+      <div class="lg:col-span-6 space-y-6 text-left">
+
+        <div class="editorial-reveal space-y-2">
+          <h1 class="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-light tracking-tight heading-text leading-tight">
+            In case it wasn't clear,
+          </h1>
+          <div>
+            <span class="editorial-highlight">
+              autonomous treasury.
+            </span>
+          </div>
+        </div>
+
+        <p class="editorial-reveal text-sm sm:text-base md:text-lg secondary-text font-normal leading-relaxed max-w-xl">
+          When bank runs unfold in minutes, spreadsheets are obsolete.
+          <strong class="heading-text font-semibold">reserve*juggler</strong> continuously choreographs enterprise capital—locking <strong class="heading-text">5.30% overnight repo yield</strong> at 17:00 UTC and shielding operations with <strong class="heading-text">99.5% conformal certainty</strong>.
+        </p>
+
+        <!-- Clean KPI Metrics Bar (No heavy clunky boxes) -->
+        <div class="editorial-reveal flex items-center gap-6 sm:gap-8 pt-3 border-t text-xs font-mono" style="border-color: var(--border-color);">
+          <div>
+            <div class="text-[10px] muted-text uppercase tracking-wider">Overnight Arbitrage</div>
+            <div class="text-xl sm:text-2xl font-bold mt-0.5" style="color: var(--cyan-primary);">+$49,726 <span class="text-xs muted-text font-normal">/ day</span></div>
+          </div>
+          <div class="w-px h-9" style="background-color: var(--border-color);"></div>
+          <div>
+            <div class="text-[10px] muted-text uppercase tracking-wider">SVB Run Tolerance</div>
+            <div class="text-xl sm:text-2xl font-bold text-emerald-500 mt-0.5">72h+ Horizon</div>
+          </div>
+          <div class="w-px h-9" style="background-color: var(--border-color);"></div>
+          <div>
+            <div class="text-[10px] muted-text uppercase tracking-wider">Vault Reserves</div>
+            <div class="text-xl sm:text-2xl font-bold heading-text mt-0.5">$160.01M</div>
+          </div>
+        </div>
+
+
+      </div>
+
+      <!-- RIGHT COLUMN: PRECISION CIRCULAR LENS (From Reference Image, ZERO AI Crypto Glow) -->
+      <div class="lg:col-span-6 flex justify-center">
+
+        <div class="hero-circular-portal">
+
+          <!-- KINETIC TYPOGRAPHY INSIDE LENS (Crisp vector typography, NO blurry neon glow) -->
+          <div class="portal-kinetic-stream">
+            <div class="kinetic-line kinetic-slide-left">
+              <span>Save $49,726</span>
+              <span class="kinetic-solid">VaR 99.5%</span>
+              <span>Overnight Repo 5.30%</span>
+              <span>Zero Penalties</span>
+            </div>
+            <div class="kinetic-line kinetic-slide-right">
+              <span class="kinetic-solid">72h SVB Shield</span>
+              <span>Autonomous Sweep</span>
+              <span class="kinetic-solid">Intraday Bridge</span>
+              <span>Continuous Flow</span>
+            </div>
+            <div class="kinetic-line kinetic-slide-left">
+              <span>Two-Sided Forecast</span>
+              <span class="kinetic-solid">No Liquidations</span>
+              <span>17:00 Cutoff</span>
+              <span class="kinetic-solid">SEC 2a-7</span>
+            </div>
+            <div class="kinetic-line kinetic-slide-right">
+              <span class="kinetic-solid">Liquidity Orchestration</span>
+              <span>15h Night-Vision</span>
+              <span class="kinetic-solid">Defuse Bank Runs</span>
+            </div>
+          </div>
+
+          <!-- REAL-TIME LIVE SIMULATION GRAPH OVERLAY -->
+          <div class="portal-graph-container flex flex-col justify-between">
+            <div class="flex items-center justify-between text-xs font-mono">
+              <div class="flex items-center gap-2">
+                <span class="w-1.5 h-1.5 rounded-full pulse-dot" style="background-color: var(--cyan-primary);"></span>
+                <span class="primary-text font-bold">Live Liquidity Waveform</span>
+              </div>
+              <span id="portalStatusBadge" class="pill-badge pill-badge-cyan font-bold text-[10px]">
+                Conformal VaR 99.5%
+              </span>
+            </div>
+
+            <!-- Continuous 60 FPS Oscillating Canvas -->
+            <div class="w-full h-24 relative overflow-hidden my-1">
+              <canvas id="portalLiveGraphCanvas" class="w-full h-full block"></canvas>
+            </div>
+
+            <!-- Live Telemetry & Stepper Controls -->
+            <div class="pt-2 border-t flex items-center justify-between text-xs font-mono" style="border-color: var(--border-color);">
+              <div>
+                <span class="text-[10px] muted-text block leading-none">Available Checking</span>
+                <div id="portalCashDisplay" data-val="24810500" class="font-extrabold text-base heading-text mt-0.5">$24,810,500</div>
+              </div>
+
+              <!-- Interactive Controls -->
+              <div class="flex items-center gap-1.5">
+                <button onclick="stepLandingSim(1)" class="curved-btn py-1 px-2.5 text-[11px] font-bold" title="Step simulation forward 1 hour">
+                  +1h Step
+                </button>
+                <button onclick="toggleLandingAutoStream()" id="landingAutoBtn" class="curved-btn py-1 px-2.5 text-[11px] font-bold">
+                  <span class="w-2 h-2 rounded-full bg-slate-400"></span>
+                  <span>Auto-Stream</span>
+                </button>
+                <button onclick="triggerLandingShock()" id="landingShockBtn" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-rose-500 border-rose-500/40" title="Simulate 3.2x Bank Run Surge">
+                  <span class="w-1.5 h-1.5 rounded-full bg-rose-500 pulse-dot mr-1"></span>
+                  <span>SVB Shock (3.2x)</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+    </main>
+
+    <!-- ================= SINGLE CLEAN LAUNCH BUTTON ================= -->
+    <div class="floating-bottom-dock">
+      <a href="platform.html" class="dock-action-btn px-9 py-3 text-sm font-bold tracking-tight shadow-xl flex items-center gap-2">
+        <span>Launch</span>
+        <span class="font-mono text-base">&rarr;</span>
+      </a>
+    </div>
+
+  </div>
+
+  <!-- ================= HIGH-FIDELITY SIMULATION THEATRE COCKPIT ================= -->
+  <div id="simTheatreOverlay" class="fixed inset-0 z-50 hidden items-center justify-center p-3 sm:p-6 modal-overlay">
+    <div class="curved-card p-5 sm:p-7 max-w-5xl w-full max-h-[94vh] flex flex-col space-y-4 overflow-y-auto">
+      
+      <!-- Top Bar -->
+      <div class="flex items-start justify-between border-b pb-3" style="border-color: var(--border-color);">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="pill-badge pill-badge-cyan font-bold text-[10px]">Real-Time Sim Theatre</span>
+            <span class="text-xs font-mono text-emerald-500 font-bold flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              60 FPS Physics Active
+            </span>
+          </div>
+          <h3 class="text-lg sm:text-xl font-bold heading-text mt-0.5">Multi-Tier Autonomous Liquidity Simulation Cockpit</h3>
+          <p class="text-xs secondary-text">Conformal VaR 99.5% &bull; Dynamic Particle Flow &bull; Real-time Fluid Dynamics</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="closeSimulationModal()" class="curved-btn py-1 px-3 text-xs font-bold" title="Exit [ESC]">&times; Exit [ESC]</button>
+        </div>
+      </div>
+
+      <!-- Top Telemetry Strip -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 p-3 rounded-xl border text-xs font-mono" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Simulated Time</span>
+          <span id="simClockHud" class="font-bold text-sm heading-text">17:00 UTC</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Active Scenario</span>
+          <span id="simScenarioName" class="font-bold text-xs" style="color: var(--cyan-primary);">17:00 Repo Sweep</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Overnight Yield Captured</span>
+          <span id="simHudYield" class="font-bold text-sm text-emerald-500">+$0</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Penalties Dodged</span>
+          <span id="simHudPenalties" class="font-bold text-sm text-amber-500">+$0</span>
+        </div>
+      </div>
+
+      <!-- Interactive Multi-Tier Canvas Fluid Simulation -->
+      <div class="w-full h-72 rounded-xl border relative overflow-hidden" style="border-color: var(--border-color); background-color: var(--bg-card);">
+        <canvas id="simTheatreCanvas" class="w-full h-full block"></canvas>
+      </div>
+
+      <!-- Scenario Injector & Simulation Controls Bar -->
+      <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-3 rounded-xl border" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div class="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+          <span class="text-[10px] uppercase font-bold muted-text mr-1">Inject Scenario:</span>
+          <button onclick="window.simTheatreInstance.triggerScenario('repo_sweep')" class="curved-btn py-1 px-2.5 text-[11px] font-bold hover:border-cyan-500" title="17:00 UTC Central Bank Sweep">
+            17:00 Sweep
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('midnight_shock')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-rose-500 border-rose-500/40 hover:border-rose-500" title="02:00 UTC Midnight Withdrawal Spike">
+            Midnight Shock
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('repo_settle')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-emerald-500 border-emerald-500/40 hover:border-emerald-500" title="08:00 UTC Repo Release">
+            08:00 Settle
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('rate_shock')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-amber-500 border-amber-500/40 hover:border-amber-500" title="Sovereign Bond Yield Shock (+45 bps)">
+            Rate Shock
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('svb_run')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-rose-600 border-rose-600/40 hover:border-rose-600" title="3.2x SVB Run & Waterfall Liquidation">
+            SVB Run 3.2x
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2 self-end sm:self-auto text-xs font-mono">
+          <span class="text-[10px] uppercase font-bold muted-text">Speed:</span>
+          <button onclick="window.simTheatreInstance.setSpeed(1)" id="simSpeed1" class="curved-btn py-0.5 px-2 text-[11px] font-bold bg-cyan-500/20 text-cyan-400">1x</button>
+          <button onclick="window.simTheatreInstance.setSpeed(5)" id="simSpeed5" class="curved-btn py-0.5 px-2 text-[11px]">5x</button>
+          <button onclick="window.simTheatreInstance.setSpeed(20)" id="simSpeed20" class="curved-btn py-0.5 px-2 text-[11px]">20x</button>
+        </div>
+      </div>
+
+      <!-- Real-Time Decision Execution Stream -->
+      <div class="space-y-1.5 p-3 rounded-xl border" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div class="flex items-center justify-between text-[10px] font-mono uppercase tracking-wider muted-text">
+          <span>Autonomous Engine Decision Stream &bull; Live Telemetry Feed:</span>
+          <span class="text-emerald-500 font-bold">14ms Execution SLA Active</span>
+        </div>
+        <div id="simDecisionList" class="space-y-1 max-h-24 overflow-y-auto pr-1">
+          <div class="flex items-start gap-2 py-1 text-[11px] font-mono">
+            <span class="font-bold text-cyan-500">[17:00:00]</span>
+            <span class="secondary-text">Ready for simulation. Select a scenario above to test autonomous decisions.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer Action Links -->
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2 border-t" style="border-color: var(--border-color);">
+        <button onclick="closeSimulationModal(); openPsWalkthroughModal();" class="curved-btn py-2 px-3 text-xs font-mono font-bold flex items-center gap-1.5" style="color: var(--cyan-primary);">
+          <span>&larr; Open Problem Statement Treasury Walkthrough</span>
+        </button>
+        <a href="platform.html" class="curved-btn-primary py-2 px-5 text-xs font-mono font-bold uppercase text-decoration-none text-center">
+          Launch Full Command Desk &rarr;
+        </a>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Modular Scripts -->
+  <script src="js/currency-stream.js"></script>
+  <script src="js/sim-theatre.js"></script>
+  <script src="js/ps-walkthrough.js?v=4"></script>
+  <script src="js/landing.js"></script>
+</body>
+</html>

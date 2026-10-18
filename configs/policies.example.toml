@@ -1,0 +1,22 @@
+# Reserve Juggler — Statutory Governance & Safety Policies Template
+# These safety constraints are non-negotiable and cannot be lowered by autonomous ML.
+
+[statutory_reserve_policy]
+mandatory_reserve_floor_pct = 0.20 # 20% minimum reserve floor
+core_capital_pct = 0.70            # 70% core capital requirement
+hot_capital_pct = 0.30             # 30% hot liquidity buffer
+
+[firewall_hard_gates]
+enforce_future_protected_firewall = true
+require_authoritative_state = true
+allow_unknown_reserve_floor_investment = false
+
+[role_permissions]
+# Permitted roles for candidate promotion
+promotion_authorizers = ["HEAD_OF_TREASURY", "RISK_OFFICER"]
+
+# Permitted roles for emergency rollback
+rollback_authorizers = ["HEAD_OF_TREASURY", "RISK_OFFICER", "AUDITOR"]
+
+# Permitted roles for financial overrides
+override_authorizers = ["HEAD_OF_TREASURY"]

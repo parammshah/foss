@@ -1,0 +1,67 @@
+# Reserve Juggler — Treasury Configuration File
+# Canonical configuration for Team 1 (Data, Ledger, Simulation, Forecasting)
+
+general:
+  operating_timezone: "UTC"
+  source_timezone: "UTC"
+  currency: "USD"
+
+initial_treasury_state:
+  opening_cash_usd: 25000000.0  # $25 Million opening cash buffer
+  transaction_cost_rate: 0.0005  # 5 bps standard brokerage commission
+
+credit_facility:
+  facility_id: "EMERGENCY_REVOLVER_A"
+  is_available: true
+  committed_limit_usd: 20000000.0  # $20 Million committed facility
+  utilized_amount_usd: 0.0
+  apr: 0.0750  # 7.50% APR normalized decimal
+  fee_rate: 0.0025  # 25 bps undrawn commitment fee
+  min_draw_usd: 500000.0
+  max_draw_usd: 20000000.0
+
+asset_tiers:
+  tier_0:
+    name: "Operational Cash"
+    tier: 0
+    annual_rate: 0.000  # 0.0% APY
+    settlement_delay_hours: 0
+    liquidation_haircut_rate: 0.000
+
+  tier_1:
+    name: "Overnight Repo"
+    tier: 1
+    annual_rate: 0.0430  # ~4.3% APY
+    sweep_window_open_hour: 17  # 17:00 local
+    maturity_hour: 8            # 08:00 next morning
+    early_exit_fee_rate: 0.005  # 0.5% early break penalty
+    settlement_delay_hours: 0
+
+  tier_2:
+    name: "Two-Year Sovereign Bonds"
+    tier: 2
+    annual_rate: 0.0480  # ~4.8% yield
+    duration_years: 1.90
+    liquidation_haircut_rate: 0.020  # 2.0% emergency liquidation haircut
+    settlement_delay_hours: 0
+
+  tier_3:
+    name: "Equity Index"
+    tier: 3
+    annual_rate: 0.1000  # ~10.0% expected annual return
+    annualized_volatility: 0.1800  # 18.0% annualized volatility
+    liquidation_haircut_rate: 0.150  # 15.0% emergency slippage
+    settlement_delay_hours: 0
+
+forecasting:
+  horizons_hours: [1, 6, 24, 48, 72]
+  lags: [1, 2, 3, 6, 12, 24, 48, 72, 168]
+  rolling_windows: [6, 24, 72, 168]
+  ml_model:
+    type: "Ridge"
+    alpha: 10.0
+  or_ensemble:
+    regularization: 0.0001
+  uncertainty:
+    quantiles: [0.10, 0.50, 0.90]
+    tail_shocks: [0.95, 0.99]
