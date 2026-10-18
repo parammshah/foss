@@ -118,11 +118,21 @@ def assess_liquidity_reserve(
             # Conservative marginal proxy heuristic bound: max(0, W_P90 - D_P10)
             pt_deficit = max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10)) * effective_stress
 
-        if forecast_is_cumulative:
+        is_cum = forecast_is_cumulative or getattr(forecast_bundle, "is_cumulative", False) or getattr(fp, "is_cumulative", False)
+        has_calibrated_cum = (
+            use_calibrated_net_quantile
+            and getattr(fp, "cumulative_net_outflow_p95", None) is not None
+            and float(getattr(fp, "cumulative_net_outflow_p95", 0.0) or 0.0) > 0.0
+        )
+
+        if is_cum:
             # Point value already represents cumulative total through this horizon
             cum_outflow_at_h = pt_deficit
+        elif has_calibrated_cum:
+            # Calibrated multi-hour cumulative quantile from uncertainty engine
+            cum_outflow_at_h = max(0.0, float(fp.cumulative_net_outflow_p95)) * effective_stress
         else:
-            # Interval accumulation
+            # Interval accumulation for discrete hourly flows
             running_cumulative_outflow += pt_deficit
             cum_outflow_at_h = running_cumulative_outflow
 
@@ -139,8 +149,8 @@ def assess_liquidity_reserve(
         total_demand_at_h = cum_outflow_at_h + cum_obligations_at_h
 
         if horizon <= payout_window_hours:
-            if forecast_is_cumulative:
-                immediate_forecast_deficit = max(immediate_forecast_deficit, pt_deficit)
+            if is_cum or has_calibrated_cum:
+                immediate_forecast_deficit = max(immediate_forecast_deficit, cum_outflow_at_h)
             else:
                 immediate_forecast_deficit = cum_outflow_at_h
         else:
@@ -149,8 +159,10 @@ def assess_liquidity_reserve(
             if net_gap > max_future_net_gap:
                 max_future_net_gap = net_gap
 
-    # Also check scheduled obligations at 24-72h even if point forecasts are sparse
-    for horizon in [30.0, 48.0, 72.0]:
+    # Also check scheduled obligations at every material payment deadline and standard horizons (24-72h)
+    obligation_deadlines = [h_due for h_due, _ in obligations_by_hour if h_due > payout_window_hours]
+    future_check_horizons = sorted(set([30.0, 48.0, 72.0] + obligation_deadlines))
+    for horizon in future_check_horizons:
         cum_obligations_at_h = sum(
             amt for h_due, amt in obligations_by_hour if h_due <= horizon
         )

@@ -513,13 +513,22 @@ class TreasuryState(CanonicalBaseModel):
             data["available_cash"] = float(cash)
 
             # Credit
-            cred = data.get("emergency_credit_available_usd")
-            if cred is None:
-                cred = data.get("authorized_credit_availability")
-            if cred is None:
-                cred = data.get("available_credit_usd", 50_000_000.0)
-            data["emergency_credit_available_usd"] = float(cred)
-            data["authorized_credit_availability"] = float(cred)
+            fac = data.get("credit_facility")
+            if fac is not None:
+                if isinstance(fac, dict):
+                    fac = CreditFacility(**fac)
+                data["credit_facility"] = fac
+                avail_cred = fac.available_credit_usd
+                data["emergency_credit_available_usd"] = float(avail_cred)
+                data["authorized_credit_availability"] = float(avail_cred)
+            else:
+                cred = data.get("emergency_credit_available_usd")
+                if cred is None:
+                    cred = data.get("authorized_credit_availability")
+                if cred is None:
+                    cred = data.get("available_credit_usd", 50_000_000.0)
+                data["emergency_credit_available_usd"] = float(cred)
+                data["authorized_credit_availability"] = float(cred)
 
             # Obligations
             obls = data.get("obligations") or data.get("future_obligations") or []
@@ -551,6 +560,8 @@ class TreasuryState(CanonicalBaseModel):
 
     @property
     def credit_availability(self) -> float:
+        if self.credit_facility is not None:
+            return self.credit_facility.available_credit_usd
         return self.emergency_credit_available_usd
 
     @property

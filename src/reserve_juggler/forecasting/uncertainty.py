@@ -176,9 +176,12 @@ class ORScenarioReconciler:
         z95 = 1.645
         z99 = 2.326
 
-        cum_net_95 = (net_50 * horizon_hours) + (z95 * self.net_std * h_factor)
-        cum_net_99 = (net_50 * horizon_hours) + (z99 * self.net_std * h_factor)
-        cum_net_99 = max(cum_net_99, cum_net_95)
+        # Conservative cumulative net outflow: deposit surplus (negative net_50) cannot be used
+        # to cancel out customer withdrawal shocks over multi-hour intervals (max(0.0, net_50))
+        cum_net_base = max(0.0, net_50) * horizon_hours
+        cum_net_95 = cum_net_base + (z95 * self.net_std * h_factor)
+        cum_net_95 = max(cum_net_95, net_95 * np.sqrt(float(horizon_hours)), net_95)
+        cum_net_99 = max(cum_net_base + (z99 * self.net_std * h_factor), cum_net_95 * 1.15)
 
         # Standardized reliability classification label:
         if not self.calibration_is_reliable or self.calibration_sample_size < 150:
