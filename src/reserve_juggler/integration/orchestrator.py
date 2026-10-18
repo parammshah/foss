@@ -584,3 +584,27 @@ class DecisionOrchestrator:
                 "decision_policy": getattr(self.decision_service, "policy_version", "2.0.0"),
             },
         )
+
+    def dispatch_live_execution(
+        self,
+        decision_record: DecisionRecord,
+        treasury_state: TreasuryState,
+        actor_name: str,
+        actor_role: str,
+        stated_reason: str = "Authorized live dispatch",
+    ) -> Tuple[bool, str, Optional[ExecutionOutcome]]:
+        """
+        Dispatches a human-approved decision to live production financial infrastructure.
+        Fails closed if live execution is attempted with provisional/synthetic tax profiles,
+        unauthorized actor roles, or unconfigured banking gateways.
+        """
+        success, msg, _, outcome, _ = self.explanation_service.execute_human_workflow(
+            decision_record=decision_record,
+            action_type="APPROVED",
+            actor_name=actor_name,
+            actor_role=actor_role,
+            stated_reason=stated_reason,
+            treasury_state=treasury_state,
+            is_live_execution=True,
+        )
+        return (success, msg, outcome)

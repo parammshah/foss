@@ -40,9 +40,13 @@ class ORScenarioReconciler:
         horizon_hours: Optional[int] = None,
     ) -> ORScenarioReconciler:
         """Fit empirical residual distributions on validation window using split-conformal calibration."""
-        res_dep = true_deposits - pred_deposits
-        res_wid = true_withdrawals - pred_withdrawals
-        res_net = (true_withdrawals - true_deposits) - (pred_withdrawals - pred_deposits)
+        td = np.asarray(true_deposits, dtype=float)
+        pd_arr = np.asarray(pred_deposits, dtype=float)
+        tw = np.asarray(true_withdrawals, dtype=float)
+        pw = np.asarray(pred_withdrawals, dtype=float)
+        res_dep = td - pd_arr
+        res_wid = tw - pw
+        res_net = (tw - td) - (pw - pd_arr)
         self.calibration_sample_size = len(res_dep)
 
         def _conformal_quantile(residuals: np.ndarray, q: float) -> float:
@@ -65,10 +69,10 @@ class ORScenarioReconciler:
             self.withdrawal_residual_quantiles[q] = _conformal_quantile(res_wid, q / 100.0)
 
         # Net outflow residual relative to median net prediction:
-        val_w50 = pred_withdrawals + self.withdrawal_residual_quantiles[50.0]
-        val_d50 = pred_deposits + self.deposit_residual_quantiles[50.0]
+        val_w50 = pw + self.withdrawal_residual_quantiles[50.0]
+        val_d50 = pd_arr + self.deposit_residual_quantiles[50.0]
         val_net_50 = val_w50 - val_d50
-        res_net = (true_withdrawals - true_deposits) - val_net_50
+        res_net = (tw - td) - val_net_50
 
         # Net outflow conformal quantiles (direct unbuffered residuals)
         raw_net_50 = _conformal_quantile(res_net, 0.50)
@@ -101,7 +105,7 @@ class ORScenarioReconciler:
         self.net_std = float(np.std(res_net))
 
         # Estimate lag-1 autocorrelation for cumulative horizon scaling
-        if len(res_net) > 2:
+        if len(res_net) > 2 and self.net_std > 1e-12:
             c1 = np.corrcoef(res_net[:-1], res_net[1:])[0, 1]
             rho1 = max(0.0, float(c1)) if not np.isnan(c1) else 0.0
             self.net_autocorr_factor = float(np.sqrt(1.0 + 2.0 * rho1))
@@ -176,6 +180,14 @@ class ORScenarioReconciler:
         cum_net_99 = (net_50 * horizon_hours) + (z99 * self.net_std * h_factor)
         cum_net_99 = max(cum_net_99, cum_net_95)
 
+        # Standardized reliability classification label:
+        if not self.calibration_is_reliable or self.calibration_sample_size < 150:
+            cal_rel_status = "DEGRADED"
+        elif horizon_hours == 6:
+            cal_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+        else:
+            cal_rel_status = "EMPIRICALLY_VALIDATED"
+
         return {
             "deposit_p025": float(d025),
             "deposit_p10": float(d10),
@@ -200,5 +212,6 @@ class ORScenarioReconciler:
             "cumulative_net_outflow_p99": float(cum_net_99),
             "calibration_sample_size": self.calibration_sample_size,
             "calibration_is_reliable": self.calibration_is_reliable,
+            "calibration_reliability_status": cal_rel_status,
             "calibration_warning": self.calibration_warning,
         }

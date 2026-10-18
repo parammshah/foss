@@ -344,13 +344,29 @@ class DecisionExplanationService:
             or tax_status in ("UNCONFIGURED_GROSS_ONLY", "SYNTHETIC_DEMO", "INVALID")
         )
 
-        if is_live_execution and is_prov_tax and action_type in ("APPROVED", "MODIFIED", "OVERRIDDEN"):
-            blocked_msg = (
-                f"Live execution BLOCKED: Decision {decision_record.decision_id} uses provisional/synthetic "
-                f"tax profile ('{tax_status}'). Live execution strictly requires an approved statutory corporate TaxProfile."
-            )
-            logger.warning(blocked_msg)
-            return (False, blocked_msg, decision_record, None, None)  # type: ignore
+        if is_live_execution and action_type in ("APPROVED", "MODIFIED", "OVERRIDDEN"):
+            # Dimension 1: Statutory Tax Profile Verification
+            if is_prov_tax:
+                blocked_msg = (
+                    f"Live execution BLOCKED: Decision {decision_record.decision_id} uses provisional/synthetic "
+                    f"tax profile ('{tax_status}'). Live execution strictly requires an approved statutory corporate TaxProfile."
+                )
+                logger.warning(blocked_msg)
+                return (False, blocked_msg, decision_record, None, None)  # type: ignore
+
+            # Dimension 4: Production Gateway Availability & Health
+            # Live execution cannot bypass unconfigured or unhealthy banking infrastructure
+            gateway_status = getattr(treasury_state, "production_gateway_status", "UNCONFIGURED") if treasury_state else "UNCONFIGURED"
+            is_gateway_healthy = getattr(treasury_state, "is_production_gateway_healthy", False) if treasury_state else False
+            if gateway_status != "CONNECTED" or not is_gateway_healthy:
+                blocked_msg = (
+                    f"Live execution BLOCKED: Production banking and broker execution gateways are not configured or healthy "
+                    f"(gateway_status='{gateway_status}', healthy={is_gateway_healthy}). "
+                    f"Decision {decision_record.decision_id} cannot be executed against real financial infrastructure. "
+                    "System fails closed to prevent unverified transaction claims."
+                )
+                logger.warning(blocked_msg)
+                return (False, blocked_msg, decision_record, None, None)  # type: ignore
 
         # Check A: Idempotence & Duplicate Execution Protection
         if (

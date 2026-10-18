@@ -600,3 +600,139 @@ def test_statutory_profile_entity_and_jurisdiction_matching():
     is_app_bad_jur, err_jur = valid_profile.is_applicable_to(entity_id="US_CORP_01", jurisdiction="UK_HMRC")
     assert is_app_bad_jur is False
     assert "Jurisdiction mismatch" in str(err_jur)
+
+
+def test_live_execution_fails_closed_when_production_gateway_unconfigured_even_with_statutory_tax():
+    """Verify that even with an approved statutory tax profile, live execution fails closed when gateways are unconfigured."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    # Ensure default unconfigured gateway state
+    assert state.production_gateway_status == "UNCONFIGURED"
+    assert state.is_production_gateway_healthy is False
+
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+    assert dec.metadata.get("tax_profile_status") == "STATUTORY_APPROVED"
+
+    expl_service = DecisionExplanationService()
+    live_ok, live_msg, _, live_out, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Attempting live production dispatch",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+        is_live_execution=True,
+    )
+
+    # Must FAIL CLOSED: cannot execute live transactions without configured gateway
+    assert live_ok is False
+    assert live_out is None
+    assert "Live execution BLOCKED" in live_msg
+    assert "gateways are not configured or healthy" in live_msg
+    assert "gateway_status='UNCONFIGURED'" in live_msg
+
+
+def test_facade_and_orchestrator_live_execution_fail_closed():
+    """Verify that ApplicationFacade and DecisionOrchestrator live execution entry points fail closed."""
+    from reserve_juggler.integration.facade import ApplicationFacade
+
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    # 1. Orchestrator dispatch_live_execution
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    orch_ok, orch_msg, orch_out = orch.dispatch_live_execution(
+        decision_record=dec,
+        treasury_state=state,
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Live production dispatch attempt",
+    )
+    assert orch_ok is False
+    assert orch_out is None
+    assert "Live execution BLOCKED" in orch_msg
+    assert "gateway_status='UNCONFIGURED'" in orch_msg
+
+    # 2. ApplicationFacade submit_human_action with is_live_execution=True
+    facade = ApplicationFacade(use_synthetic=True)
+    facade.current_scenario = "NORMAL"
+    # Seed a decision
+    facade._latest_decision_record = dec
+    fac_ok, fac_msg = facade.submit_human_action(
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Live production dispatch via facade",
+        is_live_execution=True,
+    )
+    assert fac_ok is False
+    assert "Live execution BLOCKED" in fac_msg
+
+
+def test_standardized_calibration_reliability_labels_and_conservative_policy():
+    """Verify standardization of EMPIRICALLY_VALIDATED, CONDITIONALLY_CALIBRATED_FALLBACK, and DEGRADED."""
+    from reserve_juggler.forecasting.uncertainty import ORScenarioReconciler
+    from reserve_juggler.forecasting.service import ForecastService
+    from reserve_juggler.risk.liquidity_shield import assess_liquidity_reserve
+
+    reconciler = ORScenarioReconciler()
+    d_true = [15_000_000.0] * 200
+    d_pred = [15_000_000.0] * 200
+    w_true = [16_000_000.0] * 200
+    w_pred = [16_000_000.0] * 200
+
+    # Horizon 1h with N=200 -> EMPIRICALLY_VALIDATED
+    reconciler.fit_residuals(d_true, d_pred, w_true, w_pred, horizon_hours=1)
+    pt1 = reconciler.reconcile_point(15_000_000.0, 16_000_000.0, horizon_hours=1)
+    assert pt1["calibration_reliability_status"] == "EMPIRICALLY_VALIDATED"
+
+    # Horizon 6h with N=200 -> CONDITIONALLY_CALIBRATED_FALLBACK (raw undercoverage requires 1.55x buffer)
+    reconciler.fit_residuals(d_true, d_pred, w_true, w_pred, horizon_hours=6)
+    pt6 = reconciler.reconcile_point(15_000_000.0, 16_000_000.0, horizon_hours=6)
+    assert pt6["calibration_reliability_status"] == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+    # Limited sample size N=50 -> DEGRADED
+    reconciler.fit_residuals(d_true[:50], d_pred[:50], w_true[:50], w_pred[:50], horizon_hours=1)
+    pt_deg = reconciler.reconcile_point(15_000_000.0, 16_000_000.0, horizon_hours=1)
+    assert pt_deg["calibration_reliability_status"] == "DEGRADED"
+
+    # Degraded forecast point triggers conservative policy in liquidity shield
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=10_000_000.0, now=now)
+    from reserve_juggler.contracts import ForecastBundle, ForecastPoint
+
+    deg_fp = ForecastPoint(
+        as_of_timestamp=now,
+        target_timestamp=now + timedelta(hours=6),
+        horizon_hours=6,
+        deposit_point_forecast=10_000_000.0,
+        withdrawal_point_forecast=12_000_000.0,
+        deposit_p10=8_000_000.0,
+        withdrawal_p90=15_000_000.0,
+        net_outflow_p95=5_000_000.0,
+        net_outflow_marginal_proxy=7_000_000.0,
+        calibration_is_reliable=False,
+        calibration_reliability_status="DEGRADED",
+    )
+    bundle = ForecastBundle(forecast_timestamp=now, points=[deg_fp])
+    res_deg = assess_liquidity_reserve(state, bundle, use_calibrated_net_quantile=True)
+    # The degraded point triggers 1.15x buffer on marginal proxy (7M * 1.15 = 8.05M deficit)
+    assert res_deg.conservative_net_deficit >= 7_000_000.0 * 1.15

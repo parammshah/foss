@@ -495,6 +495,8 @@ class TreasuryState(CanonicalBaseModel):
     hot_capital_pct: float = 0.30
     is_synthetic: bool = False
     source_status: ServiceStatus = ServiceStatus.SYNTHETIC_DEMO
+    production_gateway_status: str = "UNCONFIGURED"
+    is_production_gateway_healthy: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -636,6 +638,7 @@ class ForecastPoint(CanonicalBaseModel):
     uncertainty_p99: Optional[float] = None
     calibration_sample_size: int = 0
     calibration_is_reliable: bool = True
+    calibration_reliability_status: str = "EMPIRICALLY_VALIDATED"
     calibration_warning: Optional[str] = None
     training_cutoff_timestamp: Optional[datetime] = None
     reliability_tier: str = "HIGH"

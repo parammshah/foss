@@ -103,8 +103,16 @@ def assess_liquidity_reserve(
 
     for fp in sorted_points:
         horizon = float(fp.forecast_horizon)
-        if use_calibrated_net_quantile and hasattr(fp, "net_outflow_p95") and fp.net_outflow_p95 is not None:
-            # Directly calibrated net-outflow quantile from out-of-sample empirical residuals
+        rel_status = getattr(fp, "calibration_reliability_status", "EMPIRICALLY_VALIDATED")
+        is_reliable = getattr(fp, "calibration_is_reliable", True)
+
+        if not is_reliable or rel_status == "DEGRADED":
+            # Degraded calibration triggers documented conservative liquidity policy:
+            # Enforce conservative marginal proxy bound with additional 15% stress buffer
+            base_proxy = max(0.0, float(getattr(fp, "net_outflow_marginal_proxy", 0.0) or (float(fp.withdrawal_p90) - float(fp.deposit_p10))))
+            pt_deficit = max(base_proxy * 1.15, float(getattr(fp, "net_outflow_p95", 0.0) or 0.0)) * effective_stress
+        elif use_calibrated_net_quantile and hasattr(fp, "net_outflow_p95") and fp.net_outflow_p95 is not None:
+            # Calibrated quantile (or conditionally calibrated fallback with 1.55x diurnal buffer at h=6)
             pt_deficit = max(0.0, float(fp.net_outflow_p95)) * effective_stress
         else:
             # Conservative marginal proxy heuristic bound: max(0, W_P90 - D_P10)

@@ -352,10 +352,12 @@ class ApplicationFacade:
         stated_reason: str,
         modified_amount: Optional[float] = None,
         modified_action: Optional[str] = None,
+        is_live_execution: bool = False,
     ) -> Tuple[bool, str]:
         """
         Processes human approval, modification, or cancellation with live revalidation
-        against current TreasuryState.
+        against current TreasuryState. Fails closed if live execution is requested without
+        production gateway connectivity.
         """
         if not self._latest_decision_record:
             return (False, "No pending decision available to act upon.")
@@ -371,6 +373,7 @@ class ApplicationFacade:
             modified_amount=modified_amount,
             modified_action=modified_action,
             treasury_state=current_state,
+            is_live_execution=is_live_execution,
         )
 
         if success:
