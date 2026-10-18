@@ -34,6 +34,7 @@ def assess_liquidity_reserve(
     forecast_is_cumulative: bool = False,
     forecast_horizon_hours: float = 72.0,
     use_calibrated_net_quantile: bool = False,
+    policy_is_certified: bool = False,
 ) -> ReserveAssessment:
     """Assess dynamic liquidity reserves and eligible investable surplus.
 
@@ -232,8 +233,14 @@ def assess_liquidity_reserve(
     elif has_fallback or any(float(fp.forecast_horizon) > 1.0 for fp in sorted_points):
         # Multi-hour targets contain uncalibrated cumulative proxies or heuristic volatility buffers
         policy_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+    elif not policy_is_certified:
+        # Policy-level evidence is insufficient to certify >= 95% population coverage under operational liquidity dynamics.
+        # Although 1h constituent input is calibrated, finite holdout (e.g. N=100, Wilson [93.0%, 99.4%]) does not certify
+        # population policy coverage under serial dependence. Retain conditionally calibrated fallback.
+        policy_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
     else:
         # Strictly 1h single-period horizon where point and cumulative forecasts are direct unbuffered conformal quantiles
+        # AND explicit policy-level statistical certification has been verified.
         policy_rel_status = "EMPIRICALLY_VALIDATED"
 
     return ReserveAssessment(

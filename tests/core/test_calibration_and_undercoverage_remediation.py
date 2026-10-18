@@ -515,8 +515,19 @@ def test_truly_1h_only_assessment_policy_status():
     bundle = ForecastBundle(forecast_id="BUN-1H", generated_at=as_of.isoformat(), point_forecasts=[pt_1h])
     state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
 
-    assessment = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
-    assert assessment.policy_reliability_status == "EMPIRICALLY_VALIDATED"
+    # Case A: By default without explicit policy-level statistical certification,
+    # policy status retains CONDITIONALLY_CALIBRATED_FALLBACK even if input is EMPIRICALLY_VALIDATED
+    assessment_unverified = assess_liquidity_reserve(
+        state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0, policy_is_certified=False
+    )
+    assert assessment_unverified.policy_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+    # Case B: When policy-level statistical certification is established for 1h policy,
+    # it receives EMPIRICALLY_VALIDATED
+    assessment_certified = assess_liquidity_reserve(
+        state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0, policy_is_certified=True
+    )
+    assert assessment_certified.policy_reliability_status == "EMPIRICALLY_VALIDATED"
 
 
 def test_unused_multi_hour_forecasts_do_not_contaminate_1h_policy_status():
@@ -559,12 +570,16 @@ def test_unused_multi_hour_forecasts_do_not_contaminate_1h_policy_status():
     bundle = ForecastBundle(forecast_id="BUN-MIXED", generated_at=as_of.isoformat(), point_forecasts=[pt_1h, pt_6h])
     state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
 
-    # Case A: Horizon restricted to 1h -> Unused 6h point does not contaminate
-    assessment_1h = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
+    # Case A: Horizon restricted to 1h with certified policy -> Unused 6h point does not contaminate
+    assessment_1h = assess_liquidity_reserve(
+        state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0, policy_is_certified=True
+    )
     assert assessment_1h.policy_reliability_status == "EMPIRICALLY_VALIDATED"
 
     # Case B: Horizon expanded to 6h -> Multi-hour fallback point is included, policy falls back
-    assessment_6h = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=6.0, payout_window_hours=6.0)
+    assessment_6h = assess_liquidity_reserve(
+        state, bundle, forecast_horizon_hours=6.0, payout_window_hours=6.0, policy_is_certified=True
+    )
     assert assessment_6h.policy_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
 
 
@@ -588,8 +603,84 @@ def test_degraded_forecast_contaminates_policy_to_degraded():
     bundle = ForecastBundle(forecast_id="BUN-DEG", generated_at=as_of.isoformat(), point_forecasts=[pt_degraded])
     state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
 
-    assessment = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
+    assessment = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0, policy_is_certified=True)
     assert assessment.policy_reliability_status == "DEGRADED"
+
+
+def test_mbb_reproducibility_and_fixed_seed():
+    """Verify that moving_block_bootstrap_ci produces reproducible, deterministic results
+    for fixed seed=42 across multiple invocations.
+    """
+    from scripts.audit_reserve_backtest import moving_block_bootstrap_ci
+    # Simulated sequence with 10 failures out of 100 observations
+    indicators = np.ones(100)
+    indicators[::10] = 0.0
+
+    res1 = moving_block_bootstrap_ci(indicators, block_length=5, num_bootstraps=2000, seed=42)
+    res2 = moving_block_bootstrap_ci(indicators, block_length=5, num_bootstraps=2000, seed=42)
+
+    assert res1["lower"] == res2["lower"]
+    assert res1["upper"] == res2["upper"]
+    assert res1["display"] == res2["display"]
+
+
+def test_distinguish_input_calibration_reserve_sufficiency_and_cash_shortfall():
+    """Verify the structural distinction between:
+    1. Forecast Exceedance (realized outflow > point/cumulative forecast)
+    2. Reserve Exceedance (realized cumulative outflow > required reserve)
+    3. Actual Cash Shortfall (realized demand > available post-decision cleared cash)
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    pt_1h = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=1)).isoformat(),
+        forecast_horizon=1.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=2_000_000.0,
+        cumulative_net_outflow_p95=2_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="EMPIRICALLY_VALIDATED",
+        cumulative_reliability_status="EMPIRICALLY_VALIDATED",
+    )
+    bundle = ForecastBundle(forecast_id="BUN-DIST", generated_at=as_of.isoformat(), point_forecasts=[pt_1h])
+    # Starting state: $50M cash, $10M obligations due in 1h
+    state = TreasuryState(
+        timestamp=as_of,
+        operational_cash_usd=50_000_000.0,
+        obligations=[],
+    )
+    assessment = assess_liquidity_reserve(
+        state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0, use_calibrated_net_quantile=True
+    )
+    
+    # Sized reserve: $2,000,000.00
+    required_reserve = assessment.total_required_reserve
+    assert required_reserve == 2_000_000.0
+
+    # Operational decision: deploy surplus $48M into repo, keep $2M operating cash
+    surplus = assessment.eligible_investable_surplus
+    post_decision_cash = state.operational_cash_usd - surplus
+    assert post_decision_cash == 2_000_000.0
+
+    # Scenario 1: Realized outflow = $2.5M
+    realized_outflow = 2_500_000.0
+    forecast_exceeded = realized_outflow > pt_1h.net_outflow_p95  # True
+    reserve_exceeded = realized_outflow > required_reserve         # True
+    # In operating cash: $2.0M - $2.5M = -$500k shortfall during repo lockup!
+    cash_shortfall = realized_outflow > post_decision_cash         # True
+    assert forecast_exceeded is True
+    assert reserve_exceeded is True
+    assert cash_shortfall is True
+
+    # Scenario 2: Treasury maintains $10M cash buffer policy (surplus deployment capped)
+    conservative_post_cash = 10_000_000.0
+    cash_shortfall_with_buffer = realized_outflow > conservative_post_cash
+    assert cash_shortfall_with_buffer is False  # Cash shortfall prevented despite forecast exceedance!
+
 
 
 
