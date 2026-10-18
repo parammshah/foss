@@ -100,6 +100,8 @@ class TreasuryLedger:
         """Returns the canonical point-in-time TreasuryState."""
         utc_ts = ensure_utc(as_of_timestamp)
         facility_contract = self.credit_manager.facility if self.credit_manager else None
+        drawn_cred = self.credit_manager.facility.utilized_amount_usd if (self.credit_manager and self.credit_manager.facility) else 0.0
+        avail_cred = self.credit_manager.available_capacity_usd if self.credit_manager else 50_000_000.0
 
         return TreasuryState(
             timestamp=utc_ts,
@@ -107,6 +109,9 @@ class TreasuryLedger:
             asset_positions=copy.deepcopy(self.positions),
             obligations=[copy.deepcopy(ob) for ob in self.obligations if not ob.is_settled],
             credit_facility=facility_contract,
+            emergency_credit_drawn_usd=drawn_cred,
+            emergency_credit_available_usd=avail_cred,
+            authorized_credit_availability=avail_cred,
             warnings=list(self._warnings),
         )
 
@@ -352,19 +357,30 @@ class TreasuryLedger:
                 status = "REJECTED_INSUFFICIENT_CASH"
             else:
                 sandbox.cash_usd -= amount_usd
-                repo_id = f"T1_REPO_{state.timestamp.strftime('%Y%m%d_%H')}"
-                sandbox.positions[repo_id] = AssetPosition(
-                    asset_id=repo_id,
-                    tier=AssetTier.TIER_1_REPO,
-                    units=amount_usd,
-                    unit_price_usd=1.0,
-                    market_value_usd=amount_usd,
-                    liquidatable_value_usd=amount_usd * (1.0 - sandbox.config.tier1_config.early_exit_fee_rate),
-                    annual_yield_or_return=sandbox.config.tier1_config.annual_rate,
-                    early_exit_fee_rate=sandbox.config.tier1_config.early_exit_fee_rate,
-                    maturity_timestamp=state.timestamp + timedelta(hours=15),
-                    cost_basis_usd=amount_usd,
-                )
+                repo_id = asset_id if (asset_id and asset_id != "CASH") else "T1_REPO_PORTFOLIO"
+                if repo_id in sandbox.positions and sandbox.positions[repo_id].tier == AssetTier.TIER_1_REPO:
+                    existing = sandbox.positions[repo_id]
+                    new_units = existing.units + amount_usd
+                    new_val = existing.market_value_usd + amount_usd
+                    sandbox.positions[repo_id] = existing.model_copy(update={
+                        "units": new_units,
+                        "market_value_usd": new_val,
+                        "liquidatable_value_usd": new_val * (1.0 - existing.early_exit_fee_rate),
+                        "cost_basis_usd": (existing.cost_basis_usd or 0.0) + amount_usd,
+                    })
+                else:
+                    sandbox.positions[repo_id] = AssetPosition(
+                        asset_id=repo_id,
+                        tier=AssetTier.TIER_1_REPO,
+                        units=amount_usd,
+                        unit_price_usd=1.0,
+                        market_value_usd=amount_usd,
+                        liquidatable_value_usd=amount_usd * (1.0 - sandbox.config.tier1_config.early_exit_fee_rate),
+                        annual_yield_or_return=sandbox.config.tier1_config.annual_rate,
+                        early_exit_fee_rate=sandbox.config.tier1_config.early_exit_fee_rate,
+                        maturity_timestamp=state.timestamp + timedelta(hours=15),
+                        cost_basis_usd=amount_usd,
+                    )
                 cash_movements["sweep_repo"] = -amount_usd
 
         elif action_type in ("BREAK_REPO", "LIQUIDATE_REPO"):
@@ -523,7 +539,7 @@ class TreasuryLedger:
                         "liquidatable_value_usd": rem_val * (1.0 - pos.liquidation_haircut_rate),
                     })
 
-        elif action_type == "DRAW_CREDIT":
+        elif action_type in ("DRAW_CREDIT", "DRAW_REPO_30D", "DRAW_BRIDGE_CREDIT", "BORROW_REPO"):
             if not sandbox.credit_manager:
                 status = "REJECTED_NO_CREDIT_FACILITY"
             else:
@@ -532,6 +548,7 @@ class TreasuryLedger:
                     status = "REJECTED_LIMIT_EXCEEDED"
                 else:
                     sandbox.cash_usd += drawn
+                    cash_movements["borrowing_proceeds"] = drawn
                     cash_movements["draw_credit"] = drawn
 
         elif action_type == "REPAY_CREDIT":

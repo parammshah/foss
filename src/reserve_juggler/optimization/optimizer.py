@@ -845,6 +845,7 @@ def optimize_treasury_actions(
                 TreasuryAction(
                     candidate_id=place_repo_cand_id,
                     action_type=ActionType.PLACE_REPO,
+                    asset_id="T1_REPO_PORTFOLIO",
                     amount=eligible_surplus,
                     expected_net_value=repo_tax_res.after_tax_net_value,
                     total_estimated_cost=0.0,

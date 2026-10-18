@@ -156,12 +156,15 @@ class TreasuryAction:
     residual_debt_after_repayment: float = 0.0
     credit_availability_after_draw: float = 0.0
     ranking_is_provisional: bool = False
-
     def to_dict(self) -> dict[str, Any]:
+        tgt_asset = self.asset_id or ("T1_REPO_PORTFOLIO" if self.action_type == ActionType.PLACE_REPO else "CASH")
         return {
             "candidate_id": self.candidate_id,
             "action_type": self.action_type.value,
-            "asset_id": self.asset_id,
+            "asset_id": tgt_asset,
+            "target_asset": tgt_asset,
+            "source_asset": "TIER_0_CASH",
+            "destination_instrument": tgt_asset,
             "amount": round(self.amount, 2),
             "expected_net_value": round(self.expected_net_value, 4),
             "total_estimated_cost": round(self.total_estimated_cost, 4),

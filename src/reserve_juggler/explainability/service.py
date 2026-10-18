@@ -324,6 +324,7 @@ class DecisionExplanationService:
         treasury_state: Optional[TreasuryState] = None,
         as_of_time: Optional[datetime] = None,
         validity_window_seconds: float = 3600.0,
+        is_live_execution: bool = False,
     ) -> Tuple[bool, str, DecisionRecord, Optional[ExecutionOutcome], LearningEvent]:
         """
         Processes human approval, rejection, modification, or cancellation with role permissions.
@@ -332,6 +333,24 @@ class DecisionExplanationService:
         """
         current_dt = ensure_utc(as_of_time) if as_of_time else datetime.now(timezone.utc)
         now_iso = current_dt.isoformat()
+
+        # Check Tax Safety & Provisional Execution Boundaries
+        meta = getattr(decision_record, "metadata", {}) or {}
+        tax_status = meta.get("tax_profile_status", "STATUTORY_APPROVED")
+        is_prov_tax = bool(
+            meta.get("ranking_is_provisional", False)
+            or getattr(decision_record, "ranking_is_provisional", False)
+            or any("PROVISIONAL_TAX" in str(r) for r in getattr(decision_record, "reason_codes", []))
+            or tax_status in ("UNCONFIGURED_GROSS_ONLY", "SYNTHETIC_DEMO", "INVALID")
+        )
+
+        if is_live_execution and is_prov_tax and action_type in ("APPROVED", "MODIFIED", "OVERRIDDEN"):
+            blocked_msg = (
+                f"Live execution BLOCKED: Decision {decision_record.decision_id} uses provisional/synthetic "
+                f"tax profile ('{tax_status}'). Live execution strictly requires an approved statutory corporate TaxProfile."
+            )
+            logger.warning(blocked_msg)
+            return (False, blocked_msg, decision_record, None, None)  # type: ignore
 
         # Check A: Idempotence & Duplicate Execution Protection
         if (
@@ -638,6 +657,23 @@ class DecisionExplanationService:
             "slippage": round(scaled_base_slippage + exec_slippage, 2),
         }
 
+        # Prominently record provisional tax boundary if applicable
+        if is_prov_tax:
+            if hasattr(decision_record, "metadata") and isinstance(decision_record.metadata, dict):
+                decision_record.metadata["is_simulation_only"] = True
+                decision_record.metadata["live_execution_eligible"] = False
+                decision_record.metadata["provisional_tax_disclaimer"] = (
+                    f"PROVISIONAL_TAX_ASSUMPTIONS: Authorized for sandbox simulation ONLY under tax status '{tax_status}'. "
+                    "LIVE OPERATIONAL EXECUTION IS STRICTLY BLOCKED without an approved statutory corporate TaxProfile."
+                )
+
+        errors_list: list[str] = []
+        if is_prov_tax:
+            errors_list.append(
+                f"PROVISIONAL_TAX_ASSUMPTIONS: Authorized for sandbox simulation only ({tax_status}). "
+                "Live execution is strictly blocked without an approved statutory corporate TaxProfile."
+            )
+
         outcome = ExecutionOutcome(
             outcome_id=f"OUT-{decision_record.decision_id}",
             decision_id=decision_record.decision_id,
@@ -652,7 +688,7 @@ class DecisionExplanationService:
                 "penalty": scaled_penalty,
                 "slippage": round(scaled_base_slippage + exec_slippage, 2),
             },
-            errors=[],
+            errors=errors_list,
             liquidity_shortfall=0.0,
             settlement_status="SETTLED",
             slippage_bps=1.5,
@@ -675,6 +711,9 @@ class DecisionExplanationService:
                 "final_action": final_action,
                 "is_executed": True,
                 "revalidation_passed": True,
+                "is_simulation_only": is_prov_tax,
+                "live_execution_eligible": not is_prov_tax,
+                "tax_profile_status": tax_status,
             },
             associated_versions=decision_record.model_versions,
         )

@@ -7,6 +7,9 @@ from reserve_juggler.contracts import (
     ActionType,
     ApprovalStatus,
     AssetPosition,
+    AssetTier,
+    CreditFacility,
+    DecisionRecord,
     GateStatus,
     ServiceStatus,
     TreasuryState,
@@ -35,18 +38,28 @@ def _build_test_treasury_state(
     t1_repo = AssetPosition(
         asset_id="T1_REPO_PORTFOLIO",
         asset_class="REPO",
+        tier=AssetTier.TIER_1_REPO,
         market_value_usd=repo_value,
         unrealized_gain_usd=0.0,
         holding_period_days=1,
         is_encumbered=False,
         annual_yield_or_return=0.0515,
     )
+    loc = CreditFacility(
+        facility_id="EMERGENCY_LOC_01",
+        committed_limit_usd=50_000_000.0,
+        utilized_amount_usd=0.0,
+        apr=0.075,
+        fee_rate=0.0025,
+        is_available=True,
+    )
     return TreasuryState(
         timestamp=now,
         operational_cash_usd=cash,
         asset_positions={"T1_REPO_PORTFOLIO": t1_repo},
         upcoming_obligations_usd=obligations,
-        available_credit_usd=25_000_000.0,
+        credit_facility=loc,
+        available_credit_usd=50_000_000.0,
         protected_reserve_floor=25_000_000.0,
         as_of_timestamp=now,
     )
@@ -448,3 +461,142 @@ def test_canonical_place_repo_ledger_reconciliation():
     # 4. Consistent linking
     assert sim_out.decision_id == approved_dec.decision_id
     assert learn_ev.correlation_id == approved_dec.decision_id
+
+
+def test_provisional_tax_simulation_only_blocks_live_execution():
+    """Verify that provisional/synthetic tax profile allows sandbox simulation but blocks live execution."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    synth_profile = create_synthetic_demo_profile(entity_id="SYNTH_CORP_01")
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=synth_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+    assert dec.metadata.get("tax_profile_status") == "SYNTHETIC_DEMO"
+    assert res.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+
+    expl_service = DecisionExplanationService()
+
+    # Attempt live operational execution -> MUST BE BLOCKED
+    live_ok, live_msg, _, _, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Attempting live commit with synthetic profile",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+        is_live_execution=True,
+    )
+    assert live_ok is False
+    assert "Live execution BLOCKED" in live_msg
+    assert "provisional/synthetic" in live_msg
+
+    # Explicitly authorized sandbox simulation -> ALLOWED WITH PROMINENT DISCLAIMER
+    sim_ok, sim_msg, sim_dec, sim_out, sim_ev = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Approved for sandbox simulation study only.",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+        is_live_execution=False,
+    )
+    assert sim_ok is True
+    assert sim_dec.metadata.get("is_simulation_only") is True
+    assert sim_dec.metadata.get("live_execution_eligible") is False
+    assert "PROVISIONAL_TAX_ASSUMPTIONS" in sim_dec.metadata.get("provisional_tax_disclaimer", "")
+    assert sim_ev.payload.get("is_simulation_only") is True
+    assert sim_ev.payload.get("live_execution_eligible") is False
+
+
+def test_repo_target_mapping_and_direction_aware_accounting():
+    """Verify destination repo target mapping and contrast repo investment vs repo borrowing accounting."""
+    now = datetime(2026, 1, 11, 17, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    # 1. Target instrument for PLACE_REPO must be specific repo instrument, not ambiguous CASH
+    place_cand = next(
+        (a for a in [dec.selected_action] + dec.alternatives if isinstance(a, dict) and a.get("action_type") == "PLACE_REPO"),
+        None,
+    )
+    assert place_cand is not None, "PLACE_REPO candidate must be evaluated by optimizer"
+    assert place_cand.get("target_asset") == "T1_REPO_PORTFOLIO"
+    assert place_cand.get("destination_instrument") == "T1_REPO_PORTFOLIO"
+    assert place_cand.get("source_asset") == "TIER_0_CASH"
+
+    repo_rec = DecisionRecord(selected_action=place_cand)
+    assert repo_rec.target_asset == "T1_REPO_PORTFOLIO"
+    assert repo_rec.destination_instrument == "T1_REPO_PORTFOLIO"
+    assert repo_rec.source_asset == "TIER_0_CASH"
+
+    # 2. Simulate PLACE_REPO: Cash decreases, Repo asset increases, Liabilities remain 0
+    place_spec = {
+        "type": "PLACE_REPO",
+        "amount_usd": 10_000_000.0,
+        "asset_id": "T1_REPO_PORTFOLIO",
+        "decision_id": "dec-test-place",
+    }
+    state_after_place, out_place = orch.ledger.simulate_action(state, place_spec, res.forecast_bundle)
+    assert out_place.execution_status == "SUCCESS"
+    assert out_place.realized_cash_movements.get("sweep_repo") == -10_000_000.0
+    assert state_after_place.operational_cash_usd == state.operational_cash_usd - 10_000_000.0
+    assert state_after_place.asset_positions["T1_REPO_PORTFOLIO"].market_value_usd == (
+        state.asset_positions["T1_REPO_PORTFOLIO"].market_value_usd + 10_000_000.0
+    )
+    assert state_after_place.emergency_credit_drawn_usd == 0.0
+
+    # 3. Contrast with DRAW_REPO_30D (Borrowing): Cash increases, Liabilities increase, Repo asset UNCHANGED
+    borrow_spec = {
+        "type": "DRAW_REPO_30D",
+        "amount_usd": 5_000_000.0,
+        "decision_id": "dec-test-borrow",
+    }
+    state_after_borrow, out_borrow = orch.ledger.simulate_action(state, borrow_spec, res.forecast_bundle)
+    assert out_borrow.execution_status == "SUCCESS"
+    assert out_borrow.realized_cash_movements.get("borrowing_proceeds") == 5_000_000.0
+    assert state_after_borrow.operational_cash_usd == state.operational_cash_usd + 5_000_000.0
+    # Liabilities increased
+    assert state_after_borrow.emergency_credit_drawn_usd == 5_000_000.0
+    # Repo asset did NOT increase (not masquerading as repo investment)
+    assert state_after_borrow.asset_positions["T1_REPO_PORTFOLIO"].market_value_usd == (
+        state.asset_positions["T1_REPO_PORTFOLIO"].market_value_usd
+    )
+
+
+def test_statutory_profile_entity_and_jurisdiction_matching():
+    """Verify that statutory profiles require matching corporate entity and legal jurisdiction."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+
+    # Valid profile matching target
+    valid_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+    is_app, err = valid_profile.is_applicable_to(entity_id="US_CORP_01", jurisdiction="US_FED_CORP_STATUTORY")
+    assert is_app is True
+    assert err is None
+
+    # Mismatched entity
+    is_app_bad_ent, err_ent = valid_profile.is_applicable_to(entity_id="FOREIGN_CORP_99", jurisdiction="US_FED_CORP_STATUTORY")
+    assert is_app_bad_ent is False
+    assert "Entity mismatch" in str(err_ent)
+
+    # Mismatched jurisdiction
+    is_app_bad_jur, err_jur = valid_profile.is_applicable_to(entity_id="US_CORP_01", jurisdiction="UK_HMRC")
+    assert is_app_bad_jur is False
+    assert "Jurisdiction mismatch" in str(err_jur)

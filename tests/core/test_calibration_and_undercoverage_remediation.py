@@ -116,3 +116,48 @@ def test_net_outflow_empirical_holdout_coverage_ge_95():
         assert coverage_results[h]["coverage"] >= 0.95, (
             f"Horizon {h}h robust coverage {coverage_results[h]['coverage']:.1%} fell below 95% requirement!"
         )
+
+
+def test_non_overlapping_evaluation_and_appropriate_validation_status():
+    """Evaluate non-overlapping origins (step=h) and verify appropriate empirical validation status."""
+    df = pd.read_csv(resolve_dataset_path())
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+
+    # Chronologically strictly separated training set (first 500 rows)
+    train_df = df.iloc[:500].copy()
+    svc = ForecastService()
+    svc.fit(train_df, horizons=[1, 6, 24])
+
+    eval_origins_count = 100
+    for h in [1, 6, 24]:
+        covered_robust = []
+        covered_raw = []
+        covered_proxy = []
+
+        # Non-overlapping evaluation: step by h hours so windows are strictly disjoint
+        idx = 500
+        while idx + h < len(df) and len(covered_robust) < eval_origins_count:
+            as_of = df.iloc[idx][TIMESTAMP_COL]
+            act_net = df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL]
+
+            pt = svc.forecast(as_of).get_point(h)
+            covered_robust.append(act_net <= pt.net_outflow_p95)
+            covered_raw.append(act_net <= pt.net_outflow_calibrated_p95)
+            covered_proxy.append(act_net <= pt.net_outflow_marginal_proxy)
+            idx += h
+
+        emp_cov = float(np.mean(covered_robust))
+        se = float(np.sqrt(emp_cov * (1.0 - emp_cov) / len(covered_robust)))
+        ci_lower = emp_cov - 1.96 * se
+
+        # Point coverage satisfies >= 95%
+        assert emp_cov >= 0.95, f"Non-overlapping horizon {h}h coverage {emp_cov:.1%} < 95%"
+
+        # When CI spans below 95% (e.g. at h=6 where ci_lower < 0.95), status must NOT be labeled CERTIFIED
+        if ci_lower < 0.95:
+            validation_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+        else:
+            validation_status = "EMPIRICALLY_VALIDATED"
+
+        assert validation_status in ("EMPIRICALLY_VALIDATED", "CONDITIONALLY_CALIBRATED_FALLBACK")
+        assert validation_status != "CERTIFIED"

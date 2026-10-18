@@ -867,6 +867,8 @@ class DecisionRecord(CanonicalBaseModel):
     timestamp: Union[datetime, str] = Field(default_factory=lambda: datetime.now(timezone.utc))
     selected_action: Union[str, Dict[str, Any]] = "HOLD_CASH"
     target_asset: str = "CASH"
+    source_asset: str = "TIER_0_CASH"
+    destination_instrument: Optional[str] = None
     amount: float = 0.0
     reserve: Union[float, Dict[str, Any]] = 0.0
     eligible_surplus: float = 0.0
@@ -908,6 +910,23 @@ class DecisionRecord(CanonicalBaseModel):
             tss = data.get("treasury_safety_score")
             if tss is not None and "score" in data and isinstance(data["score"], dict):
                 data["score"]["treasury_safety_score"] = tss
+            # Sync target_asset & destination_instrument
+            act = data.get("selected_action")
+            if isinstance(act, dict):
+                tgt = act.get("target_asset") or act.get("asset_id")
+                act_name = str(act.get("action_type") or act.get("type") or "").upper()
+                if tgt and tgt != "CASH":
+                    data["target_asset"] = tgt
+                    data["destination_instrument"] = tgt
+                elif "REPO" in act_name and any(k in act_name for k in ("PLACE", "SWEEP", "INVEST")):
+                    data["target_asset"] = "T1_REPO_PORTFOLIO"
+                    data["destination_instrument"] = "T1_REPO_PORTFOLIO"
+            elif isinstance(act, str):
+                act_name = act.upper()
+                if "REPO" in act_name and any(k in act_name for k in ("PLACE", "SWEEP", "INVEST")):
+                    if data.get("target_asset") in (None, "CASH"):
+                        data["target_asset"] = "T1_REPO_PORTFOLIO"
+                        data["destination_instrument"] = "T1_REPO_PORTFOLIO"
         return data
 
 

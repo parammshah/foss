@@ -66,8 +66,24 @@ class StandardDecisionRecord:
     @property
     def target_asset(self) -> str:
         if isinstance(self.selected_action, dict):
-            return str(self.selected_action.get("target_asset") or self.selected_action.get("asset_id") or "CASH")
+            tgt = self.selected_action.get("target_asset") or self.selected_action.get("asset_id")
+            if tgt and tgt != "CASH":
+                return str(tgt)
+            act = str(self.selected_action.get("action_type") or self.selected_action.get("type") or "")
+            if "REPO" in act and any(k in act for k in ("PLACE", "SWEEP", "INVEST")):
+                return "T1_REPO_PORTFOLIO"
+            return str(tgt or "CASH")
         return "CASH"
+
+    @property
+    def source_asset(self) -> str:
+        if isinstance(self.selected_action, dict):
+            return str(self.selected_action.get("source_asset") or "TIER_0_CASH")
+        return "TIER_0_CASH"
+
+    @property
+    def destination_instrument(self) -> str:
+        return self.target_asset
 
     @property
     def amount(self) -> float:
