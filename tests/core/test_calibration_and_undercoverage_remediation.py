@@ -492,3 +492,104 @@ def test_statistical_intervals_zero_low_nonzero_exceedances():
     assert 0.65 <= mbb_nonzero["lower"] <= mbb_nonzero["upper"] <= 0.95
 
 
+def test_truly_1h_only_assessment_policy_status():
+    """Verify that a policy assessment with truly 1h-only constituent forecast
+    receives EMPIRICALLY_VALIDATED if the 1h forecast is empirically validated.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    pt_1h = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=1)).isoformat(),
+        forecast_horizon=1.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=2_000_000.0,
+        cumulative_net_outflow_p95=2_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="EMPIRICALLY_VALIDATED",
+        cumulative_reliability_status="EMPIRICALLY_VALIDATED",
+    )
+    bundle = ForecastBundle(forecast_id="BUN-1H", generated_at=as_of.isoformat(), point_forecasts=[pt_1h])
+    state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
+
+    assessment = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
+    assert assessment.policy_reliability_status == "EMPIRICALLY_VALIDATED"
+
+
+def test_unused_multi_hour_forecasts_do_not_contaminate_1h_policy_status():
+    """Verify that unused multi-hour forecasts present in a bundle do NOT contaminate
+    a strictly 1-hour assessment when forecast_horizon_hours=1.0.
+    However, when forecast_horizon_hours includes multi-hour targets, status falls back.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    pt_1h = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=1)).isoformat(),
+        forecast_horizon=1.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=2_000_000.0,
+        cumulative_net_outflow_p95=2_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="EMPIRICALLY_VALIDATED",
+        cumulative_reliability_status="EMPIRICALLY_VALIDATED",
+    )
+    pt_6h = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=6)).isoformat(),
+        forecast_horizon=6.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=5_000_000.0,
+        cumulative_net_outflow_p95=12_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+        cumulative_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+    )
+    # Bundle contains BOTH 1h and 6h
+    bundle = ForecastBundle(forecast_id="BUN-MIXED", generated_at=as_of.isoformat(), point_forecasts=[pt_1h, pt_6h])
+    state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
+
+    # Case A: Horizon restricted to 1h -> Unused 6h point does not contaminate
+    assessment_1h = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
+    assert assessment_1h.policy_reliability_status == "EMPIRICALLY_VALIDATED"
+
+    # Case B: Horizon expanded to 6h -> Multi-hour fallback point is included, policy falls back
+    assessment_6h = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=6.0, payout_window_hours=6.0)
+    assert assessment_6h.policy_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+
+def test_degraded_forecast_contaminates_policy_to_degraded():
+    """Verify that a degraded constituent forecast forces policy status to DEGRADED."""
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    pt_degraded = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=1)).isoformat(),
+        forecast_horizon=1.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=2_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="DEGRADED",
+        cumulative_reliability_status="DEGRADED",
+    )
+    bundle = ForecastBundle(forecast_id="BUN-DEG", generated_at=as_of.isoformat(), point_forecasts=[pt_degraded])
+    state = TreasuryState(timestamp=as_of, operational_cash_usd=50_000_000.0, obligations=[])
+
+    assessment = assess_liquidity_reserve(state, bundle, forecast_horizon_hours=1.0, payout_window_hours=1.0)
+    assert assessment.policy_reliability_status == "DEGRADED"
+
+
+

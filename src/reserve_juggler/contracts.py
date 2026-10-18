@@ -672,6 +672,11 @@ class ForecastPoint(CanonicalBaseModel):
                     data[k] = ensure_utc(v)
 
             # Horizon
+            if "forecast_horizon" in data and "horizon_hours" not in data:
+                try:
+                    data["horizon_hours"] = int(float(data["forecast_horizon"]))
+                except (ValueError, TypeError):
+                    data["horizon_hours"] = 1
             if "horizon_hours" in data and "horizon" not in data:
                 data["horizon"] = f"{data['horizon_hours']}h"
             elif "horizon" in data and "horizon_hours" not in data:

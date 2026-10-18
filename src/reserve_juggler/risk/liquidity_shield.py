@@ -93,8 +93,14 @@ def assess_liquidity_reserve(
                 total_maturing_repo_liquidity += full_repo_val
 
     # 3. Forecast Deficit Analysis
+    # Filter constituent forecast points strictly within the declared evaluation horizon
     sorted_points = sorted(
-        forecast_bundle.point_forecasts or [], key=lambda p: float(p.forecast_horizon)
+        [
+            p
+            for p in (forecast_bundle.point_forecasts or [])
+            if float(p.forecast_horizon) <= forecast_horizon_hours
+        ],
+        key=lambda p: float(p.forecast_horizon),
     )
 
     immediate_forecast_deficit = 0.0
@@ -159,9 +165,10 @@ def assess_liquidity_reserve(
             if net_gap > max_future_net_gap:
                 max_future_net_gap = net_gap
 
-    # Also check scheduled obligations at every material payment deadline and standard horizons (24-72h)
-    obligation_deadlines = [h_due for h_due, _ in obligations_by_hour if h_due > payout_window_hours]
-    future_check_horizons = sorted(set([30.0, 48.0, 72.0] + obligation_deadlines))
+    # Also check scheduled obligations at every material payment deadline within evaluation horizon
+    obligation_deadlines = [h_due for h_due, _ in obligations_by_hour if h_due > payout_window_hours and h_due <= forecast_horizon_hours]
+    future_check_horizons = sorted(set([h for h in [30.0, 48.0, 72.0] if h <= forecast_horizon_hours] + obligation_deadlines))
+
     for horizon in future_check_horizons:
         cum_obligations_at_h = sum(
             amt for h_due, amt in obligations_by_hour if h_due <= horizon

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Auditable evaluation script reproducing row-level reserve backtest results and statistical intervals.
 
-Outputs row-level evaluation artifact with exact timestamps, realized customer flows,
-forecasts, policy reserves, exceedances, and target-specific reliability labels.
+Outputs:
+1. artifacts/reserve_backtest_row_level.csv (600 rows: 200 rolling origins x 3 horizons)
+2. artifacts/reserve_backtest_daily_expanded.csv (963 rows: 321 daily origins x 3 horizons)
 """
 
 from __future__ import annotations
@@ -48,8 +49,7 @@ def moving_block_bootstrap_ci(
 
     If the sample has zero observed failures (k_failures = 0), standard empirical bootstrap
     is degenerate (resampling all-successes yields 100% in every replicate, sample variance=0).
-    In this case, this function explicitly flags degeneracy and supplies the exact finite-sample
-    Rule of Three / Hanley-Jadack upper confidence bound on failure probability under independence.
+    In this case, this function explicitly flags degeneracy.
     """
     n = len(indicators)
     k_success = int(np.sum(indicators))
@@ -59,16 +59,13 @@ def moving_block_bootstrap_ci(
 
     # Degenerate Case: 0 observed failures
     if k_failures == 0:
-        # Rule of Three / Exact Binomial 1-sided 95% bound under independence:
-        # P(0 failures in n trials | failure_rate = p) = (1 - p)^n = alpha
-        # p_upper = 1 - alpha**(1/n) ~ -ln(alpha) / n ~ 3 / n
         p_failure_upper = 1.0 - (alpha ** (1.0 / n))
         coverage_lower_bound = 1.0 - p_failure_upper
         return {
             "lower": float(coverage_lower_bound),
             "upper": 1.0,
             "is_degenerate": True,
-            "display": f"[{coverage_lower_bound * 100:.1f}%, 100.0%]*",
+            "display": "Degenerate (0 failures)",
             "rule_of_three_bound": float(coverage_lower_bound),
             "failure_rate_upper": float(p_failure_upper),
         }
@@ -122,11 +119,11 @@ def main() -> int:
     with open(dataset_path, "rb") as f:
         file_hash = hashlib.sha256(f.read()).hexdigest()
 
-    print("=" * 125)
+    print("=" * 135)
     print("RESERVE JUGGLER AUDITABLE BACKTEST — DATASET INTEGRITY & PROVENANCE")
     print(f"Dataset Path : {dataset_path}")
     print(f"SHA-256 Hash : {file_hash}")
-    print("=" * 125)
+    print("=" * 135)
 
     df = pd.read_csv(dataset_path)
     df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
@@ -140,7 +137,7 @@ def main() -> int:
     svc.fit(train_df, horizons=[1, 6, 24, 48, 72], val_split_ratio=VAL_RATIO)
 
     print(f"Fitted ForecastService: {N_FIT} total rows ({N_FIT * (1 - VAL_RATIO):.0f} train, {N_FIT * VAL_RATIO:.0f} val)")
-    print(f"Total rows in dataset: {total_dataset_rows}")
+    print(f"Total rows in dataset: {total_dataset_rows} (rows 0..{total_dataset_rows - 1})")
     print(f"Available holdout pool: rows {N_FIT}..{total_dataset_rows - 1} ({total_dataset_rows - N_FIT} rows)")
     print(f"Evaluation origins strictly begin at row {N_FIT} ({df.iloc[N_FIT][TIMESTAMP_COL]})\n")
 
@@ -149,9 +146,7 @@ def main() -> int:
     # -------------------------------------------------------------------------
     EVAL_ORIGINS = 200
     horizons = [6, 24, 72]
-    row_records = []
-    summary_results = {}
-    block_sensitivities = {}
+    rolling_records = []
 
     start_origin_idx = N_FIT
     end_origin_idx = N_FIT + EVAL_ORIGINS - 1
@@ -164,27 +159,19 @@ def main() -> int:
     print(f"Max Target Timestamp  : {(end_ts + pd.Timedelta(hours=72)).isoformat()} (Row {end_origin_idx + 72})\n")
 
     for h in horizons:
-        pt_covered = []
-        raw_pt_covered = []
-        cum_covered = []
-        policy_covered = []
-
         for idx in range(N_FIT, N_FIT + EVAL_ORIGINS):
             as_of_ts = df.iloc[idx][TIMESTAMP_COL]
             bundle = svc.forecast(as_of_ts)
             fp = bundle.get_point(h)
 
-            # Realized outcomes
             act_pt = float(df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL])
             act_cum = float((df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).sum())
 
-            # Forecasts & policies
             raw_pt_p95 = float(getattr(fp, "net_outflow_calibrated_p95", 0.0) or 0.0)
             robust_pt_p95 = float(fp.net_outflow_p95)
             raw_cum_p95 = float(getattr(fp, "cumulative_net_outflow_p95", 0.0) or 0.0)
             applied_buffer = robust_pt_p95 - raw_pt_p95
 
-            # Liquidity reserve assessment with zero scheduled obligations to strictly test customer flow coverage
             state = TreasuryState(
                 timestamp=as_of_ts,
                 operational_cash_usd=100_000_000.0,
@@ -195,6 +182,7 @@ def main() -> int:
                 forecast_bundle=bundle,
                 use_calibrated_net_quantile=True,
                 payout_window_hours=float(h),
+                forecast_horizon_hours=float(h),
             )
 
             cons_deficit = float(assessment.conservative_net_deficit)
@@ -202,18 +190,12 @@ def main() -> int:
             avail_cash = float(state.available_cash)
             surplus = float(assessment.eligible_investable_surplus)
 
-            # Exceedance flags
             exc_raw_pt = act_pt > raw_pt_p95
             exc_robust_pt = act_pt > robust_pt_p95
             exc_raw_cum = act_cum > raw_cum_p95
             exc_policy = act_cum > cons_deficit
 
-            raw_pt_covered.append(not exc_raw_pt)
-            pt_covered.append(not exc_robust_pt)
-            cum_covered.append(not exc_raw_cum)
-            policy_covered.append(not exc_policy)
-
-            row_records.append({
+            rolling_records.append({
                 "forecast_origin_idx": idx,
                 "as_of_timestamp": as_of_ts.isoformat(),
                 "horizon_hours": h,
@@ -237,35 +219,15 @@ def main() -> int:
                 "policy_reliability_status": assessment.policy_reliability_status,
             })
 
-        arr_pt = np.array(pt_covered, dtype=float)
-        arr_cum = np.array(cum_covered, dtype=float)
-        arr_pol = np.array(policy_covered, dtype=float)
-
-        summary_results[h] = {
-            "n": EVAL_ORIGINS,
-            "raw_pt_cov": float(np.mean(raw_pt_covered)),
-            "robust_pt_cov": float(np.mean(pt_covered)),
-            "robust_pt_exc": EVAL_ORIGINS - sum(pt_covered),
-            "robust_pt_wilson": wilson_score_interval(sum(pt_covered), EVAL_ORIGINS),
-            "robust_pt_mbb": moving_block_bootstrap_ci(arr_pt, block_length=max(2, h // 4)),
-            "raw_cum_cov": float(np.mean(cum_covered)),
-            "raw_cum_exc": EVAL_ORIGINS - sum(cum_covered),
-            "raw_cum_wilson": wilson_score_interval(sum(cum_covered), EVAL_ORIGINS),
-            "raw_cum_mbb": moving_block_bootstrap_ci(arr_cum, block_length=max(2, h // 4)),
-            "policy_cov": float(np.mean(policy_covered)),
-            "policy_exc": EVAL_ORIGINS - sum(policy_covered),
-            "policy_wilson": wilson_score_interval(sum(policy_covered), EVAL_ORIGINS),
-            "policy_mbb": moving_block_bootstrap_ci(arr_pol, block_length=max(2, h // 4)),
-            "policy_status": "CONDITIONALLY_CALIBRATED_FALLBACK",
-        }
-        block_sensitivities[h] = {
-            "pt": evaluate_block_sensitivity(arr_pt),
-            "cum": evaluate_block_sensitivity(arr_cum),
-            "pol": evaluate_block_sensitivity(arr_pol),
-        }
+    # Persist rolling artifact
+    rolling_df = pd.DataFrame(rolling_records)
+    artifact_path_rolling = Path("artifacts/reserve_backtest_row_level.csv")
+    artifact_path_rolling.parent.mkdir(parents=True, exist_ok=True)
+    rolling_df.to_csv(artifact_path_rolling, index=False)
+    print(f"Saved {len(rolling_df)} row-level backtest evaluations to: {artifact_path_rolling}")
 
     # -------------------------------------------------------------------------
-    # PART B: NON-OVERLAPPING ORIGINS (step=h, independent windows starting at row 1000)
+    # PART B: NON-OVERLAPPING ORIGINS (step=h)
     # -------------------------------------------------------------------------
     non_overlap_results = {}
     for h in [1, 6, 24, 72]:
@@ -288,7 +250,13 @@ def main() -> int:
             cum_cov.append(act_cum <= getattr(fp, "cumulative_net_outflow_p95", 0.0))
 
             state = TreasuryState(timestamp=as_of_ts, operational_cash_usd=100_000_000.0, obligations=[])
-            assessment = assess_liquidity_reserve(state, bundle, use_calibrated_net_quantile=True, payout_window_hours=float(h))
+            assessment = assess_liquidity_reserve(
+                state=state,
+                forecast_bundle=bundle,
+                use_calibrated_net_quantile=True,
+                payout_window_hours=float(h),
+                forecast_horizon_hours=float(h),
+            )
             policy_cov.append(act_cum <= assessment.conservative_net_deficit)
 
             idx += h
@@ -302,140 +270,204 @@ def main() -> int:
 
         non_overlap_results[h] = {
             "n_windows": n_w,
+            "first_origin": origins_used[0],
+            "last_origin": origins_used[-1],
+            "first_ts": df.iloc[origins_used[0]][TIMESTAMP_COL].isoformat(),
+            "last_ts": df.iloc[origins_used[-1]][TIMESTAMP_COL].isoformat(),
+            "last_target_ts": df.iloc[origins_used[-1] + h][TIMESTAMP_COL].isoformat(),
             "pt_cov": float(np.mean(pt_cov)),
             "pt_exc": n_w - sum(pt_cov),
             "pt_wilson": wilson_score_interval(sum(pt_cov), n_w),
-            "pt_mbb": moving_block_bootstrap_ci(arr_pt_no, block_length=max(2, h // 4)),
+            "pt_mbb": moving_block_bootstrap_ci(arr_pt_no, block_length=max(1, h // 4)),
             "cum_cov": float(np.mean(cum_cov)),
             "cum_exc": n_w - sum(cum_cov),
             "cum_wilson": wilson_score_interval(sum(cum_cov), n_w),
-            "cum_mbb": moving_block_bootstrap_ci(arr_cum_no, block_length=max(2, h // 4)),
+            "cum_mbb": moving_block_bootstrap_ci(arr_cum_no, block_length=max(1, h // 4)),
             "policy_cov": float(np.mean(policy_cov)),
             "policy_exc": n_w - sum(policy_cov),
             "policy_wilson": wilson_score_interval(sum(policy_cov), n_w),
-            "policy_mbb": moving_block_bootstrap_ci(arr_pol_no, block_length=max(2, h // 4)),
+            "policy_mbb": moving_block_bootstrap_ci(arr_pol_no, block_length=max(1, h // 4)),
+            "policy_status": "EMPIRICALLY_VALIDATED" if h == 1 else "CONDITIONALLY_CALIBRATED_FALLBACK",
         }
 
     # -------------------------------------------------------------------------
-    # PART C: EXPANDED FULL-HOLDOUT EVALUATION (Daily rolling step=24h, rows 1000..8688)
+    # PART C: EXPANDED FULL-HOLDOUT EVALUATION (Daily step=24h, N=321 origins)
     # -------------------------------------------------------------------------
-    expanded_results = {}
-    expanded_origins = list(range(N_FIT, len(df) - 72, 24))  # 320 daily origins across 7688 holdout rows
-    n_exp = len(expanded_origins)
+    # Exact origin sequence: start at row 1000, step 24, max target row idx + 72 <= 8759 (idx <= 8687)
+    # Generated origins: 1000, 1024, ..., 8680 (321 total origins)
+    daily_origins = [idx for idx in range(N_FIT, len(df) - 72, 24)]
+    expanded_records = []
 
     for h in [6, 24, 72]:
-        exp_pt_cov = []
-        exp_cum_cov = []
-        exp_pol_cov = []
-        for idx in expanded_origins:
+        for idx in daily_origins:
             as_of_ts = df.iloc[idx][TIMESTAMP_COL]
             bundle = svc.forecast(as_of_ts)
             fp = bundle.get_point(h)
+
             act_pt = float(df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL])
             act_cum = float((df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).sum())
-            exp_pt_cov.append(act_pt <= fp.net_outflow_p95)
-            exp_cum_cov.append(act_cum <= getattr(fp, "cumulative_net_outflow_p95", 0.0))
+
+            raw_pt_p95 = float(getattr(fp, "net_outflow_calibrated_p95", 0.0) or 0.0)
+            robust_pt_p95 = float(fp.net_outflow_p95)
+            raw_cum_p95 = float(getattr(fp, "cumulative_net_outflow_p95", 0.0) or 0.0)
+            applied_buffer = robust_pt_p95 - raw_pt_p95
+
             state = TreasuryState(timestamp=as_of_ts, operational_cash_usd=100_000_000.0, obligations=[])
-            assessment = assess_liquidity_reserve(state, bundle, use_calibrated_net_quantile=True, payout_window_hours=float(h))
-            exp_pol_cov.append(act_cum <= assessment.conservative_net_deficit)
+            assessment = assess_liquidity_reserve(
+                state=state,
+                forecast_bundle=bundle,
+                use_calibrated_net_quantile=True,
+                payout_window_hours=float(h),
+                forecast_horizon_hours=float(h),
+            )
 
-        arr_pt_exp = np.array(exp_pt_cov, dtype=float)
-        arr_cum_exp = np.array(exp_cum_cov, dtype=float)
-        arr_pol_exp = np.array(exp_pol_cov, dtype=float)
+            cons_deficit = float(assessment.conservative_net_deficit)
+            tot_reserve = float(assessment.total_required_reserve)
+            avail_cash = float(state.available_cash)
+            surplus = float(assessment.eligible_investable_surplus)
 
-        expanded_results[h] = {
-            "n": n_exp,
-            "pt_cov": float(np.mean(exp_pt_cov)),
-            "pt_exc": n_exp - sum(exp_pt_cov),
-            "pt_wilson": wilson_score_interval(sum(exp_pt_cov), n_exp),
-            "pt_mbb": moving_block_bootstrap_ci(arr_pt_exp, block_length=max(2, h // 4)),
-            "cum_cov": float(np.mean(exp_cum_cov)),
-            "cum_exc": n_exp - sum(exp_cum_cov),
-            "cum_wilson": wilson_score_interval(sum(exp_cum_cov), n_exp),
-            "cum_mbb": moving_block_bootstrap_ci(arr_cum_exp, block_length=max(2, h // 4)),
-            "pol_cov": float(np.mean(exp_pol_cov)),
-            "pol_exc": n_exp - sum(exp_pol_cov),
-            "pol_wilson": wilson_score_interval(sum(exp_pol_cov), n_exp),
-            "pol_mbb": moving_block_bootstrap_ci(arr_pol_exp, block_length=max(2, h // 4)),
-        }
+            exc_raw_pt = act_pt > raw_pt_p95
+            exc_robust_pt = act_pt > robust_pt_p95
+            exc_raw_cum = act_cum > raw_cum_p95
+            exc_policy = act_cum > cons_deficit
 
-    # Save row-level CSV artifact
-    out_df = pd.DataFrame(row_records)
-    artifact_path = Path("artifacts/reserve_backtest_row_level.csv")
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(artifact_path, index=False)
-    print(f"Saved {len(out_df)} row-level backtest evaluations to: {artifact_path}")
+            expanded_records.append({
+                "forecast_origin_idx": idx,
+                "as_of_timestamp": as_of_ts.isoformat(),
+                "horizon_hours": h,
+                "target_timestamp": (as_of_ts + pd.Timedelta(hours=h)).isoformat(),
+                "actual_point_net_usd": act_pt,
+                "actual_cumulative_net_usd": act_cum,
+                "raw_point_p95_usd": raw_pt_p95,
+                "robust_point_p95_usd": robust_pt_p95,
+                "raw_cumulative_p95_usd": raw_cum_p95,
+                "applied_point_buffer_usd": applied_buffer,
+                "conservative_net_deficit_usd": cons_deficit,
+                "total_required_reserve_usd": tot_reserve,
+                "available_cash_usd": avail_cash,
+                "eligible_surplus_usd": surplus,
+                "exceeded_raw_point": exc_raw_pt,
+                "exceeded_robust_point": exc_robust_pt,
+                "exceeded_raw_cumulative": exc_raw_cum,
+                "exceeded_policy_reserve": exc_policy,
+                "point_reliability_status": fp.point_reliability_status,
+                "cumulative_reliability_status": fp.cumulative_reliability_status,
+                "policy_reliability_status": assessment.policy_reliability_status,
+            })
 
-    # Also copy to system generated brain artifact directory if available
+    # Persist expanded artifact
+    expanded_df = pd.DataFrame(expanded_records)
+    artifact_path_expanded = Path("artifacts/reserve_backtest_daily_expanded.csv")
+    expanded_df.to_csv(artifact_path_expanded, index=False)
+    print(f"Saved {len(expanded_df)} expanded row-level evaluations to: {artifact_path_expanded}")
+
+    # Copy to brain artifact directory if present
     brain_artifact_dir = Path("/Users/paramshah/.gemini/antigravity-ide/brain/4f700b38-a8e5-4609-a671-eefc75b6fe00")
     if brain_artifact_dir.exists():
-        shutil.copy(artifact_path, brain_artifact_dir / "reserve_backtest_row_level.csv")
-        print(f"Copied row-level backtest artifact to: {brain_artifact_dir / 'reserve_backtest_row_level.csv'}")
+        shutil.copy(artifact_path_rolling, brain_artifact_dir / "reserve_backtest_row_level.csv")
+        shutil.copy(artifact_path_expanded, brain_artifact_dir / "reserve_backtest_daily_expanded.csv")
+        print(f"Copied both artifacts to brain directory: {brain_artifact_dir}")
 
     # -------------------------------------------------------------------------
-    # PRINT RESULTS TABLES
+    # AUTOMATED INTEGRITY & RECONCILIATION ASSERTIONS
     # -------------------------------------------------------------------------
-    print("\n" + "=" * 135)
+    # Verify rolling artifact integrity
+    assert len(rolling_df) == 600, f"Expected 600 records, got {len(rolling_df)}"
+    assert len(rolling_df["forecast_origin_idx"].unique()) == 200, "Expected 200 unique origins"
+    assert rolling_df["forecast_origin_idx"].min() == 1000
+    assert rolling_df["forecast_origin_idx"].max() == 1199
+
+    # Verify expanded artifact integrity
+    assert len(expanded_df) == 963, f"Expected 963 records (321 x 3), got {len(expanded_df)}"
+    assert len(expanded_df["forecast_origin_idx"].unique()) == 321, "Expected 321 unique daily origins"
+    assert expanded_df["forecast_origin_idx"].min() == 1000
+    assert expanded_df["forecast_origin_idx"].max() == 8680
+    assert (expanded_df["forecast_origin_idx"] + expanded_df["horizon_hours"]).max() <= 8759, "Horizon breached dataset length"
+
+    # -------------------------------------------------------------------------
+    # PRINT RESULTS TABLES DIRECTLY FROM PERSISTED ARTIFACT DATA
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 145)
     print("TABLE 1: ROLLING-ORIGIN BACKTEST (N=200, Origins 1000..1199, step=1h)")
-    print("=" * 135)
-    print(f"{'Horizon':<8} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Reliability Status'}")
-    print("-" * 135)
+    print("=" * 145)
+    print(f"{'Horizon':<8} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 145)
     for h in horizons:
-        r = summary_results[h]
-        pt_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
-        cum_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
-        pol_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+        sub = rolling_df[rolling_df["horizon_hours"] == h]
+        n_sub = len(sub)
+        
+        # Robust point flow
+        pt_exc = int(sub["exceeded_robust_point"].sum())
+        pt_cov = (n_sub - pt_exc) / n_sub
+        pt_w = wilson_score_interval(n_sub - pt_exc, n_sub)
+        pt_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_robust_point"], dtype=float), block_length=max(2, h // 4))
+        pt_zf = f">={pt_mbb['rule_of_three_bound']*100:.1f}%" if pt_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Point Flow (t+h)':<28} | {pt_cov*100:5.1f}% | {pt_exc:2d}/200 | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
 
-        print(f"{h:2d} Hours  | {'Point Flow (t+h)':<28} | {r['robust_pt_cov']*100:5.1f}% | {r['robust_pt_exc']:2d}/200 | [{r['robust_pt_wilson'][0]*100:.1f}%, {r['robust_pt_wilson'][1]*100:.1f}%]   | {r['robust_pt_mbb']['display']:<26} | {pt_status}")
-        print(f"{h:2d} Hours  | {'Raw Cumulative (t,t+h]':<28} | {r['raw_cum_cov']*100:5.1f}% | {r['raw_cum_exc']:2d}/200 | [{r['raw_cum_wilson'][0]*100:.1f}%, {r['raw_cum_wilson'][1]*100:.1f}%]   | {r['raw_cum_mbb']['display']:<26} | {cum_status}")
-        print(f"{h:2d} Hours  | {'Production Reserve Policy':<28} | {r['policy_cov']*100:5.1f}% | {r['policy_exc']:2d}/200 | [{r['policy_wilson'][0]*100:.1f}%, {r['policy_wilson'][1]*100:.1f}%]   | {r['policy_mbb']['display']:<26} | {pol_status}")
-        print("-" * 135)
+        # Raw cumulative
+        cum_exc = int(sub["exceeded_raw_cumulative"].sum())
+        cum_cov = (n_sub - cum_exc) / n_sub
+        cum_w = wilson_score_interval(n_sub - cum_exc, n_sub)
+        cum_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_raw_cumulative"], dtype=float), block_length=max(2, h // 4))
+        cum_zf = f">={cum_mbb['rule_of_three_bound']*100:.1f}%" if cum_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Raw Cumulative (t,t+h]':<28} | {cum_cov*100:5.1f}% | {cum_exc:2d}/200 | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
 
-    print("\n" + "=" * 135)
-    print("TABLE 2: NON-OVERLAPPING ORIGINS (step=h, independent windows starting at row 1000)")
-    print("=" * 135)
-    print(f"{'Horizon':<8} | {'Windows (N)':<12} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Reliability Status'}")
-    print("-" * 135)
+        # Reserve Policy
+        pol_exc = int(sub["exceeded_policy_reserve"].sum())
+        pol_cov = (n_sub - pol_exc) / n_sub
+        pol_w = wilson_score_interval(n_sub - pol_exc, n_sub)
+        pol_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_policy_reserve"], dtype=float), block_length=max(2, h // 4))
+        pol_zf = f">={pol_mbb['rule_of_three_bound']*100:.1f}%" if pol_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Production Reserve Policy':<28} | {pol_cov*100:5.1f}% | {pol_exc:2d}/200 | [{pol_w[0]*100:.1f}%, {pol_w[1]*100:.1f}%]   | {pol_mbb['display']:<26} | {pol_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        print("-" * 145)
+
+    print("\n" + "=" * 145)
+    print("TABLE 2: NON-OVERLAPPING ORIGINS (step=h)")
+    print("=" * 145)
+    print(f"{'Horizon':<8} | {'Windows (N)':<12} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 145)
     for h in [1, 6, 24, 72]:
         r = non_overlap_results[h]
         nw = r["n_windows"]
-        pt_st = "EMPIRICALLY_VALIDATED" if h == 1 else "CONDITIONALLY_CALIBRATED_FALLBACK"
-        cum_st = "EMPIRICALLY_VALIDATED" if h == 1 else "CONDITIONALLY_CALIBRATED_FALLBACK"
-        pol_st = "EMPIRICALLY_VALIDATED" if h == 1 else "CONDITIONALLY_CALIBRATED_FALLBACK"
+        pt_zf = f">={r['pt_mbb']['rule_of_three_bound']*100:.1f}%" if r["pt_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        cum_zf = f">={r['cum_mbb']['rule_of_three_bound']*100:.1f}%" if r["cum_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        pol_zf = f">={r['policy_mbb']['rule_of_three_bound']*100:.1f}%" if r["policy_mbb"]["is_degenerate"] else "N/A (>0 exc)"
 
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Point Flow (t+h)':<28} | {r['pt_cov']*100:5.1f}% | {r['pt_exc']:2d}/{nw:<3} | [{r['pt_wilson'][0]*100:.1f}%, {r['pt_wilson'][1]*100:.1f}%]   | {r['pt_mbb']['display']:<26} | {pt_st}")
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Raw Cumulative (t,t+h]':<28} | {r['cum_cov']*100:5.1f}% | {r['cum_exc']:2d}/{nw:<3} | [{r['cum_wilson'][0]*100:.1f}%, {r['cum_wilson'][1]*100:.1f}%]   | {r['cum_mbb']['display']:<26} | {cum_st}")
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Production Reserve Policy':<28} | {r['policy_cov']*100:5.1f}% | {r['policy_exc']:2d}/{nw:<3} | [{r['policy_wilson'][0]*100:.1f}%, {r['policy_wilson'][1]*100:.1f}%]   | {r['policy_mbb']['display']:<26} | {pol_st}")
-        print("-" * 135)
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Point Flow (t+h)':<28} | {r['pt_cov']*100:5.1f}% | {r['pt_exc']:2d}/{nw:<3} | [{r['pt_wilson'][0]*100:.1f}%, {r['pt_wilson'][1]*100:.1f}%]   | {r['pt_mbb']['display']:<26} | {pt_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Raw Cumulative (t,t+h]':<28} | {r['cum_cov']*100:5.1f}% | {r['cum_exc']:2d}/{nw:<3} | [{r['cum_wilson'][0]*100:.1f}%, {r['cum_wilson'][1]*100:.1f}%]   | {r['cum_mbb']['display']:<26} | {cum_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Production Reserve Policy':<28} | {r['policy_cov']*100:5.1f}% | {r['policy_exc']:2d}/{nw:<3} | [{r['policy_wilson'][0]*100:.1f}%, {r['policy_wilson'][1]*100:.1f}%]   | {r['policy_mbb']['display']:<26} | {pol_zf:<20} | {r['policy_status']}")
+        print("-" * 145)
 
-    print("\n" + "=" * 135)
-    print("TABLE 3: EXPANDED FULL-HOLDOUT EVALUATION (Daily step=24h, N=320 origins, Rows 1000..8688)")
-    print("=" * 135)
-    print(f"{'Horizon':<8} | {'Origins (N)':<12} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Reliability Status'}")
-    print("-" * 135)
+    print("\n" + "=" * 145)
+    print("TABLE 3: EXPANDED FULL-HOLDOUT EVALUATION (Daily step=24h, N=321 origins: 1000..8680)")
+    print("=" * 145)
+    print(f"{'Horizon':<8} | {'Origins (N)':<12} | {'Target Description':<28} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 145)
     for h in [6, 24, 72]:
-        r = expanded_results[h]
-        print(f"{h:2d} Hours  | N={r['n']:<10} | {'Point Flow (t+h)':<28} | {r['pt_cov']*100:5.1f}% | {r['pt_exc']:2d}/{r['n']:<3} | [{r['pt_wilson'][0]*100:.1f}%, {r['pt_wilson'][1]*100:.1f}%]   | {r['pt_mbb']['display']:<26} | CONDITIONALLY_CALIBRATED_FALLBACK")
-        print(f"{h:2d} Hours  | N={r['n']:<10} | {'Raw Cumulative (t,t+h]':<28} | {r['cum_cov']*100:5.1f}% | {r['cum_exc']:2d}/{r['n']:<3} | [{r['cum_wilson'][0]*100:.1f}%, {r['cum_wilson'][1]*100:.1f}%]   | {r['cum_mbb']['display']:<26} | CONDITIONALLY_CALIBRATED_FALLBACK")
-        print(f"{h:2d} Hours  | N={r['n']:<10} | {'Production Reserve Policy':<28} | {r['pol_cov']*100:5.1f}% | {r['pol_exc']:2d}/{r['n']:<3} | [{r['pol_wilson'][0]*100:.1f}%, {r['pol_wilson'][1]*100:.1f}%]   | {r['pol_mbb']['display']:<26} | CONDITIONALLY_CALIBRATED_FALLBACK")
-        print("-" * 135)
+        sub = expanded_df[expanded_df["horizon_hours"] == h]
+        n_sub = len(sub)
 
-    print("\n" + "=" * 135)
-    print("TABLE 4: BOOTSTRAP BLOCK-LENGTH SENSITIVITY ANALYSIS (Rolling N=200)")
-    print("=" * 135)
-    print(f"{'Horizon':<8} | {'Target':<24} | {'b=1 (i.i.d.)':<18} | {'b=2':<18} | {'b=6':<18} | {'b=12':<18} | {'b=24':<18}")
-    print("-" * 135)
-    for h in [6, 24, 72]:
-        sens = block_sensitivities[h]
-        for tgt_key, tgt_lbl in [("pt", "Point Flow"), ("cum", "Raw Cumulative"), ("pol", "Reserve Policy")]:
-            res = sens[tgt_key]
-            str_b1 = res[1]["display"]
-            str_b2 = res[2]["display"]
-            str_b6 = res[6]["display"]
-            str_b12 = res[12]["display"]
-            str_b24 = res[24]["display"]
-            print(f"{h:2d} Hours  | {tgt_lbl:<24} | {str_b1:<18} | {str_b2:<18} | {str_b6:<18} | {str_b12:<18} | {str_b24:<18}")
-    print("-" * 135)
+        pt_exc = int(sub["exceeded_robust_point"].sum())
+        pt_cov = (n_sub - pt_exc) / n_sub
+        pt_w = wilson_score_interval(n_sub - pt_exc, n_sub)
+        pt_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_robust_point"], dtype=float), block_length=max(2, h // 4))
+        pt_zf = f">={pt_mbb['rule_of_three_bound']*100:.1f}%" if pt_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Point Flow (t+h)':<28} | {pt_cov*100:5.1f}% | {pt_exc:2d}/{n_sub:<3} | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
+
+        cum_exc = int(sub["exceeded_raw_cumulative"].sum())
+        cum_cov = (n_sub - cum_exc) / n_sub
+        cum_w = wilson_score_interval(n_sub - cum_exc, n_sub)
+        cum_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_raw_cumulative"], dtype=float), block_length=max(2, h // 4))
+        cum_zf = f">={cum_mbb['rule_of_three_bound']*100:.1f}%" if cum_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Raw Cumulative (t,t+h]':<28} | {cum_cov*100:5.1f}% | {cum_exc:2d}/{n_sub:<3} | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
+
+        pol_exc = int(sub["exceeded_policy_reserve"].sum())
+        pol_cov = (n_sub - pol_exc) / n_sub
+        pol_w = wilson_score_interval(n_sub - pol_exc, n_sub)
+        pol_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_policy_reserve"], dtype=float), block_length=max(2, h // 4))
+        pol_zf = f">={pol_mbb['rule_of_three_bound']*100:.1f}%" if pol_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Production Reserve Policy':<28} | {pol_cov*100:5.1f}% | {pol_exc:2d}/{n_sub:<3} | [{pol_w[0]*100:.1f}%, {pol_w[1]*100:.1f}%]   | {pol_mbb['display']:<26} | {pol_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        print("-" * 145)
 
     return 0
 
