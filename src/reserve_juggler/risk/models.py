@@ -91,6 +91,7 @@ class ReserveAssessment:
     conservative_net_deficit: float
     maturing_repo_liquidity: float
     uncovered_stress_scenarios: list[str] = field(default_factory=list)
+    policy_reliability_status: str = "CONDITIONALLY_CALIBRATED_FALLBACK"
 
     @property
     def total_required_reserve(self) -> float:
@@ -107,6 +108,7 @@ class ReserveAssessment:
             "conservative_net_deficit": round(self.conservative_net_deficit, 2),
             "maturing_repo_liquidity": round(self.maturing_repo_liquidity, 2),
             "uncovered_stress_scenarios": list(self.uncovered_stress_scenarios),
+            "policy_reliability_status": self.policy_reliability_status,
         }
 
 

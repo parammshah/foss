@@ -209,6 +209,26 @@ def assess_liquidity_reserve(
     if float(state.credit_availability) <= 0.0 and available_cash < immediate_obligations:
         uncovered_scenarios.append("Credit facility exhausted during immediate cash deficit.")
 
+    # Determine policy reliability status from constituent forecast points
+    has_degraded = False
+    has_fallback = False
+    for fp in sorted_points:
+        p_stat = getattr(fp, "point_reliability_status", getattr(fp, "calibration_reliability_status", "EMPIRICALLY_VALIDATED"))
+        c_stat = getattr(fp, "cumulative_reliability_status", p_stat)
+        if p_stat == "DEGRADED" or c_stat == "DEGRADED" or not getattr(fp, "calibration_is_reliable", True):
+            has_degraded = True
+        elif p_stat == "CONDITIONALLY_CALIBRATED_FALLBACK" or c_stat == "CONDITIONALLY_CALIBRATED_FALLBACK":
+            has_fallback = True
+
+    if has_degraded or not sorted_points:
+        policy_rel_status = "DEGRADED"
+    elif has_fallback or any(float(fp.forecast_horizon) > 1.0 for fp in sorted_points):
+        # Multi-hour targets contain uncalibrated cumulative proxies or heuristic volatility buffers
+        policy_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+    else:
+        # Strictly 1h single-period horizon where point and cumulative forecasts are direct unbuffered conformal quantiles
+        policy_rel_status = "EMPIRICALLY_VALIDATED"
+
     return ReserveAssessment(
         protected_capital=protected_capital,
         future_obligation_reserve=future_obligation_reserve,
@@ -218,7 +238,9 @@ def assess_liquidity_reserve(
         conservative_net_deficit=immediate_forecast_deficit + future_obligation_reserve,
         maturing_repo_liquidity=total_maturing_repo_liquidity,
         uncovered_stress_scenarios=uncovered_scenarios,
+        policy_reliability_status=policy_rel_status,
     )
+
 
 
 def evaluate_hard_safety_gates(

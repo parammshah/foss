@@ -404,3 +404,91 @@ def test_adversarial_clustered_large_outflows_reserve_protection():
     assert assessment.eligible_investable_surplus == 0.0
     assert assessment.total_required_reserve >= opening_cash
 
+
+def test_zero_exceedance_does_not_promote_policy_or_horizon_reliability():
+    """Verify that zero observed failures (100% empirical coverage) does NOT promote
+    a multi-hour forecast or reserve policy to EMPIRICALLY_VALIDATED.
+    Reliability certification requires explicit, direct conformal calibration without heuristic multipliers.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    opening_cash = 100_000_000.0
+
+    # 6h point forecast in fallback
+    pt_6h = ForecastPoint(
+        timestamp=(as_of + timedelta(hours=6)).isoformat(),
+        forecast_horizon=6.0,
+        deposit_point_forecast=5_000_000.0,
+        withdrawal_point_forecast=6_000_000.0,
+        deposit_p10=4_000_000.0,
+        deposit_p90=6_000_000.0,
+        withdrawal_p10=5_000_000.0,
+        withdrawal_p90=8_000_000.0,
+        net_outflow_p95=4_000_000.0,
+        cumulative_net_outflow_p95=10_000_000.0,
+        is_cumulative=False,
+        point_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+        cumulative_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+    )
+
+    bundle = ForecastBundle(
+        forecast_id="BUN-6H-FALLBACK",
+        generated_at=as_of.isoformat(),
+        point_forecasts=[pt_6h],
+        is_cumulative=False,
+    )
+
+    state = TreasuryState(
+        timestamp=as_of,
+        operational_cash_usd=opening_cash,
+        obligations=[],
+    )
+
+    assessment = assess_liquidity_reserve(state, bundle, use_calibrated_net_quantile=True)
+
+    # Even though 6h reserve ($10M) easily covers customer outflow of e.g. $1M (0 failures):
+    # Status MUST remain CONDITIONALLY_CALIBRATED_FALLBACK, not EMPIRICALLY_VALIDATED!
+    assert assessment.policy_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert pt_6h.point_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert pt_6h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+
+def test_statistical_intervals_zero_low_nonzero_exceedances():
+    """Verify statistical intervals (Wilson score and Moving Block Bootstrap) under
+    zero, low, and nonzero failure counts. All endpoints must be finite and bounded in [0, 1].
+    """
+    from scripts.audit_reserve_backtest import wilson_score_interval, moving_block_bootstrap_ci
+
+    # 1. Zero failures (k=0 failures out of N=200, i.e. 200 successes)
+    ind_zero = np.ones(200, dtype=float)
+    w_low, w_high = wilson_score_interval(200, 200)
+    assert 0.98 <= w_low <= 0.985
+    assert w_high == 1.0
+
+    mbb_zero = moving_block_bootstrap_ci(ind_zero, block_length=6)
+    assert mbb_zero["is_degenerate"] is True
+    # Rule of Three / Hanley-Jadack exact upper bound on failure: ~3/N = 1.5% -> lower coverage >= 98.5%
+    assert mbb_zero["rule_of_three_bound"] >= 0.985
+    assert mbb_zero["upper"] == 1.0
+    assert 0.0 <= mbb_zero["lower"] <= 1.0
+
+    # 2. Low failures (k=2 failures out of N=100, i.e. 98 successes)
+    ind_low = np.array([1.0] * 98 + [0.0] * 2)
+    w_low, w_high = wilson_score_interval(98, 100)
+    assert 0.92 <= w_low <= 0.94
+    assert 0.99 <= w_high <= 1.0
+
+    mbb_low = moving_block_bootstrap_ci(ind_low, block_length=2)
+    assert mbb_low["is_degenerate"] is False
+    assert 0.90 <= mbb_low["lower"] <= mbb_low["upper"] <= 1.0
+
+    # 3. Nonzero failures (k=38 failures out of N=200, i.e. 162 successes = 81%)
+    ind_nonzero = np.array([1.0] * 162 + [0.0] * 38)
+    w_low, w_high = wilson_score_interval(162, 200)
+    assert 0.74 <= w_low <= 0.76
+    assert 0.85 <= w_high <= 0.87
+
+    mbb_nonzero = moving_block_bootstrap_ci(ind_nonzero, block_length=6)
+    assert mbb_nonzero["is_degenerate"] is False
+    assert 0.65 <= mbb_nonzero["lower"] <= mbb_nonzero["upper"] <= 0.95
+
+
