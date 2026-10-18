@@ -650,6 +650,8 @@ class ForecastPoint(CanonicalBaseModel):
     calibration_sample_size: int = 0
     calibration_is_reliable: bool = True
     calibration_reliability_status: str = "EMPIRICALLY_VALIDATED"
+    point_reliability_status: str = "EMPIRICALLY_VALIDATED"
+    cumulative_reliability_status: str = "CONDITIONALLY_CALIBRATED_FALLBACK"
     calibration_warning: Optional[str] = None
     training_cutoff_timestamp: Optional[datetime] = None
     reliability_tier: str = "HIGH"
@@ -710,6 +712,19 @@ class ForecastPoint(CanonicalBaseModel):
                 if k in data:
                     v = data[k]
                     data[k] = float(v) if v is not None else None
+
+            # Target-specific reliability statuses
+            if "point_reliability_status" not in data:
+                data["point_reliability_status"] = data.get("calibration_reliability_status", "EMPIRICALLY_VALIDATED")
+            if "cumulative_reliability_status" not in data:
+                h_hr = int(data.get("horizon_hours", 1))
+                cal_stat = data.get("calibration_reliability_status", "EMPIRICALLY_VALIDATED")
+                if h_hr == 1 and cal_stat == "EMPIRICALLY_VALIDATED":
+                    data["cumulative_reliability_status"] = "EMPIRICALLY_VALIDATED"
+                elif cal_stat == "DEGRADED":
+                    data["cumulative_reliability_status"] = "DEGRADED"
+                else:
+                    data["cumulative_reliability_status"] = "CONDITIONALLY_CALIBRATED_FALLBACK"
 
         return data
 

@@ -183,13 +183,20 @@ class ORScenarioReconciler:
         cum_net_95 = max(cum_net_95, net_95 * np.sqrt(float(horizon_hours)), net_95)
         cum_net_99 = max(cum_net_base + (z99 * self.net_std * h_factor), cum_net_95 * 1.15)
 
-        # Standardized reliability classification label:
+        # Standardized reliability classification labels:
         if not self.calibration_is_reliable or self.calibration_sample_size < 150:
-            cal_rel_status = "DEGRADED"
+            point_rel_status = "DEGRADED"
+            cum_rel_status = "DEGRADED"
+        elif horizon_hours == 1:
+            point_rel_status = "EMPIRICALLY_VALIDATED"
+            cum_rel_status = "EMPIRICALLY_VALIDATED"
         elif horizon_hours == 6:
-            cal_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+            point_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
+            cum_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
         else:
-            cal_rel_status = "EMPIRICALLY_VALIDATED"
+            point_rel_status = "EMPIRICALLY_VALIDATED"
+            # Cumulative horizons > 1h are analytical proxy heuristics subject to multi-hour serial drift
+            cum_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
 
         return {
             "deposit_p025": float(d025),
@@ -215,6 +222,8 @@ class ORScenarioReconciler:
             "cumulative_net_outflow_p99": float(cum_net_99),
             "calibration_sample_size": self.calibration_sample_size,
             "calibration_is_reliable": self.calibration_is_reliable,
-            "calibration_reliability_status": cal_rel_status,
+            "calibration_reliability_status": point_rel_status,
+            "point_reliability_status": point_rel_status,
+            "cumulative_reliability_status": cum_rel_status,
             "calibration_warning": self.calibration_warning,
         }

@@ -1,6 +1,4 @@
-"""Deterministic regression tests for forecast calibration, undercoverage remediation, and quantile diagnostics."""
-
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,6 +7,14 @@ from reserve_juggler.data import resolve_dataset_path
 from reserve_juggler.data.schema import DEPOSITS_COL, TIMESTAMP_COL, WITHDRAWALS_COL
 from reserve_juggler.forecasting.service import ForecastService
 from reserve_juggler.forecasting.uncertainty import ORScenarioReconciler
+from reserve_juggler.contracts import (
+    ForecastPoint,
+    ForecastBundle,
+    TreasuryState,
+    Obligation,
+    ObligationType,
+)
+from reserve_juggler.risk.liquidity_shield import assess_liquidity_reserve
 
 
 def test_degraded_calibration_detection_when_sample_size_limited():
@@ -161,3 +167,132 @@ def test_non_overlapping_evaluation_and_appropriate_validation_status():
 
         assert validation_status in ("EMPIRICALLY_VALIDATED", "CONDITIONALLY_CALIBRATED_FALLBACK")
         assert validation_status != "CERTIFIED"
+
+
+def test_target_labels_do_not_extend_into_evaluation_period():
+    """Verify that no target label used for estimator training or calibration
+    falls on or after the earliest evaluation origin timestamp.
+    """
+    df = pd.read_csv(resolve_dataset_path())
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+
+    # Supply rows 0..999 to fit()
+    N = 1000
+    val_split_ratio = 0.25
+    train_slice = df.iloc[:N].copy()
+
+    svc = ForecastService()
+    svc.fit(train_slice, horizons=[1, 6, 24, 48, 72], val_split_ratio=val_split_ratio)
+
+    n_val = int(N * val_split_ratio)  # 250
+    n_train = N - n_val                # 750
+
+    earliest_eval_origin_idx = N
+    earliest_eval_origin_ts = df.iloc[earliest_eval_origin_idx][TIMESTAMP_COL]
+
+    for h in [1, 6, 24, 48, 72]:
+        # Estimator training targets
+        est_target_indices = [i + h for i in range(0, n_train - h)]
+        est_latest_target_ts = df.iloc[est_target_indices[-1]][TIMESTAMP_COL]
+
+        # Calibration targets
+        cal_target_indices = [i + h for i in range(n_train, N - h)]
+        cal_latest_target_ts = df.iloc[cal_target_indices[-1]][TIMESTAMP_COL]
+
+        # Verify strict chronological separation: latest targets < earliest eval origin
+        assert est_latest_target_ts < earliest_eval_origin_ts, (
+            f"Horizon {h}h estimator target label ({est_latest_target_ts}) overlaps evaluation ({earliest_eval_origin_ts})"
+        )
+        assert cal_latest_target_ts < earliest_eval_origin_ts, (
+            f"Horizon {h}h calibration target label ({cal_latest_target_ts}) overlaps evaluation ({earliest_eval_origin_ts})"
+        )
+
+
+def test_target_specific_reliability_classification_separation():
+    """Verify that point-forecast validation does NOT automatically certify cumulative reserve forecasts."""
+    df = pd.read_csv(resolve_dataset_path())
+    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
+
+    # Fit with sufficient calibration samples (N_cal >= 150)
+    svc = ForecastService()
+    svc.fit(df.iloc[:1000], horizons=[1, 6, 24, 48, 72], val_split_ratio=0.25)
+
+    as_of = df.iloc[1000][TIMESTAMP_COL]
+    bundle = svc.forecast(as_of)
+
+    # 1h: Both point and cumulative are empirically validated
+    pt_1h = bundle.get_point(1)
+    assert pt_1h.point_reliability_status == "EMPIRICALLY_VALIDATED"
+    assert pt_1h.cumulative_reliability_status == "EMPIRICALLY_VALIDATED"
+
+    # 6h: Point and cumulative are conditionally calibrated fallback (due to diurnal clustering)
+    pt_6h = bundle.get_point(6)
+    assert pt_6h.point_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert pt_6h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+    # 24h: Point is validated (>95% single-hour coverage), BUT cumulative is conditionally calibrated fallback!
+    pt_24h = bundle.get_point(24)
+    assert pt_24h.point_reliability_status == "EMPIRICALLY_VALIDATED"
+    assert pt_24h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert pt_24h.cumulative_reliability_status != pt_24h.point_reliability_status
+
+
+def test_adversarial_clustered_large_outflows_reserve_protection():
+    """Adversarial test: verify that clustered large customer outflows cannot deplete
+    reserves below committed obligations or permit unsafe discretionary deployments.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    opening_cash = 50_000_000.0
+
+    # 5 consecutive hours of extreme customer outflows ($15M withdrawals, $2M deposits = $13M/hr deficit)
+    clustered_points = []
+    for h in range(1, 6):
+        clustered_points.append(
+            ForecastPoint(
+                timestamp=(as_of + timedelta(hours=h)).isoformat(),
+                forecast_horizon=float(h),
+                deposit_point_forecast=2_000_000.0,
+                withdrawal_point_forecast=15_000_000.0,
+                deposit_p10=1_000_000.0,
+                deposit_p90=3_000_000.0,
+                withdrawal_p10=12_000_000.0,
+                withdrawal_p90=18_000_000.0,
+                net_outflow_p95=16_000_000.0,
+                is_cumulative=False,
+            )
+        )
+
+    bundle = ForecastBundle(
+        forecast_id="BUN-ADV-CLUSTER",
+        generated_at=as_of.isoformat(),
+        point_forecasts=clustered_points,
+        is_cumulative=False,
+    )
+
+    # Obligation due at hour 6: $20M
+    obl = Obligation(
+        obligation_id="OBL-ADV-01",
+        timestamp=as_of + timedelta(hours=6),
+        amount_usd=20_000_000.0,
+        obligation_type=ObligationType.CUSTOMER_PAYOUT,
+        is_mandatory=True,
+    )
+
+    state = TreasuryState(
+        timestamp=as_of,
+        operational_cash_usd=opening_cash,
+        obligations=[obl],
+    )
+
+    assessment = assess_liquidity_reserve(state, bundle)
+
+    # Required reserve must cover both committed obligations AND accumulated customer deficit
+    assert assessment.immediate_obligations == 20_000_000.0
+    assert assessment.conservative_net_deficit > 0.0
+    assert assessment.total_required_reserve > assessment.immediate_obligations
+
+    # Because total demand ($20M + $2M buffer + clustered deficit > $50M) exceeds available cash ($50M):
+    # Surplus must be exactly $0.00!
+    assert assessment.eligible_investable_surplus == 0.0
+    assert assessment.total_required_reserve >= opening_cash
+
