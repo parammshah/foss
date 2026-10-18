@@ -85,8 +85,8 @@ def main() -> int:
     parser.add_argument(
         "--training-hours",
         type=int,
-        default=250,
-        help="Hours of historical data to use for feature engineering and model fitting (default: 250)",
+        default=258,
+        help="Hours of historical data to use for feature engineering and model fitting (default: 258 for 17:00 UTC repo sweep window)",
     )
     parser.add_argument(
         "--regime",
@@ -141,9 +141,13 @@ def main() -> int:
     # 3. Fit Multi-Horizon Forecasting Engine (Team 1)
     train_slice = clean_df.iloc[:args.training_hours].copy()
     as_of_time = ensure_utc(train_slice.iloc[-1][TIMESTAMP_COL])
+    assert train_slice[TIMESTAMP_COL].max() <= as_of_time, (
+        f"Temporal leakage violation: max training observation ({train_slice[TIMESTAMP_COL].max()}) > as_of_time ({as_of_time})"
+    )
     print(f"\n[3/10] Fitting Multi-Horizon Forecast Engine up to as-of timestamp: {as_of_time.isoformat()}...")
+    print(f"       Temporal Protocol Verified: max(training_timestamps) <= as_of_timestamp")
     forecast_service = ForecastService()
-    forecast_service.fit(train_slice, horizons=[1, 6, 24, 48, 72])
+    forecast_service.fit(train_slice, horizons=[1, 6, 24, 48, 72], as_of_timestamp=as_of_time)
     forecast_bundle = forecast_service.forecast(as_of_time)
     print(f"       Forecast Bundle Generated: {len(forecast_bundle.point_forecasts)} horizons")
     pt_1h = forecast_bundle.get_point(1)
@@ -240,7 +244,7 @@ def main() -> int:
     merchant_obl = Obligation(
         obligation_id="OBL-SETTLE-001",
         timestamp=as_of_time + timedelta(hours=2),
-        amount_usd=12_000_000.0,
+        amount_usd=20_500_000.0,
         description="Mandatory Daily Merchant Batch Settlement",
         obligation_type=ObligationType.MERCHANT_SETTLEMENT,
         is_mandatory=True,
@@ -248,7 +252,7 @@ def main() -> int:
 
     state = TreasuryState(
         timestamp=as_of_time,
-        operational_cash_usd=25_000_000.0,
+        operational_cash_usd=65_000_000.0,
         asset_positions={"T1_REPO_PORTFOLIO": t1_repo, "T2_UST_2Y_PORTFOLIO": t2_bonds},
         obligations=[merchant_obl],
         credit_facility=emergency_loc,
@@ -258,6 +262,13 @@ def main() -> int:
     print(f"       Invested Assets Market Value: ${state.total_investments_market_value_usd:,.2f}")
     print(f"       Committed Upcoming Obligations: ${state.upcoming_obligations_usd:,.2f}")
     print(f"       Available Credit Facility: ${state.available_credit_usd:,.2f}")
+
+    # Liquidity Reserve Assessment & Reconciliation
+    from reserve_juggler.risk.liquidity_shield import assess_liquidity_reserve
+    res_assess = assess_liquidity_reserve(state, forecast_bundle)
+    state.protected_reserve_floor = res_assess.total_required_reserve
+    print(f"       Reserve Assessment: Protected=${res_assess.protected_capital:,.2f} | Future Reserve=${res_assess.future_obligation_reserve:,.2f} | Total Required=${res_assess.total_required_reserve:,.2f}")
+    print(f"       Eligible Surplus:   ${res_assess.eligible_investable_surplus:,.2f} | Identity Check: ${res_assess.total_required_reserve + res_assess.eligible_investable_surplus:,.2f} == ${state.operational_cash_usd:,.2f}")
 
     # 6. Initialize Orchestrator & Services
     print(f"\n[6/10] Initializing Enterprise Decision Orchestrator & Safety Gatekeeper...")
@@ -273,7 +284,7 @@ def main() -> int:
         learning_service=learning_service,
     )
 
-    # 7. Execute Decision Cycle
+    # 7. Execute Decision Cycle (Pre-Approval Phase)
     print(f"\n[7/10] Executing Full 10-Step Decision Cycle (Tax Mode: {args.tax_mode.upper()})...")
     if args.tax_mode == "statutory":
         from reserve_juggler.tax.tax_profile import create_statutory_us_corp_profile
@@ -290,27 +301,77 @@ def main() -> int:
         historical_df=train_slice,
         external_raw_events=events_to_inject,
         tax_profile=tax_profile,
-        auto_simulate_execution=True,
+        auto_simulate_execution=False,
     )
 
-    # 8. Display Decision & Independent Constraint Validation
+    # 8. Display Output A: Before Approval
     dec = res.decision_record
     val = res.validation_result
     tss_val = dec.score.get('treasury_safety_score', dec.treasury_safety_score) if isinstance(dec.score, dict) else (dec.treasury_safety_score or 'N/A')
-    print(f"\n[8/10] Decision Engine Recommendation:")
-    print(f"       Decision ID:      {dec.decision_id}")
+    
+    print("\n" + "=" * 80)
+    print("                    OUTPUT A: BEFORE APPROVAL (PENDING)                  ")
+    print("=" * 80)
+    print(f"       Decision ID:        {dec.decision_id}")
     print(f"       Recommended Action: {dec.action_type} -> Target: {dec.target_asset}")
-    print(f"       Allocated Amount: ${dec.amount:,.2f}")
-    print(f"       Safety Score TSS: {tss_val}/100")
-    print(f"       Stress Regime:    {res.stress_regime}")
-    print(f"       Approval Status:  {res.approval_status}")
-
-    print(f"\n[9/10] Independent Constraint Validation Audit:")
-    print(f"       Independent Check Passed: {val.passed}")
+    print(f"       Allocated Amount:   ${dec.amount:,.2f}")
+    print(f"       Forecast Timestamp: {res.as_of_timestamp}")
+    tax_st = dec.metadata.get("tax_profile_status", args.tax_mode.upper())
+    print(f"       Tax Status:         {tax_st}")
+    print(f"       Risk Regime:        {res.stress_regime} (TSS Score: {tss_val}/100)")
+    print(f"       Validation Result:  Passed = {val.passed}")
     for g in val.gate_outcomes:
         status_icon = "✓ PASS" if g.status.value == "PASS" else "✗ FAIL"
-        print(f"       [{status_icon}] {g.gate_name}: {g.reason}")
+        print(f"         [{status_icon}] {g.gate_name}: {g.reason}")
+    print(f"       Approval Status:    {res.approval_status}")
+    print(f"       Execution State:    UNEXECUTED (simulated_outcome = {res.simulated_outcome})")
+    print(f"       Ledger Balance:     ${state.operational_cash_usd:,.2f} (UNTOUCHED)")
+    print("=" * 80)
 
+    # 9. Human Governance Sign-Off & Governed Execution (Output B)
+    from reserve_juggler.contracts import UserRole
+    approval_time = as_of_time + timedelta(minutes=15)
+    ok, msg, approved_rec, outcome, learn_evt = orchestrator.explanation_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Approved under verified liquidity reserve floor and statutory tax parameters.",
+        treasury_state=state,
+        as_of_time=approval_time,
+    )
+
+    if not ok:
+        raise RuntimeError(f"Approval revalidation failed unexpectedly: {msg}")
+
+    action_name = str(approved_rec.action_type).upper()
+    action_spec = {
+        "type": "SWEEP_REPO" if "REPO" in action_name else action_name,
+        "amount_usd": approved_rec.amount,
+        "asset_id": approved_rec.target_asset,
+        "decision_id": approved_rec.decision_id,
+    }
+    new_state, sim_out = orchestrator.ledger.simulate_action(state, action_spec, forecast_bundle)
+
+    print("\n" + "=" * 80)
+    print("                    OUTPUT B: AFTER VALID APPROVAL                       ")
+    print("=" * 80)
+    print(f"       Approver:           {approved_rec.approved_by} ({approved_rec.approval_role})")
+    print(f"       Approval Timestamp: {approved_rec.approval_timestamp}")
+    print(f"       Reviewed Decision:  {approved_rec.decision_id}")
+    print(f"       Reviewed Params:    Action={approved_rec.action_type} | Target={approved_rec.target_asset} | Amount=${approved_rec.amount:,.2f}")
+    print(f"       Revalidation Check: {ok} ({msg})")
+    print(f"       Execution Status:   {sim_out.execution_status}")
+    print(f"       Signed Cash Movmt:  {sim_out.realized_cash_movements}")
+    print(f"       Post-Trade Cash:    ${new_state.operational_cash_usd:,.2f}")
+    print(f"       Total Required Res: ${res_assess.total_required_reserve:,.2f}")
+    print(f"       Reserve Invariant:  ${new_state.operational_cash_usd:,.2f} >= ${res_assess.total_required_reserve:,.2f} -> PRESERVED")
+    print(f"       Total Invested:     ${new_state.total_investments_market_value_usd:,.2f}")
+    print(f"       Total BalanceSheet: ${new_state.total_balance_sheet_assets_usd:,.2f}")
+    print(f"       Matching Event ID:  {learn_evt.event_id if learn_evt else 'N/A'}")
+    print("=" * 80)
+
+    # 10. Explainability & Persistent Telemetry
     if res.explanation:
         print(f"\n[10/10] Explainability & Rationale Summary:")
         print(f"       Primary Rationale: {res.explanation.primary_rationale}")

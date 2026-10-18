@@ -28,6 +28,13 @@ class StandardDecisionRecord:
     hard_gate_results: dict[str, Any]
     reason_codes: list[str]
     metadata: dict[str, Any] = field(default_factory=dict)
+    approval_status: Optional[str] = None
+    approved_by: Optional[str] = None
+    approval_role: Optional[str] = None
+    approval_timestamp: Optional[str] = None
+    execution_timestamp: Optional[str] = None
+    forecast_as_of_timestamp: Optional[str] = None
+    override_reason: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert decision record to JSON-serializable dictionary."""
@@ -43,6 +50,13 @@ class StandardDecisionRecord:
             "hard_gate_results": self.hard_gate_results,
             "reason_codes": list(self.reason_codes),
             "metadata": self.metadata,
+            "approval_status": self.approval_status,
+            "approved_by": self.approved_by,
+            "approval_role": self.approval_role,
+            "approval_timestamp": self.approval_timestamp,
+            "execution_timestamp": self.execution_timestamp,
+            "forecast_as_of_timestamp": self.forecast_as_of_timestamp,
+            "override_reason": self.override_reason,
         }
 
     def to_json(self) -> str:
@@ -61,6 +75,11 @@ class StandardDecisionRecord:
             return float(self.selected_action.get("amount") or self.selected_action.get("amount_usd") or 0.0)
         return 0.0
 
+    @amount.setter
+    def amount(self, val: float) -> None:
+        if isinstance(self.selected_action, dict):
+            self.selected_action["amount"] = float(val)
+
     @property
     def action_type(self) -> str:
         if isinstance(self.selected_action, dict):
@@ -70,6 +89,10 @@ class StandardDecisionRecord:
     @property
     def estimated_costs(self) -> dict[str, float]:
         return self.cost_breakdown
+
+    @estimated_costs.setter
+    def estimated_costs(self, val: dict[str, float]) -> None:
+        self.cost_breakdown = val
 
     @property
     def hard_gate_outcomes(self) -> list[Any]:

@@ -88,6 +88,7 @@ class ApprovalStatus(str, Enum):
     PENDING_APPROVAL = "PENDING_APPROVAL"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
     MODIFIED = "MODIFIED"
     CANCELLED = "CANCELLED"
     OVERRIDDEN = "OVERRIDDEN"
@@ -623,6 +624,8 @@ class ForecastPoint(CanonicalBaseModel):
     withdrawal_p975: float = 0.0
     net_outflow_p50: float = 0.0
     net_outflow_p95: float = 0.0
+    net_outflow_calibrated_p95: Optional[float] = None
+    net_outflow_marginal_proxy: Optional[float] = None
     net_outflow_p99: float = 0.0
     cumulative_net_outflow_p95: Optional[float] = None
     cumulative_net_outflow_p99: Optional[float] = None
@@ -632,6 +635,8 @@ class ForecastPoint(CanonicalBaseModel):
     uncertainty_p95: Optional[float] = None
     uncertainty_p99: Optional[float] = None
     calibration_sample_size: int = 0
+    calibration_is_reliable: bool = True
+    calibration_warning: Optional[str] = None
     training_cutoff_timestamp: Optional[datetime] = None
     reliability_tier: str = "HIGH"
     reliability_rationale: str = ""
@@ -879,6 +884,8 @@ class DecisionRecord(CanonicalBaseModel):
     approved_by: Optional[str] = None
     approval_role: Optional[str] = None
     approval_timestamp: Optional[str] = None
+    execution_timestamp: Optional[str] = None
+    forecast_as_of_timestamp: Optional[str] = None
     override_reason: Optional[str] = None
     audit_trail_id: str = ""
     is_synthetic: bool = False

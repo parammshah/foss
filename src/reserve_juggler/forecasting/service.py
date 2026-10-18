@@ -84,12 +84,28 @@ class ForecastService:
         historical_df: pd.DataFrame,
         horizons: Optional[List[int]] = None,
         val_split_ratio: float = 0.2,
+        as_of_timestamp: Optional[datetime] = None,
     ) -> ForecastService:
-        """Fit all models on historical dataset using train/validation split for OR combination."""
+        """Fit all models on historical dataset using train/validation split for OR combination.
+        
+        Strictly enforces that no observation after as_of_timestamp is used in model training,
+        validation, feature engineering, or calibration.
+        """
         df = historical_df.copy()
         if not pd.api.types.is_datetime64_any_dtype(df[TIMESTAMP_COL]):
             df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
         df = df.sort_values(by=TIMESTAMP_COL).reset_index(drop=True)
+
+        if as_of_timestamp is not None:
+            as_of_utc = ensure_utc(as_of_timestamp)
+            df = df[df[TIMESTAMP_COL] <= as_of_utc].copy()
+            if len(df) == 0:
+                raise ValueError(f"Historical dataset contains 0 observations on or before {as_of_utc}.")
+            assert df[TIMESTAMP_COL].max() <= as_of_utc, (
+                f"Temporal leakage detected: max(training_timestamps) ({df[TIMESTAMP_COL].max()}) "
+                f"> as_of_timestamp ({as_of_utc})"
+            )
+
         self._historical_df = df
 
         target_horizons = horizons or DEFAULT_HORIZONS
@@ -175,6 +191,7 @@ class ForecastService:
                     pred_deposits=ens_pred_dep,
                     true_withdrawals=y_wid_val.values,
                     pred_withdrawals=ens_pred_wid,
+                    horizon_hours=h,
                 )
 
             suite.is_fitted = True
@@ -205,6 +222,10 @@ class ForecastService:
         hist_subset = self._historical_df[ts_col <= as_of_utc].copy()
         if len(hist_subset) == 0:
             hist_subset = self._historical_df.iloc[:24].copy()
+        assert hist_subset[TIMESTAMP_COL].max() <= as_of_utc, (
+            f"Temporal leakage detected: max(training_timestamps) ({hist_subset[TIMESTAMP_COL].max()}) "
+            f"> as_of_timestamp ({as_of_utc})"
+        )
 
         # Compute features strictly up to as-of time
         featured_hist = self.feature_engineer.create_features(hist_subset)
@@ -292,10 +313,14 @@ class ForecastService:
                 withdrawal_p975=reconciled["withdrawal_p975"],
                 net_outflow_p50=reconciled["net_outflow_p50"],
                 net_outflow_p95=reconciled["net_outflow_p95"],
+                net_outflow_calibrated_p95=reconciled.get("net_outflow_calibrated_p95"),
+                net_outflow_marginal_proxy=reconciled.get("net_outflow_marginal_proxy"),
                 net_outflow_p99=reconciled["net_outflow_p99"],
                 cumulative_net_outflow_p95=reconciled["cumulative_net_outflow_p95"],
                 cumulative_net_outflow_p99=reconciled["cumulative_net_outflow_p99"],
                 calibration_sample_size=cal_size,
+                calibration_is_reliable=reconciled.get("calibration_is_reliable", True),
+                calibration_warning=reconciled.get("calibration_warning"),
                 training_cutoff_timestamp=as_of_utc,
                 reliability_score=float(rel_score),
                 reliability_tier=rel_tier,

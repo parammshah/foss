@@ -1,0 +1,450 @@
+"""Comprehensive regression tests for approval-state machine, freshness TTL, and ledger reconciliation."""
+
+from datetime import datetime, timedelta, timezone
+import pytest
+
+from reserve_juggler.contracts import (
+    ActionType,
+    ApprovalStatus,
+    AssetPosition,
+    GateStatus,
+    ServiceStatus,
+    TreasuryState,
+    UserRole,
+    ensure_utc,
+)
+from reserve_juggler.decision.models import StandardDecisionRecord
+from reserve_juggler.explainability.service import DecisionExplanationService
+from reserve_juggler.integration.orchestrator import (
+    DecisionOrchestrator,
+    IndependentConstraintValidator,
+    OrchestratedDecisionResult,
+)
+from reserve_juggler.tax.tax_profile import (
+    create_statutory_us_corp_profile,
+    create_synthetic_demo_profile,
+)
+
+
+def _build_test_treasury_state(
+    cash: float = 65_000_000.0,
+    obligations: float = 12_500_000.0,
+    repo_value: float = 20_000_000.0,
+    now: datetime = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc),
+) -> TreasuryState:
+    t1_repo = AssetPosition(
+        asset_id="T1_REPO_PORTFOLIO",
+        asset_class="REPO",
+        market_value_usd=repo_value,
+        unrealized_gain_usd=0.0,
+        holding_period_days=1,
+        is_encumbered=False,
+        annual_yield_or_return=0.0515,
+    )
+    return TreasuryState(
+        timestamp=now,
+        operational_cash_usd=cash,
+        asset_positions={"T1_REPO_PORTFOLIO": t1_repo},
+        upcoming_obligations_usd=obligations,
+        available_credit_usd=25_000_000.0,
+        protected_reserve_floor=25_000_000.0,
+        as_of_timestamp=now,
+    )
+
+
+def test_statutory_decision_requiring_approval_under_policy():
+    """1. A statutory, valid-tax decision requiring approval under configured policy."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    # When auto_simulate_execution=False, policy requires officer approval before commitment
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+
+    assert res.validation_result.passed is True
+    assert res.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res.workflow_state == "EXECUTION_ELIGIBLE"
+    assert res.simulated_outcome is None
+    assert res.decision_record.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res.decision_record.metadata["tax_profile_status"] == "STATUTORY_APPROVED"
+
+
+def test_synthetic_or_missing_tax_mandatory_human_approval():
+    """2. A synthetic or missing tax profile requiring mandatory human approval."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+
+    orch = DecisionOrchestrator()
+    # Missing tax profile
+    res_none = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=None,
+        auto_simulate_execution=True,
+    )
+    assert res_none.validation_result.requires_human_approval is True
+    assert res_none.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res_none.workflow_state == "HUMAN_APPROVAL_PENDING"
+    assert res_none.simulated_outcome is None
+
+    # Synthetic demo profile
+    synth_profile = create_synthetic_demo_profile()
+    res_synth = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=synth_profile,
+        auto_simulate_execution=True,
+    )
+    assert res_synth.validation_result.requires_human_approval is True
+    assert res_synth.approval_status == ApprovalStatus.PENDING_APPROVAL.value
+    assert res_synth.workflow_state == "HUMAN_APPROVAL_PENDING"
+    assert res_synth.simulated_outcome is None
+
+
+def test_unauthorized_actors_rejected():
+    """3. An unauthorized actor cannot approve, override, or exceed limits."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    expl_service = DecisionExplanationService()
+
+    # Case A: Auditor role is strictly read-only
+    ok_aud, msg_aud, _, out_aud, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="External Auditor",
+        actor_role=UserRole.AUDITOR.value,
+        stated_reason="Auditor signoff attempt",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok_aud is False
+    assert "read-only" in msg_aud
+    assert out_aud is None
+
+    # Case B: Treasury Analyst cannot override or cancel
+    ok_an_ov, msg_an_ov, _, _, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="OVERRIDDEN",
+        actor_name="Junior Analyst",
+        actor_role=UserRole.TREASURY_ANALYST.value,
+        stated_reason="Attempting override",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok_an_ov is False
+    assert "TREASURY_ANALYST" in msg_an_ov
+
+    # Case C: Treasury Analyst cannot approve amounts > $10M
+    ok_an_hi, msg_an_hi, _, _, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="MODIFIED",
+        actor_name="Junior Analyst",
+        actor_role=UserRole.TREASURY_ANALYST.value,
+        stated_reason="Increasing to 15M",
+        modified_amount=15_000_000.0,
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok_an_hi is False
+    assert "exceeding $10,000,000" in msg_an_hi
+
+
+def test_denied_or_absent_approval():
+    """4. A denied or absent approval produces zero financial transactions."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    expl_service = DecisionExplanationService()
+
+    # Case A: Explicit rejection by Risk Officer
+    ok_rej, msg_rej, updated_dec, outcome_rej, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="REJECTED",
+        actor_name="Chief Risk Officer",
+        actor_role=UserRole.RISK_OFFICER.value,
+        stated_reason="Market conditions volatile; pausing allocations.",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+    )
+    assert ok_rej is True
+    assert updated_dec.approval_status == ApprovalStatus.REJECTED.value
+    assert outcome_rej is not None
+    assert outcome_rej.realized_amount == 0.0
+    assert outcome_rej.settlement_status == "REJECTED"
+
+
+def test_failed_safety_gate_cannot_be_approved():
+    """5. A decision that failed safety gates cannot be approved for execution."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    # Cash ($5M) < obligations ($15M) -> immediate deficit
+    broken_state = _build_test_treasury_state(cash=5_000_000.0, obligations=15_000_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=broken_state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+
+    assert res.validation_result.passed is False
+    assert res.approval_status == ApprovalStatus.REJECTED.value
+    assert res.workflow_state == "SAFETY_VALIDATION_FAILED"
+
+    expl_service = DecisionExplanationService()
+    ok, msg, _, outcome, _ = expl_service.execute_human_workflow(
+        decision_record=res.decision_record,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Force approval attempt",
+        treasury_state=broken_state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok is False
+    assert "failed mandatory independent safety validation" in msg
+    assert outcome is None
+
+
+def test_approval_parameter_tampering_rejected():
+    """6. An approval with altered action, target, or amount without revalidation is rejected."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+    orig_amt = dec.amount
+
+    expl_service = DecisionExplanationService()
+
+    # Tampering: Attempting standard "APPROVED" while passing modified_amount silently
+    ok_tamper, msg_tamper, _, _, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Normal approval with silent inflation",
+        modified_amount=orig_amt + 5_000_000.0,
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok_tamper is False
+    assert "Parameter tampering detected" in msg_tamper
+
+
+def test_duplicate_approval_or_execution_idempotency():
+    """7. Duplicate execution request cannot create double side effects."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    state.protected_reserve_floor = 25_000_000.0
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    expl_service = DecisionExplanationService()
+
+    # Execution 1: First valid approval
+    ok1, msg1, dec_app, out1, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="First certified approval",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=5),
+    )
+    assert ok1 is True
+    assert dec_app.approval_status == ApprovalStatus.APPROVED.value
+    assert dec_app.execution_timestamp is not None
+
+    # Execution 2: Duplicate request on the same decision record
+    ok2, msg2, _, out2, _ = expl_service.execute_human_workflow(
+        decision_record=dec_app,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Duplicate submission",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+    )
+    assert ok2 is False
+    assert "Duplicate execution request rejected" in msg2
+    assert out2 is None
+
+
+def test_approval_freshness_ttl_rejection():
+    """Demonstrate expired approval rejection using deterministic timestamps."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+
+    expl_service = DecisionExplanationService()
+
+    # Attempt approval 2 hours later (TTL is 3600s = 1h)
+    stale_time = now + timedelta(hours=2)
+    ok_stale, msg_stale, dec_stale, _, ev_stale = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Late approval",
+        treasury_state=state,
+        as_of_time=stale_time,
+        validity_window_seconds=3600.0,
+    )
+    assert ok_stale is False
+    assert "Approval EXPIRED" in msg_stale
+    assert dec_stale.approval_status == ApprovalStatus.EXPIRED.value
+    assert ev_stale is not None
+    assert ev_stale.versioned_event_type == "HUMAN_APPROVAL_EXPIRED"
+
+
+def test_changed_treasury_state_rejection():
+    """Demonstrate that changes in treasury state invalidate pending approvals."""
+    now = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    initial_state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=initial_state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+    assert dec.amount > 0
+
+    # Before approval, cash drains drastically due to unexpected customer outflows
+    degraded_state = _build_test_treasury_state(cash=20_000_000.0, obligations=12_500_000.0, now=now)
+    degraded_state.protected_reserve_floor = 25_000_000.0  # Reserve floor is $25M
+
+    expl_service = DecisionExplanationService()
+    ok, msg, _, _, _ = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Head of Treasury",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Approval under degraded state",
+        treasury_state=degraded_state,
+        as_of_time=now + timedelta(minutes=15),
+    )
+    assert ok is False
+    assert "Mandatory Reserve Floor" in msg
+
+
+def test_canonical_place_repo_ledger_reconciliation():
+    """Verify complete PLACE_REPO workflow: signed cash flow, asset position, reserve preservation."""
+    now = datetime(2026, 1, 11, 17, 0, 0, tzinfo=timezone.utc)
+    state = _build_test_treasury_state(cash=65_000_000.0, obligations=12_500_000.0, now=now)
+    stat_profile = create_statutory_us_corp_profile(entity_id="US_CORP_01", tax_year=2026)
+
+    orch = DecisionOrchestrator()
+    res = orch.run_cycle(
+        current_state=state,
+        as_of_timestamp=now,
+        tax_profile=stat_profile,
+        auto_simulate_execution=False,
+    )
+    dec = res.decision_record
+    assert any(k in str(dec.selected_action).upper() for k in ["REPO", "INVEST", "BUY", "SWEEP"])
+
+    initial_cash = state.operational_cash_usd
+    initial_investments = state.total_investments_market_value_usd
+    action_amt = dec.amount
+    reserve_floor = 25_000_000.0
+    state.protected_reserve_floor = reserve_floor
+
+    # Officer approves the exact recommendation
+    expl_service = DecisionExplanationService()
+    ok, msg, approved_dec, outcome, learn_ev = expl_service.execute_human_workflow(
+        decision_record=dec,
+        action_type="APPROVED",
+        actor_name="Director of Treasury Operations",
+        actor_role=UserRole.HEAD_OF_TREASURY.value,
+        stated_reason="Approved overnight repo investment under protected reserve floor.",
+        treasury_state=state,
+        as_of_time=now + timedelta(minutes=10),
+    )
+    assert ok is True
+    assert approved_dec.approval_status == ApprovalStatus.APPROVED.value
+
+    # Execute approved action on ledger
+    if isinstance(approved_dec.selected_action, dict):
+        action_name = str(approved_dec.selected_action.get("action_type", "")).upper()
+    else:
+        action_name = str(getattr(approved_dec, "action_type", approved_dec.selected_action)).upper()
+    action_spec = {
+        "type": "SWEEP_REPO" if "REPO" in action_name else action_name,
+        "amount_usd": approved_dec.amount,
+        "asset_id": approved_dec.target_asset,
+        "decision_id": approved_dec.decision_id,
+    }
+    new_state, sim_out = orch.ledger.simulate_action(state, action_spec, res.forecast_bundle)
+
+    # 1. Exact signed cash flow applied
+    signed_flow = sum(sim_out.realized_cash_movements.values())
+    expected_cash = initial_cash + signed_flow
+    assert new_state.operational_cash_usd == pytest.approx(expected_cash, abs=1e-2)
+    assert signed_flow <= -action_amt  # At least the principal amount was deducted
+
+    # 2. Asset position increment
+    assert new_state.total_investments_market_value_usd >= initial_investments + action_amt - 1e-2
+
+    # 3. Post-execution cash remains at or above reserve floor
+    assert new_state.operational_cash_usd >= reserve_floor
+
+    # 4. Consistent linking
+    assert sim_out.decision_id == approved_dec.decision_id
+    assert learn_ev.correlation_id == approved_dec.decision_id

@@ -92,10 +92,15 @@ class ReserveAssessment:
     maturing_repo_liquidity: float
     uncovered_stress_scenarios: list[str] = field(default_factory=list)
 
+    @property
+    def total_required_reserve(self) -> float:
+        return self.protected_capital + self.future_obligation_reserve
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "protected_capital": round(self.protected_capital, 2),
             "future_obligation_reserve": round(self.future_obligation_reserve, 2),
+            "total_required_reserve": round(self.total_required_reserve, 2),
             "eligible_investable_surplus": round(self.eligible_investable_surplus, 2),
             "immediate_obligations": round(self.immediate_obligations, 2),
             "operational_safety_buffer": round(self.operational_safety_buffer, 2),

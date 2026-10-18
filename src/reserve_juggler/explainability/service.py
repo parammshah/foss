@@ -22,6 +22,7 @@ from reserve_juggler.contracts import (
     LearningEvent,
     TreasuryState,
     UserRole,
+    ensure_utc,
 )
 from reserve_juggler.explainability.models import (
     AlternativeComparisonEntry,
@@ -34,21 +35,30 @@ from reserve_juggler.explainability.models import (
 logger = logging.getLogger(__name__)
 
 
-def resolve_action_type(action_str: str) -> ActionType:
+def resolve_action_type(action_val: Any) -> ActionType:
     """Resolves arbitrary action strings or enum representations into typed ActionType."""
+    if isinstance(action_val, dict):
+        action_str = str(action_val.get("action_type") or action_val.get("type") or "HOLD_CASH")
+    elif hasattr(action_val, "value"):
+        action_str = str(action_val.value)
+    else:
+        action_str = str(action_val or "HOLD_CASH")
+
     normalized = action_str.upper().strip()
     try:
         return ActionType(normalized)
     except ValueError:
         pass
-    if "CREDIT" in normalized and ("DRAW" in normalized or "BORROW" in normalized):
+    if "PLACE_REPO" in normalized or "SWEEP_REPO" in normalized or ("REPO" in normalized and ("INVEST" in normalized or "BUY" in normalized or "PLACE" in normalized or "SWEEP" in normalized)):
+        return ActionType.INVEST_REPO
+    if "CREDIT" in normalized and ("DRAW" in normalized or "BORROW" in normalized or "BRIDGE" in normalized):
         return ActionType.DRAW_CREDIT
     if "CREDIT" in normalized and "REPAY" in normalized:
         return ActionType.REPAY_CREDIT
-    if "REPO" in normalized and ("DRAW" in normalized or "BREAK" in normalized):
+    if "REPO" in normalized and ("BREAK" in normalized or "LIQUIDATE" in normalized):
+        return ActionType.LIQUIDATE_REPO
+    if "REPO" in normalized and "DRAW" in normalized:
         return ActionType.DRAW_REPO_30D
-    if "REPO" in normalized and ("INVEST" in normalized or "BUY" in normalized):
-        return ActionType.INVEST_REPO
     if "BOND" in normalized and ("INVEST" in normalized or "BUY" in normalized):
         return ActionType.INVEST_BONDS
     if "EQUITY" in normalized and ("INVEST" in normalized or "BUY" in normalized):
@@ -57,7 +67,7 @@ def resolve_action_type(action_str: str) -> ActionType:
         return ActionType.LIQUIDATE_BONDS
     if "EQUITY" in normalized and ("LIQUIDATE" in normalized or "SELL" in normalized or "TRIM" in normalized):
         return ActionType.LIQUIDATE_EQUITIES
-    if "HOLD" in normalized:
+    if "HOLD" in normalized or "KEEP_CASH" in normalized:
         return ActionType.HOLD_CASH
     return ActionType.UNKNOWN
 
@@ -312,13 +322,103 @@ class DecisionExplanationService:
         modified_amount: Optional[float] = None,
         modified_action: Optional[str] = None,
         treasury_state: Optional[TreasuryState] = None,
+        as_of_time: Optional[datetime] = None,
+        validity_window_seconds: float = 3600.0,
     ) -> Tuple[bool, str, DecisionRecord, Optional[ExecutionOutcome], LearningEvent]:
         """
         Processes human approval, rejection, modification, or cancellation with role permissions.
-        Revalidates all modifications against current TreasuryState to prevent reserve breaches.
+        Enforces approval freshness TTL, gate integrity, and live revalidation against TreasuryState.
         Cancelled and rejected actions produce zero phantom transaction outcomes.
         """
-        now_iso = datetime.now(timezone.utc).isoformat()
+        current_dt = ensure_utc(as_of_time) if as_of_time else datetime.now(timezone.utc)
+        now_iso = current_dt.isoformat()
+
+        # Check A: Idempotence & Duplicate Execution Protection
+        if (
+            decision_record.approval_status in (ApprovalStatus.APPROVED.value, ApprovalStatus.EXECUTED.value)
+            and getattr(decision_record, "execution_timestamp", None) is not None
+        ):
+            dup_msg = (
+                f"Duplicate execution request rejected: Decision {decision_record.decision_id} "
+                f"has already been approved and executed at {getattr(decision_record, 'execution_timestamp')}."
+            )
+            logger.warning(dup_msg)
+            return (False, dup_msg, decision_record, None, None)  # type: ignore
+
+        # Check B: Safety Gate Integrity - Cannot approve a recommendation that failed safety validation or expired
+        if decision_record.approval_status in (ApprovalStatus.REJECTED.value, ApprovalStatus.EXPIRED.value):
+            if decision_record.approval_status == ApprovalStatus.EXPIRED.value:
+                fail_msg = (
+                    f"Cannot approve decision {decision_record.decision_id}: Proposal has expired "
+                    "and requires fresh forecast revalidation."
+                )
+            else:
+                fail_msg = (
+                    f"Cannot approve decision {decision_record.decision_id}: Proposal failed mandatory "
+                    "independent safety validation and is marked REJECTED."
+                )
+            logger.warning(fail_msg)
+            return (False, fail_msg, decision_record, None, None)  # type: ignore
+
+        # Check C: Approval Freshness & Time-To-Live (TTL) Enforcement
+        dec_ts = decision_record.timestamp
+        if isinstance(dec_ts, str):
+            try:
+                dec_dt = ensure_utc(datetime.fromisoformat(dec_ts))
+            except Exception:
+                dec_dt = current_dt
+        elif isinstance(dec_ts, datetime):
+            dec_dt = ensure_utc(dec_ts)
+        else:
+            dec_dt = current_dt
+
+        elapsed_seconds = (current_dt - dec_dt).total_seconds()
+        if elapsed_seconds > validity_window_seconds:
+            freshness_msg = (
+                f"Approval EXPIRED: Recommendation was generated at {dec_dt.isoformat()}, "
+                f"which is {elapsed_seconds:,.1f}s ago, exceeding maximum validity window of {validity_window_seconds:,.1f}s. "
+                "Revalidation and fresh recommendation required."
+            )
+            logger.warning(freshness_msg)
+            decision_record.approval_status = ApprovalStatus.EXPIRED.value
+            return (
+                False,
+                freshness_msg,
+                decision_record,
+                None,
+                LearningEvent(
+                    event_id=f"EV-EXPIRED-{decision_record.decision_id}",
+                    versioned_event_type="HUMAN_APPROVAL_EXPIRED",
+                    module="HUMAN_OVERSIGHT",
+                    timestamp=now_iso,
+                    correlation_id=decision_record.decision_id,
+                    payload={
+                        "reason": "Approval TTL expired",
+                        "elapsed_seconds": elapsed_seconds,
+                        "decision_time": dec_dt.isoformat(),
+                        "attempted_approval_time": now_iso,
+                    },
+                ),
+            )
+
+        # Check D: Standard Approval Parameter Tampering Guard
+        if action_type in ("APPROVED", "APPROVE"):
+            if modified_amount is not None and abs(modified_amount - decision_record.amount) > 1e-4:
+                tamper_msg = (
+                    f"Parameter tampering detected: Modified amount (${modified_amount:,.2f}) does not match "
+                    f"recommended amount (${decision_record.amount:,.2f}) on standard approval. "
+                    "Submit with action 'MODIFIED' to revalidate changed parameters."
+                )
+                logger.warning(tamper_msg)
+                return (False, tamper_msg, decision_record, None, None)  # type: ignore
+            if modified_action is not None and modified_action != decision_record.selected_action:
+                tamper_msg = (
+                    f"Parameter tampering detected: Modified action ({modified_action}) does not match "
+                    f"recommended action ({decision_record.selected_action}) on standard approval. "
+                    "Submit with action 'MODIFIED' to revalidate changed parameters."
+                )
+                logger.warning(tamper_msg)
+                return (False, tamper_msg, decision_record, None, None)  # type: ignore
 
         # 1. Role Permissions Backend Enforcement
         if actor_role == UserRole.AUDITOR.value:
@@ -413,7 +513,7 @@ class DecisionExplanationService:
                 is_cash_draw = resolved_act in (ActionType.DRAW_CREDIT, ActionType.DRAW_REPO_30D, ActionType.HOLD_CASH)
                 if not is_cash_draw:
                     projected_cash = treasury_state.available_cash - candidate_amt
-                    if projected_cash < treasury_state.protected_reserve_floor:
+                    if round(projected_cash, 2) < round(treasury_state.protected_reserve_floor, 2):
                         violation_msg = (
                             f"Revalidation FAILED: Proposed modification of ${candidate_amt:,.2f} breaches the "
                             f"Mandatory Reserve Floor (${treasury_state.protected_reserve_floor:,.2f}). Remaining cash would be ${projected_cash:,.2f}."
@@ -526,6 +626,7 @@ class DecisionExplanationService:
         decision_record.approved_by = actor_name
         decision_record.approval_role = actor_role
         decision_record.approval_timestamp = now_iso
+        decision_record.execution_timestamp = now_iso
         decision_record.override_reason = stated_reason if action_type in ("OVERRIDDEN", "MODIFIED") else None
         decision_record.amount = final_amount
         decision_record.selected_action = final_action

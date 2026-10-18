@@ -343,10 +343,10 @@ class TreasuryLedger:
         status = "SUCCESS"
         cash_movements: Dict[str, float] = {}
 
-        if action_type == "HOLD":
+        if action_type in ("HOLD", "HOLD_CASH"):
             status = "SUCCESS"
 
-        elif action_type == "SWEEP_REPO":
+        elif action_type in ("SWEEP_REPO", "PLACE_REPO", "INVEST_REPO"):
             # Invest into overnight repo: minimum available cash required
             if amount_usd > sandbox.cash_usd:
                 status = "REJECTED_INSUFFICIENT_CASH"
@@ -367,7 +367,7 @@ class TreasuryLedger:
                 )
                 cash_movements["sweep_repo"] = -amount_usd
 
-        elif action_type == "BREAK_REPO":
+        elif action_type in ("BREAK_REPO", "LIQUIDATE_REPO"):
             # Early break of repo position before maturity
             target_id = asset_id or next((k for k, v in sandbox.positions.items() if v.tier == AssetTier.TIER_1_REPO), None)
             if not target_id or target_id not in sandbox.positions:
@@ -393,7 +393,7 @@ class TreasuryLedger:
                         "liquidatable_value_usd": remaining_val * (1.0 - pos.early_exit_fee_rate),
                     })
 
-        elif action_type == "BUY_BONDS":
+        elif action_type in ("BUY_BONDS", "BUY_BOND", "INVEST_BONDS"):
             fee = amount_usd * sandbox.config.transaction_cost_rate
             total_cost = amount_usd + fee
             if total_cost > sandbox.cash_usd:
@@ -430,7 +430,7 @@ class TreasuryLedger:
                 cash_movements["buy_bonds"] = -amount_usd
                 cash_movements["transaction_fee"] = -fee
 
-        elif action_type == "SELL_BONDS":
+        elif action_type in ("SELL_BONDS", "SELL_BOND", "LIQUIDATE_BONDS"):
             pos_id = asset_id or "T2_BONDS_PORTFOLIO"
             if pos_id not in sandbox.positions:
                 status = "REJECTED_ASSET_NOT_FOUND"
@@ -458,7 +458,7 @@ class TreasuryLedger:
                         "liquidatable_value_usd": rem_val * (1.0 - pos.liquidation_haircut_rate),
                     })
 
-        elif action_type == "BUY_EQUITIES":
+        elif action_type in ("BUY_EQUITIES", "BUY_EQUITY", "INVEST_EQUITIES"):
             fee = amount_usd * sandbox.config.transaction_cost_rate
             total_cost = amount_usd + fee
             if total_cost > sandbox.cash_usd:

@@ -33,6 +33,7 @@ def assess_liquidity_reserve(
     stress_multiplier: float = 1.0,
     forecast_is_cumulative: bool = False,
     forecast_horizon_hours: float = 72.0,
+    use_calibrated_net_quantile: bool = False,
 ) -> ReserveAssessment:
     """Assess dynamic liquidity reserves and eligible investable surplus.
 
@@ -102,7 +103,12 @@ def assess_liquidity_reserve(
 
     for fp in sorted_points:
         horizon = float(fp.forecast_horizon)
-        pt_deficit = max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10)) * effective_stress
+        if use_calibrated_net_quantile and hasattr(fp, "net_outflow_p95") and fp.net_outflow_p95 is not None:
+            # Directly calibrated net-outflow quantile from out-of-sample empirical residuals
+            pt_deficit = max(0.0, float(fp.net_outflow_p95)) * effective_stress
+        else:
+            # Conservative marginal proxy heuristic bound: max(0, W_P90 - D_P10)
+            pt_deficit = max(0.0, float(fp.withdrawal_p90) - float(fp.deposit_p10)) * effective_stress
 
         if forecast_is_cumulative:
             # Point value already represents cumulative total through this horizon

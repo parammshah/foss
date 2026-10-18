@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import pandas as pd
 
 from reserve_juggler.contracts import (
     ActionType,
@@ -95,11 +96,15 @@ class IndependentConstraintValidator:
         available_cash = max(0.0, state.operational_cash_usd)
 
         # Discretionary investments cannot consume cash committed to obligations
-        proposed_action = getattr(proposal, "selected_action", "HOLD_CASH")
+        sel_act = getattr(proposal, "selected_action", "HOLD_CASH")
+        if isinstance(sel_act, dict):
+            proposed_action = str(sel_act.get("action_type", "HOLD_CASH"))
+        else:
+            proposed_action = str(sel_act)
         proposed_amount = float(getattr(proposal, "amount", 0.0) or 0.0)
 
         is_investment = any(
-            k in str(proposed_action).upper()
+            k in proposed_action.upper()
             for k in ["BUY", "INVEST", "SWEEP", "PLACE_REPO"]
         )
 
@@ -146,14 +151,58 @@ class IndependentConstraintValidator:
                         reason="Customer obligations safely covered by post-investment cash.",
                     )
                 )
+        # Gate 1B: Total Required Reserve Gate (Protected Capital + Future Obligation Reserve)
+        reserve_info = getattr(proposal, "reserve", {})
+        if isinstance(reserve_info, dict):
+            prot_cap = float(reserve_info.get("protected_capital", 0.0) or 0.0)
+            fut_res = float(reserve_info.get("future_obligation_reserve", 0.0) or 0.0)
+            total_req_reserve = float(reserve_info.get("total_required_reserve") or (prot_cap + fut_res))
+        elif isinstance(reserve_info, (int, float)):
+            prot_cap = float(reserve_info)
+            fut_res = 0.0
+            total_req_reserve = prot_cap
+        else:
+            prot_cap = committed_obligations
+            fut_res = 0.0
+            total_req_reserve = committed_obligations
+
+        if is_investment:
+            cash_after_investment = available_cash - proposed_amount
+            if total_req_reserve > 0 and cash_after_investment < total_req_reserve - 1e-4:
+                res_deficit = total_req_reserve - cash_after_investment
+                shortfall = max(shortfall, res_deficit)
+                reasons.append(
+                    f"Discretionary investment ${proposed_amount:,.2f} breaches total required reserve floor "
+                    f"(${total_req_reserve:,.2f} = protected ${prot_cap:,.2f} + future reserve ${fut_res:,.2f}): "
+                    f"Remaining operating cash (${cash_after_investment:,.2f}) leaves shortfall of ${res_deficit:,.2f}."
+                )
+                gates.append(
+                    HardGateOutcome(
+                        gate_name="TotalRequiredReserveGate",
+                        status=GateStatus.FAIL,
+                        threshold_value=total_req_reserve,
+                        observed_value=cash_after_investment,
+                        reason=f"Discretionary investment breaches total required reserve floor by ${res_deficit:,.2f}.",
+                    )
+                )
+            else:
+                gates.append(
+                    HardGateOutcome(
+                        gate_name="TotalRequiredReserveGate",
+                        status=GateStatus.PASS,
+                        threshold_value=total_req_reserve,
+                        observed_value=cash_after_investment,
+                        reason="Total required reserve safely preserved in cleared operating cash post-investment.",
+                    )
+                )
         else:
             gates.append(
                 HardGateOutcome(
-                    gate_name="CustomerObligationsProtectionGate",
+                    gate_name="TotalRequiredReserveGate",
                     status=GateStatus.PASS,
-                    threshold_value=committed_obligations,
+                    threshold_value=total_req_reserve,
                     observed_value=available_cash,
-                    reason="No discretionary cash reduction proposed and obligations covered.",
+                    reason="Operating cash preserves total required reserve.",
                 )
             )
 
@@ -212,7 +261,7 @@ class IndependentConstraintValidator:
                 )
 
         # Gate 5: Credit Line Committed Capacity
-        if "CREDIT" in str(proposed_action).upper():
+        if any(k in str(proposed_action).upper() for k in ["DRAW_CREDIT", "DRAW_BRIDGE_CREDIT", "BORROW_CREDIT"]):
             avail_credit = state.available_credit_usd
             if proposed_amount > avail_credit:
                 reasons.append(
@@ -291,6 +340,10 @@ class OrchestratedDecisionResult:
     simulated_outcome: Optional[ExecutionOutcome]
     audit_event: LearningEvent
     approval_status: str
+    workflow_state: str = "RECOMMENDATION_GENERATED"
+    decision_timestamp: Optional[str] = None
+    forecast_as_of_timestamp: Optional[str] = None
+    execution_timestamp: Optional[str] = None
     model_versions: Dict[str, str] = field(default_factory=dict)
 
 
@@ -343,6 +396,16 @@ class DecisionOrchestrator:
         dq_report: Optional[Dict[str, Any]] = None
         data_quality_warnings: List[str] = []
         if historical_df is not None:
+            # Enforce zero lookahead leakage on training data
+            from reserve_juggler.data.schema import TIMESTAMP_COL
+            if TIMESTAMP_COL in historical_df.columns:
+                hist_ts = pd.to_datetime(historical_df[TIMESTAMP_COL], utc=True)
+                max_training_ts = hist_ts.max()
+                assert max_training_ts <= now_utc, (
+                    f"Temporal leakage detected: max(training_timestamps) ({max_training_ts}) "
+                    f"> as_of_timestamp ({now_utc})"
+                )
+
             val_rep = self.validator.validate(historical_df)
             errs = [i for i in val_rep.issues if i.severity == "ERROR"]
             warns = [i for i in val_rep.issues if i.severity == "WARNING"]
@@ -405,15 +468,29 @@ class DecisionOrchestrator:
         )
 
         # Step 7: Apply approval and execution policies
+        dec_ts_str = (
+            decision_record.timestamp.isoformat()
+            if hasattr(decision_record.timestamp, "isoformat")
+            else str(decision_record.timestamp)
+        )
+        setattr(decision_record, "forecast_as_of_timestamp", now_iso)
+
         if not val_result.passed:
             approval_status = ApprovalStatus.REJECTED.value
+            workflow_state = "SAFETY_VALIDATION_FAILED"
             decision_record.approval_status = approval_status
             decision_record.reason_codes.extend(val_result.rejection_reasons)
         elif val_result.requires_human_approval:
             approval_status = ApprovalStatus.PENDING_APPROVAL.value
+            workflow_state = "HUMAN_APPROVAL_PENDING"
             decision_record.approval_status = approval_status
         else:
-            approval_status = ApprovalStatus.APPROVED.value
+            if auto_simulate_execution:
+                approval_status = ApprovalStatus.APPROVED.value
+                workflow_state = "EXECUTION_ELIGIBLE"
+            else:
+                approval_status = ApprovalStatus.PENDING_APPROVAL.value
+                workflow_state = "EXECUTION_ELIGIBLE"
             decision_record.approval_status = approval_status
 
         # Step 8: Return a unified, explainable decision
@@ -429,6 +506,7 @@ class DecisionOrchestrator:
 
         # Step 9: Simulate financial execution outcome if approved
         simulated_outcome: Optional[ExecutionOutcome] = None
+        exec_ts: Optional[str] = None
         if auto_simulate_execution and approval_status == ApprovalStatus.APPROVED.value:
             try:
                 action_name = str(getattr(decision_record, "action_type", decision_record.selected_action)).upper()
@@ -440,8 +518,17 @@ class DecisionOrchestrator:
                 }
                 new_state, sim_out = self.ledger.simulate_action(current_state, action_spec, forecast_bundle)
                 simulated_outcome = sim_out
+                exec_ts = now_iso
+                if sim_out.execution_status == "SETTLED" or sim_out.settlement_status == "SETTLED":
+                    approval_status = ApprovalStatus.EXECUTED.value
+                    decision_record.approval_status = approval_status
+                    decision_record.execution_timestamp = now_iso
+                    workflow_state = "SIMULATED_EXECUTION_COMPLETED"
+                else:
+                    workflow_state = "SIMULATED_EXECUTION_REJECTED"
             except Exception as e:
                 logger.warning("Simulation execution failed: %s", e)
+                workflow_state = "SIMULATED_EXECUTION_REJECTED"
 
         # Step 10: Record decision, audit trail, and telemetry into system-wide self-learning
         audit_event = LearningEvent(
@@ -460,6 +547,7 @@ class DecisionOrchestrator:
                 "validation_passed": val_result.passed,
                 "rejection_reasons": val_result.rejection_reasons,
                 "approval_status": approval_status,
+                "workflow_state": workflow_state,
                 "shortfall_usd": val_result.shortfall_amount_usd,
             },
             associated_versions={
@@ -486,6 +574,10 @@ class DecisionOrchestrator:
             simulated_outcome=simulated_outcome,
             audit_event=audit_event,
             approval_status=approval_status,
+            workflow_state=workflow_state,
+            decision_timestamp=dec_ts_str,
+            forecast_as_of_timestamp=now_iso,
+            execution_timestamp=exec_ts,
             model_versions={
                 "orchestrator": self.ORCHESTRATOR_VERSION,
                 "forecasting": getattr(self.forecast_service, "model_version", "1.0.0"),
