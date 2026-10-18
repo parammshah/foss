@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Auditable evaluation script reproducing row-level reserve backtest results and statistical intervals.
+"""Auditable evaluation script reproducing row-level reserve backtest results,
+peak-outflow coverage, actual decision paths, and moving-block-bootstrap statistical intervals.
 
 Outputs:
 1. artifacts/reserve_backtest_row_level.csv (600 rows: 200 rolling origins x 3 horizons)
@@ -11,7 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -21,6 +22,8 @@ from reserve_juggler.data.schema import DEPOSITS_COL, TIMESTAMP_COL, WITHDRAWALS
 from reserve_juggler.forecasting.service import ForecastService
 from reserve_juggler.risk.liquidity_shield import assess_liquidity_reserve
 from reserve_juggler.contracts import TreasuryState
+from reserve_juggler.decision.service import TreasuryDecisionService
+from reserve_juggler.tax.tax_profile import create_statutory_us_corp_profile
 
 
 def wilson_score_interval(k: int, n: int, confidence: float = 0.95) -> tuple[float, float]:
@@ -123,11 +126,11 @@ def main() -> int:
     with open(dataset_path, "rb") as f:
         file_hash = hashlib.sha256(f.read()).hexdigest()
 
-    print("=" * 145)
+    print("=" * 155)
     print("RESERVE JUGGLER AUDITABLE BACKTEST — DATASET INTEGRITY & PROVENANCE")
     print(f"Dataset Path : {dataset_path}")
     print(f"SHA-256 Hash : {file_hash}")
-    print("=" * 145)
+    print("=" * 155)
 
     df = pd.read_csv(dataset_path)
     df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], utc=True)
@@ -147,6 +150,8 @@ def main() -> int:
 
     # Baseline operational cash for canonical execution simulation
     INITIAL_OP_CASH = 65_000_000.0
+    dec_svc = TreasuryDecisionService()
+    tax_prof = create_statutory_us_corp_profile()
 
     # -------------------------------------------------------------------------
     # PART A: ROLLING-ORIGIN BACKTEST (N=200, origins 1000..1199, step=1h)
@@ -172,7 +177,9 @@ def main() -> int:
             fp = bundle.get_point(h)
 
             act_pt = float(df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL])
-            act_cum = float((df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).sum())
+            cum_series = (df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).cumsum()
+            realized_terminal_flow = float(cum_series.iloc[-1])
+            realized_peak_flow = float(cum_series.max())
 
             raw_pt_p95 = float(getattr(fp, "net_outflow_calibrated_p95", 0.0) or 0.0)
             robust_pt_p95 = float(fp.net_outflow_p95)
@@ -211,25 +218,43 @@ def main() -> int:
             canon_tot_reserve = float(assessment_canon.total_required_reserve)
             canon_surplus = float(assessment_canon.eligible_investable_surplus)
 
-            # 3. Operational decision & asset availability cash path simulation (15h sweep repo)
-            sweep_amount = canon_surplus
-            post_sweep_cash = INITIAL_OP_CASH - sweep_amount  # min(INITIAL_OP_CASH, canon_tot_reserve)
+            # 3. Actual Decision Logic Invocation (in simulation mode)
+            actual_rec = dec_svc.decide(state_canon, bundle, tax_profile=tax_prof)
+            actual_action = actual_rec.action_type.value if hasattr(actual_rec.action_type, "value") else str(actual_rec.action_type)
+            actual_amount = float(getattr(actual_rec, "amount", 0.0) or 0.0)
+            actual_post_cash = INITIAL_OP_CASH - (actual_amount if actual_action == "PLACE_REPO" else 0.0)
 
-            cum_series = (df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).cumsum()
-            lockup_draw = float(cum_series.iloc[:min(15, len(cum_series))].max())
-            lockup_shortfall = lockup_draw > post_sweep_cash
+            # Path-wise cash simulation under Actual Decision
+            actual_shortfall = False
+            for tau in range(1, h + 1):
+                c_tau = float(cum_series.iloc[tau - 1])
+                avail_act = (actual_post_cash if tau <= 15 else INITIAL_OP_CASH) if actual_action == "PLACE_REPO" else (INITIAL_OP_CASH - c_tau)
+                if (avail_act if actual_action != "PLACE_REPO" else (avail_act - c_tau)) < 0:
+                    actual_shortfall = True
+                    break
 
-            if len(cum_series) <= 15:
-                cash_shortfall = lockup_shortfall
-            else:
-                post_mat_draw = float(cum_series.iloc[15:].max())
-                cash_shortfall = lockup_shortfall or (post_mat_draw > INITIAL_OP_CASH)
+            # 4. Counterfactual Scenario (assuming 100% of eligible surplus is placed into 15h repo)
+            counterfactual_sweep = canon_surplus
+            post_sweep_cash = INITIAL_OP_CASH - counterfactual_sweep
 
-            exc_raw_pt = act_pt > raw_pt_p95
-            exc_robust_pt = act_pt > robust_pt_p95
-            exc_raw_cum = act_cum > raw_cum_p95
-            exc_comp_policy = act_cum > comp_cons_deficit
-            exc_canon_reserve = act_cum > canon_tot_reserve
+            first_shortfall_ts = ""
+            lockup_shortfall = False
+            counterfactual_shortfall = False
+
+            for tau in range(1, h + 1):
+                c_tau = float(cum_series.iloc[tau - 1])
+                avail_c = (post_sweep_cash if tau <= 15 else INITIAL_OP_CASH) - c_tau
+                if avail_c < 0:
+                    if not first_shortfall_ts:
+                        first_shortfall_ts = df.iloc[idx + tau][TIMESTAMP_COL].isoformat()
+                    if tau <= 15:
+                        lockup_shortfall = True
+                    counterfactual_shortfall = True
+
+            comp_term_exc = realized_terminal_flow > comp_cons_deficit
+            comp_peak_exc = realized_peak_flow > comp_cons_deficit
+            canon_term_exc = realized_terminal_flow > canon_tot_reserve
+            canon_peak_exc = realized_peak_flow > canon_tot_reserve
 
             rolling_records.append({
                 "forecast_origin_idx": idx,
@@ -237,7 +262,8 @@ def main() -> int:
                 "horizon_hours": h,
                 "target_timestamp": (as_of_ts + pd.Timedelta(hours=h)).isoformat(),
                 "actual_point_net_usd": act_pt,
-                "actual_cumulative_net_usd": act_cum,
+                "realized_terminal_cumulative_net_outflow": realized_terminal_flow,
+                "realized_peak_cumulative_net_outflow": realized_peak_flow,
                 "raw_point_p95_usd": raw_pt_p95,
                 "robust_point_p95_usd": robust_pt_p95,
                 "raw_cumulative_p95_usd": raw_cum_p95,
@@ -247,13 +273,24 @@ def main() -> int:
                 "canonical_required_reserve_usd": canon_tot_reserve,
                 "canonical_eligible_surplus_usd": canon_surplus,
                 "post_sweep_cleared_cash_usd": post_sweep_cash,
-                "exceeded_raw_point": exc_raw_pt,
-                "exceeded_robust_point": exc_robust_pt,
-                "exceeded_raw_cumulative": exc_raw_cum,
-                "exceeded_component_reserve": exc_comp_policy,
-                "exceeded_canonical_reserve": exc_canon_reserve,
-                "lockup_shortfall_15h": lockup_shortfall,
-                "cash_shortfall_post_sweep": cash_shortfall,
+                "actual_decision_action": actual_action,
+                "actual_decision_amount_usd": actual_amount,
+                "actual_post_decision_cash_usd": actual_post_cash,
+                "actual_decision_cash_shortfall": actual_shortfall,
+                "counterfactual_cash_shortfall": counterfactual_shortfall,
+                "counterfactual_lockup_shortfall_15h": lockup_shortfall,
+                "cash_shortfall_timestamps": first_shortfall_ts,
+                "reserve_vs_terminal_exceeded": canon_term_exc,
+                "reserve_vs_peak_exceeded": canon_peak_exc,
+                "canonical_reserve_vs_terminal_exceeded": canon_term_exc,
+                "canonical_reserve_vs_peak_exceeded": canon_peak_exc,
+                "component_reserve_vs_terminal_exceeded": comp_term_exc,
+                "component_reserve_vs_peak_exceeded": comp_peak_exc,
+                "exceeded_raw_point": act_pt > raw_pt_p95,
+                "exceeded_robust_point": act_pt > robust_pt_p95,
+                "exceeded_raw_cumulative": realized_terminal_flow > raw_cum_p95,
+                "exceeded_component_reserve": comp_term_exc,
+                "exceeded_canonical_reserve": canon_term_exc,
                 "point_reliability_status": fp.point_reliability_status,
                 "cumulative_reliability_status": fp.cumulative_reliability_status,
                 "policy_reliability_status": assessment_comp.policy_reliability_status,
@@ -273,8 +310,10 @@ def main() -> int:
     for h in [1, 6, 24, 72]:
         pt_cov = []
         cum_cov = []
-        comp_cov = []
-        canon_cov = []
+        comp_term_cov = []
+        comp_peak_cov = []
+        canon_term_cov = []
+        canon_peak_cov = []
         origins_used = []
         idx = N_FIT
 
@@ -285,10 +324,12 @@ def main() -> int:
             fp = bundle.get_point(h)
 
             act_pt = float(df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL])
-            act_cum = float((df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).sum())
+            cum_series = (df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).cumsum()
+            term_flow = float(cum_series.iloc[-1])
+            peak_flow = float(cum_series.max())
 
             pt_cov.append(act_pt <= fp.net_outflow_p95)
-            cum_cov.append(act_cum <= getattr(fp, "cumulative_net_outflow_p95", 0.0))
+            cum_cov.append(term_flow <= getattr(fp, "cumulative_net_outflow_p95", 0.0))
 
             # Isolated component reserve
             state_comp = TreasuryState(timestamp=as_of_ts, operational_cash_usd=100_000_000.0, obligations=[])
@@ -299,7 +340,8 @@ def main() -> int:
                 payout_window_hours=float(h),
                 forecast_horizon_hours=float(h),
             )
-            comp_cov.append(act_cum <= assess_comp.conservative_net_deficit)
+            comp_term_cov.append(term_flow <= assess_comp.conservative_net_deficit)
+            comp_peak_cov.append(peak_flow <= assess_comp.conservative_net_deficit)
 
             # Canonical production reserve
             state_canon = TreasuryState(timestamp=as_of_ts, operational_cash_usd=INITIAL_OP_CASH, obligations=[])
@@ -310,7 +352,8 @@ def main() -> int:
                 payout_window_hours=1.0,
                 forecast_horizon_hours=72.0,
             )
-            canon_cov.append(act_cum <= assess_canon.total_required_reserve)
+            canon_term_cov.append(term_flow <= assess_canon.total_required_reserve)
+            canon_peak_cov.append(peak_flow <= assess_canon.total_required_reserve)
 
             idx += h
             if h <= 24 and len(origins_used) >= 100:
@@ -319,10 +362,11 @@ def main() -> int:
         n_w = len(origins_used)
         arr_pt_no = np.array(pt_cov, dtype=float)
         arr_cum_no = np.array(cum_cov, dtype=float)
-        arr_comp_no = np.array(comp_cov, dtype=float)
-        arr_canon_no = np.array(canon_cov, dtype=float)
+        arr_comp_term = np.array(comp_term_cov, dtype=float)
+        arr_comp_peak = np.array(comp_peak_cov, dtype=float)
+        arr_canon_term = np.array(canon_term_cov, dtype=float)
+        arr_canon_peak = np.array(canon_peak_cov, dtype=float)
 
-        # For non-overlapping windows, block length 1 obs is the standard baseline
         non_overlap_results[h] = {
             "n_windows": n_w,
             "first_origin": origins_used[0],
@@ -338,14 +382,22 @@ def main() -> int:
             "cum_exc": n_w - sum(cum_cov),
             "cum_wilson": wilson_score_interval(sum(cum_cov), n_w),
             "cum_mbb": moving_block_bootstrap_ci(arr_cum_no, block_length=1),
-            "comp_cov": float(np.mean(comp_cov)),
-            "comp_exc": n_w - sum(comp_cov),
-            "comp_wilson": wilson_score_interval(sum(comp_cov), n_w),
-            "comp_mbb": moving_block_bootstrap_ci(arr_comp_no, block_length=1),
-            "canon_cov": float(np.mean(canon_cov)),
-            "canon_exc": n_w - sum(canon_cov),
-            "canon_wilson": wilson_score_interval(sum(canon_cov), n_w),
-            "canon_mbb": moving_block_bootstrap_ci(arr_canon_no, block_length=1),
+            "comp_term_cov": float(np.mean(comp_term_cov)),
+            "comp_term_exc": n_w - sum(comp_term_cov),
+            "comp_term_wilson": wilson_score_interval(sum(comp_term_cov), n_w),
+            "comp_term_mbb": moving_block_bootstrap_ci(arr_comp_term, block_length=1),
+            "comp_peak_cov": float(np.mean(comp_peak_cov)),
+            "comp_peak_exc": n_w - sum(comp_peak_cov),
+            "comp_peak_wilson": wilson_score_interval(sum(comp_peak_cov), n_w),
+            "comp_peak_mbb": moving_block_bootstrap_ci(arr_comp_peak, block_length=1),
+            "canon_term_cov": float(np.mean(canon_term_cov)),
+            "canon_term_exc": n_w - sum(canon_term_cov),
+            "canon_term_wilson": wilson_score_interval(sum(canon_term_cov), n_w),
+            "canon_term_mbb": moving_block_bootstrap_ci(arr_canon_term, block_length=1),
+            "canon_peak_cov": float(np.mean(canon_peak_cov)),
+            "canon_peak_exc": n_w - sum(canon_peak_cov),
+            "canon_peak_wilson": wilson_score_interval(sum(canon_peak_cov), n_w),
+            "canon_peak_mbb": moving_block_bootstrap_ci(arr_canon_peak, block_length=1),
             "policy_status": "CONDITIONALLY_CALIBRATED_FALLBACK",
         }
 
@@ -362,7 +414,9 @@ def main() -> int:
             fp = bundle.get_point(h)
 
             act_pt = float(df.iloc[idx + h][WITHDRAWALS_COL] - df.iloc[idx + h][DEPOSITS_COL])
-            act_cum = float((df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).sum())
+            cum_series = (df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).cumsum()
+            realized_terminal_flow = float(cum_series.iloc[-1])
+            realized_peak_flow = float(cum_series.max())
 
             raw_pt_p95 = float(getattr(fp, "net_outflow_calibrated_p95", 0.0) or 0.0)
             robust_pt_p95 = float(fp.net_outflow_p95)
@@ -393,25 +447,42 @@ def main() -> int:
             canon_tot_reserve = float(assess_canon.total_required_reserve)
             canon_surplus = float(assess_canon.eligible_investable_surplus)
 
-            # 3. Operational decision & cash path simulation
-            sweep_amount = canon_surplus
-            post_sweep_cash = INITIAL_OP_CASH - sweep_amount
+            # 3. Actual Decision Logic Invocation (in simulation mode)
+            actual_rec = dec_svc.decide(state_canon, bundle, tax_profile=tax_prof)
+            actual_action = actual_rec.action_type.value if hasattr(actual_rec.action_type, "value") else str(actual_rec.action_type)
+            actual_amount = float(getattr(actual_rec, "amount", 0.0) or 0.0)
+            actual_post_cash = INITIAL_OP_CASH - (actual_amount if actual_action == "PLACE_REPO" else 0.0)
 
-            cum_series = (df.iloc[idx + 1 : idx + h + 1][WITHDRAWALS_COL] - df.iloc[idx + 1 : idx + h + 1][DEPOSITS_COL]).cumsum()
-            lockup_draw = float(cum_series.iloc[:min(15, len(cum_series))].max())
-            lockup_shortfall = lockup_draw > post_sweep_cash
+            actual_shortfall = False
+            for tau in range(1, h + 1):
+                c_tau = float(cum_series.iloc[tau - 1])
+                avail_act = (actual_post_cash if tau <= 15 else INITIAL_OP_CASH) if actual_action == "PLACE_REPO" else (INITIAL_OP_CASH - c_tau)
+                if (avail_act if actual_action != "PLACE_REPO" else (avail_act - c_tau)) < 0:
+                    actual_shortfall = True
+                    break
 
-            if len(cum_series) <= 15:
-                cash_shortfall = lockup_shortfall
-            else:
-                post_mat_draw = float(cum_series.iloc[15:].max())
-                cash_shortfall = lockup_shortfall or (post_mat_draw > INITIAL_OP_CASH)
+            # 4. Counterfactual Scenario (assuming 100% surplus is swept into 15h repo)
+            counterfactual_sweep = canon_surplus
+            post_sweep_cash = INITIAL_OP_CASH - counterfactual_sweep
 
-            exc_raw_pt = act_pt > raw_pt_p95
-            exc_robust_pt = act_pt > robust_pt_p95
-            exc_raw_cum = act_cum > raw_cum_p95
-            exc_comp_policy = act_cum > comp_cons_deficit
-            exc_canon_reserve = act_cum > canon_tot_reserve
+            first_shortfall_ts = ""
+            lockup_shortfall = False
+            counterfactual_shortfall = False
+
+            for tau in range(1, h + 1):
+                c_tau = float(cum_series.iloc[tau - 1])
+                avail_c = (post_sweep_cash if tau <= 15 else INITIAL_OP_CASH) - c_tau
+                if avail_c < 0:
+                    if not first_shortfall_ts:
+                        first_shortfall_ts = df.iloc[idx + tau][TIMESTAMP_COL].isoformat()
+                    if tau <= 15:
+                        lockup_shortfall = True
+                    counterfactual_shortfall = True
+
+            comp_term_exc = realized_terminal_flow > comp_cons_deficit
+            comp_peak_exc = realized_peak_flow > comp_cons_deficit
+            canon_term_exc = realized_terminal_flow > canon_tot_reserve
+            canon_peak_exc = realized_peak_flow > canon_tot_reserve
 
             expanded_records.append({
                 "forecast_origin_idx": idx,
@@ -419,7 +490,8 @@ def main() -> int:
                 "horizon_hours": h,
                 "target_timestamp": (as_of_ts + pd.Timedelta(hours=h)).isoformat(),
                 "actual_point_net_usd": act_pt,
-                "actual_cumulative_net_usd": act_cum,
+                "realized_terminal_cumulative_net_outflow": realized_terminal_flow,
+                "realized_peak_cumulative_net_outflow": realized_peak_flow,
                 "raw_point_p95_usd": raw_pt_p95,
                 "robust_point_p95_usd": robust_pt_p95,
                 "raw_cumulative_p95_usd": raw_cum_p95,
@@ -429,13 +501,24 @@ def main() -> int:
                 "canonical_required_reserve_usd": canon_tot_reserve,
                 "canonical_eligible_surplus_usd": canon_surplus,
                 "post_sweep_cleared_cash_usd": post_sweep_cash,
-                "exceeded_raw_point": exc_raw_pt,
-                "exceeded_robust_point": exc_robust_pt,
-                "exceeded_raw_cumulative": exc_raw_cum,
-                "exceeded_component_reserve": exc_comp_policy,
-                "exceeded_canonical_reserve": exc_canon_reserve,
-                "lockup_shortfall_15h": lockup_shortfall,
-                "cash_shortfall_post_sweep": cash_shortfall,
+                "actual_decision_action": actual_action,
+                "actual_decision_amount_usd": actual_amount,
+                "actual_post_decision_cash_usd": actual_post_cash,
+                "actual_decision_cash_shortfall": actual_shortfall,
+                "counterfactual_cash_shortfall": counterfactual_shortfall,
+                "counterfactual_lockup_shortfall_15h": lockup_shortfall,
+                "cash_shortfall_timestamps": first_shortfall_ts,
+                "reserve_vs_terminal_exceeded": canon_term_exc,
+                "reserve_vs_peak_exceeded": canon_peak_exc,
+                "canonical_reserve_vs_terminal_exceeded": canon_term_exc,
+                "canonical_reserve_vs_peak_exceeded": canon_peak_exc,
+                "component_reserve_vs_terminal_exceeded": comp_term_exc,
+                "component_reserve_vs_peak_exceeded": comp_peak_exc,
+                "exceeded_raw_point": act_pt > raw_pt_p95,
+                "exceeded_robust_point": act_pt > robust_pt_p95,
+                "exceeded_raw_cumulative": realized_terminal_flow > raw_cum_p95,
+                "exceeded_component_reserve": comp_term_exc,
+                "exceeded_canonical_reserve": canon_term_exc,
                 "point_reliability_status": fp.point_reliability_status,
                 "cumulative_reliability_status": fp.cumulative_reliability_status,
                 "policy_reliability_status": assess_comp.policy_reliability_status,
@@ -468,15 +551,19 @@ def main() -> int:
     assert expanded_df["forecast_origin_idx"].max() == 8680
     assert (expanded_df["forecast_origin_idx"] + expanded_df["horizon_hours"]).max() <= 8759, "Horizon breached dataset length"
 
+    # Verify peak is always >= terminal cumulative outflow
+    assert (rolling_df["realized_peak_cumulative_net_outflow"] >= rolling_df["realized_terminal_cumulative_net_outflow"] - 1e-6).all(), "Peak outflow < terminal outflow in rolling"
+    assert (expanded_df["realized_peak_cumulative_net_outflow"] >= expanded_df["realized_terminal_cumulative_net_outflow"] - 1e-6).all(), "Peak outflow < terminal outflow in expanded"
+
     # -------------------------------------------------------------------------
     # PRINT RESULTS TABLES DIRECTLY FROM PERSISTED ARTIFACT DATA
     # -------------------------------------------------------------------------
-    print("\n" + "=" * 155)
+    print("\n" + "=" * 165)
     print("TABLE 1: ROLLING-ORIGIN BACKTEST (N=200, Origins 1000..1199, step=1h)")
     print("MBB configuration: B=2,000, seed=42. Block lengths in hourly observations: 6h=2 obs (2h), 24h=6 obs (6h), 72h=18 obs (18h)")
-    print("=" * 155)
-    print(f"{'Horizon':<8} | {'Metric / Scope':<36} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
-    print("-" * 155)
+    print("=" * 165)
+    print(f"{'Horizon':<8} | {'Metric / Scope':<42} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 165)
     rolling_blocks = {6: 2, 24: 6, 72: 18}
     for h in horizons:
         sub = rolling_df[rolling_df["horizon_hours"] == h]
@@ -489,67 +576,95 @@ def main() -> int:
         pt_w = wilson_score_interval(n_sub - pt_exc, n_sub)
         pt_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_robust_point"], dtype=float), block_length=b_roll)
         pt_zf = f">={pt_mbb['rule_of_three_bound']*100:.1f}%" if pt_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | {'Point Flow Forecast (t+h)':<36} | {pt_cov*100:5.1f}% | {pt_exc:2d}/200 | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
+        print(f"{h:2d} Hours  | {'Point Flow Forecast (t+h)':<42} | {pt_cov*100:5.1f}% | {pt_exc:2d}/200 | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
 
-        # 2. Raw cumulative flow
+        # 2. Raw cumulative flow (Terminal)
         cum_exc = int(sub["exceeded_raw_cumulative"].sum())
         cum_cov = (n_sub - cum_exc) / n_sub
         cum_w = wilson_score_interval(n_sub - cum_exc, n_sub)
         cum_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_raw_cumulative"], dtype=float), block_length=b_roll)
         cum_zf = f">={cum_mbb['rule_of_three_bound']*100:.1f}%" if cum_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | {'Raw Cumulative Forecast (t,t+h]':<36} | {cum_cov*100:5.1f}% | {cum_exc:2d}/200 | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
+        print(f"{h:2d} Hours  | {'Raw Cumulative Forecast (t,t+h] [Terminal]':<42} | {cum_cov*100:5.1f}% | {cum_exc:2d}/200 | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
 
-        # 3. Horizon-specific component reserve
-        comp_exc = int(sub["exceeded_component_reserve"].sum())
-        comp_cov = (n_sub - comp_exc) / n_sub
-        comp_w = wilson_score_interval(n_sub - comp_exc, n_sub)
-        comp_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_component_reserve"], dtype=float), block_length=b_roll)
-        comp_zf = f">={comp_mbb['rule_of_three_bound']*100:.1f}%" if comp_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | {'Component Reserve (h-isolated)':<36} | {comp_cov*100:5.1f}% | {comp_exc:2d}/200 | [{comp_w[0]*100:.1f}%, {comp_w[1]*100:.1f}%]   | {comp_mbb['display']:<26} | {comp_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        # 3. Component Reserve vs Terminal
+        comp_t_exc = int(sub["component_reserve_vs_terminal_exceeded"].sum())
+        comp_t_cov = (n_sub - comp_t_exc) / n_sub
+        comp_t_w = wilson_score_interval(n_sub - comp_t_exc, n_sub)
+        comp_t_mbb = moving_block_bootstrap_ci(np.array(~sub["component_reserve_vs_terminal_exceeded"], dtype=float), block_length=b_roll)
+        comp_t_zf = f">={comp_t_mbb['rule_of_three_bound']*100:.1f}%" if comp_t_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Component Reserve [Terminal Outflow]':<42} | {comp_t_cov*100:5.1f}% | {comp_t_exc:2d}/200 | [{comp_t_w[0]*100:.1f}%, {comp_t_w[1]*100:.1f}%]   | {comp_t_mbb['display']:<26} | {comp_t_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
 
-        # 4. Canonical complete multi-horizon reserve
-        canon_exc = int(sub["exceeded_canonical_reserve"].sum())
-        canon_cov = (n_sub - canon_exc) / n_sub
-        canon_w = wilson_score_interval(n_sub - canon_exc, n_sub)
-        canon_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_canonical_reserve"], dtype=float), block_length=b_roll)
-        canon_zf = f">={canon_mbb['rule_of_three_bound']*100:.1f}%" if canon_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | {'Canonical Multi-Horizon Reserve (72h)':<36} | {canon_cov*100:5.1f}% | {canon_exc:2d}/200 | [{canon_w[0]*100:.1f}%, {canon_w[1]*100:.1f}%]   | {canon_mbb['display']:<26} | {canon_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        # 4. Component Reserve vs Peak
+        comp_p_exc = int(sub["component_reserve_vs_peak_exceeded"].sum())
+        comp_p_cov = (n_sub - comp_p_exc) / n_sub
+        comp_p_w = wilson_score_interval(n_sub - comp_p_exc, n_sub)
+        comp_p_mbb = moving_block_bootstrap_ci(np.array(~sub["component_reserve_vs_peak_exceeded"], dtype=float), block_length=b_roll)
+        comp_p_zf = f">={comp_p_mbb['rule_of_three_bound']*100:.1f}%" if comp_p_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Component Reserve [Intrahorizon Peak]':<42} | {comp_p_cov*100:5.1f}% | {comp_p_exc:2d}/200 | [{comp_p_w[0]*100:.1f}%, {comp_p_w[1]*100:.1f}%]   | {comp_p_mbb['display']:<26} | {comp_p_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
 
-        # 5. Operational Cash Shortfall (with 15h repo lockup)
-        shortfall_cnt = int(sub["cash_shortfall_post_sweep"].sum())
-        shortfall_cov = (n_sub - shortfall_cnt) / n_sub
-        sf_w = wilson_score_interval(n_sub - shortfall_cnt, n_sub)
-        sf_mbb = moving_block_bootstrap_ci(np.array(~sub["cash_shortfall_post_sweep"], dtype=float), block_length=b_roll)
-        sf_zf = f">={sf_mbb['rule_of_three_bound']*100:.1f}%" if sf_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | {'Operational Cash Path Sufficiency':<36} | {shortfall_cov*100:5.1f}% | {shortfall_cnt:2d}/200 | [{sf_w[0]*100:.1f}%, {sf_w[1]*100:.1f}%]   | {sf_mbb['display']:<26} | {sf_zf:<20} | OPERATIONAL_PATH")
-        print("-" * 155)
+        # 5. Canonical Multi-Horizon Reserve vs Terminal
+        canon_t_exc = int(sub["canonical_reserve_vs_terminal_exceeded"].sum())
+        canon_t_cov = (n_sub - canon_t_exc) / n_sub
+        canon_t_w = wilson_score_interval(n_sub - canon_t_exc, n_sub)
+        canon_t_mbb = moving_block_bootstrap_ci(np.array(~sub["canonical_reserve_vs_terminal_exceeded"], dtype=float), block_length=b_roll)
+        canon_t_zf = f">={canon_t_mbb['rule_of_three_bound']*100:.1f}%" if canon_t_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Terminal Outflow]':<42} | {canon_t_cov*100:5.1f}% | {canon_t_exc:2d}/200 | [{canon_t_w[0]*100:.1f}%, {canon_t_w[1]*100:.1f}%]   | {canon_t_mbb['display']:<26} | {canon_t_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
 
-    print("\n" + "=" * 155)
+        # 6. Canonical Multi-Horizon Reserve vs Peak
+        canon_p_exc = int(sub["canonical_reserve_vs_peak_exceeded"].sum())
+        canon_p_cov = (n_sub - canon_p_exc) / n_sub
+        canon_p_w = wilson_score_interval(n_sub - canon_p_exc, n_sub)
+        canon_p_mbb = moving_block_bootstrap_ci(np.array(~sub["canonical_reserve_vs_peak_exceeded"], dtype=float), block_length=b_roll)
+        canon_p_zf = f">={canon_p_mbb['rule_of_three_bound']*100:.1f}%" if canon_p_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Intrahorizon Peak]':<42} | {canon_p_cov*100:5.1f}% | {canon_p_exc:2d}/200 | [{canon_p_w[0]*100:.1f}%, {canon_p_w[1]*100:.1f}%]   | {canon_p_mbb['display']:<26} | {canon_p_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+
+        # 7. Actual Decision Simulation Cash Path
+        act_sf_cnt = int(sub["actual_decision_cash_shortfall"].sum())
+        act_sf_cov = (n_sub - act_sf_cnt) / n_sub
+        act_w = wilson_score_interval(n_sub - act_sf_cnt, n_sub)
+        act_mbb = moving_block_bootstrap_ci(np.array(~sub["actual_decision_cash_shortfall"], dtype=float), block_length=b_roll)
+        act_zf = f">={act_mbb['rule_of_three_bound']*100:.1f}%" if act_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Actual Decision Policy Path Sufficiency':<42} | {act_sf_cov*100:5.1f}% | {act_sf_cnt:2d}/200 | [{act_w[0]*100:.1f}%, {act_w[1]*100:.1f}%]   | {act_mbb['display']:<26} | {act_zf:<20} | ACTUAL_ORCHESTRATOR")
+
+        # 8. Counterfactual Stress Scenario (100% Surplus Placed into 15h Repo)
+        cf_sf_cnt = int(sub["counterfactual_cash_shortfall"].sum())
+        cf_sf_cov = (n_sub - cf_sf_cnt) / n_sub
+        cf_w = wilson_score_interval(n_sub - cf_sf_cnt, n_sub)
+        cf_mbb = moving_block_bootstrap_ci(np.array(~sub["counterfactual_cash_shortfall"], dtype=float), block_length=b_roll)
+        cf_zf = f">={cf_mbb['rule_of_three_bound']*100:.1f}%" if cf_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | {'Counterfactual 15h Repo Sweep Stress Path':<42} | {cf_sf_cov*100:5.1f}% | {cf_sf_cnt:2d}/200 | [{cf_w[0]*100:.1f}%, {cf_w[1]*100:.1f}%]   | {cf_mbb['display']:<26} | {cf_zf:<20} | COUNTERFACTUAL_REPO")
+        print("-" * 165)
+
+    print("\n" + "=" * 165)
     print("TABLE 2: NON-OVERLAPPING ORIGINS (step=h)")
     print("MBB configuration: B=2,000, seed=42, block_length=1 observation (disjoint non-overlapping windows)")
-    print("=" * 155)
-    print(f"{'Horizon':<8} | {'Windows (N)':<12} | {'Metric / Scope':<36} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
-    print("-" * 155)
+    print("=" * 165)
+    print(f"{'Horizon':<8} | {'Windows (N)':<12} | {'Metric / Scope':<42} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 165)
     for h in [1, 6, 24, 72]:
         r = non_overlap_results[h]
         nw = r["n_windows"]
         pt_zf = f">={r['pt_mbb']['rule_of_three_bound']*100:.1f}%" if r["pt_mbb"]["is_degenerate"] else "N/A (>0 exc)"
         cum_zf = f">={r['cum_mbb']['rule_of_three_bound']*100:.1f}%" if r["cum_mbb"]["is_degenerate"] else "N/A (>0 exc)"
-        comp_zf = f">={r['comp_mbb']['rule_of_three_bound']*100:.1f}%" if r["comp_mbb"]["is_degenerate"] else "N/A (>0 exc)"
-        canon_zf = f">={r['canon_mbb']['rule_of_three_bound']*100:.1f}%" if r["canon_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        comp_t_zf = f">={r['comp_term_mbb']['rule_of_three_bound']*100:.1f}%" if r["comp_term_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        comp_p_zf = f">={r['comp_peak_mbb']['rule_of_three_bound']*100:.1f}%" if r["comp_peak_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        canon_t_zf = f">={r['canon_term_mbb']['rule_of_three_bound']*100:.1f}%" if r["canon_term_mbb"]["is_degenerate"] else "N/A (>0 exc)"
+        canon_p_zf = f">={r['canon_peak_mbb']['rule_of_three_bound']*100:.1f}%" if r["canon_peak_mbb"]["is_degenerate"] else "N/A (>0 exc)"
 
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Point Flow Forecast (t+h)':<36} | {r['pt_cov']*100:5.1f}% | {r['pt_exc']:2d}/{nw:<3} | [{r['pt_wilson'][0]*100:.1f}%, {r['pt_wilson'][1]*100:.1f}%]   | {r['pt_mbb']['display']:<26} | {pt_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Raw Cumulative Forecast (t,t+h]':<36} | {r['cum_cov']*100:5.1f}% | {r['cum_exc']:2d}/{nw:<3} | [{r['cum_wilson'][0]*100:.1f}%, {r['cum_wilson'][1]*100:.1f}%]   | {r['cum_mbb']['display']:<26} | {cum_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Component Reserve (h-isolated)':<36} | {r['comp_cov']*100:5.1f}% | {r['comp_exc']:2d}/{nw:<3} | [{r['comp_wilson'][0]*100:.1f}%, {r['comp_wilson'][1]*100:.1f}%]   | {r['comp_mbb']['display']:<26} | {comp_zf:<20} | {r['policy_status']}")
-        print(f"{h:2d} Hours  | N={nw:<10} | {'Canonical Multi-Horizon Reserve (72h)':<36} | {r['canon_cov']*100:5.1f}% | {r['canon_exc']:2d}/{nw:<3} | [{r['canon_wilson'][0]*100:.1f}%, {r['canon_wilson'][1]*100:.1f}%]   | {r['canon_mbb']['display']:<26} | {canon_zf:<20} | {r['policy_status']}")
-        print("-" * 155)
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Point Flow Forecast (t+h)':<42} | {r['pt_cov']*100:5.1f}% | {r['pt_exc']:2d}/{nw:<3} | [{r['pt_wilson'][0]*100:.1f}%, {r['pt_wilson'][1]*100:.1f}%]   | {r['pt_mbb']['display']:<26} | {pt_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Raw Cumulative Forecast (t,t+h]':<42} | {r['cum_cov']*100:5.1f}% | {r['cum_exc']:2d}/{nw:<3} | [{r['cum_wilson'][0]*100:.1f}%, {r['cum_wilson'][1]*100:.1f}%]   | {r['cum_mbb']['display']:<26} | {cum_zf:<20} | {'EMPIRICALLY_VALIDATED' if h == 1 else 'CONDITIONALLY_CALIBRATED_FALLBACK'}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Component Reserve [Terminal Outflow]':<42} | {r['comp_term_cov']*100:5.1f}% | {r['comp_term_exc']:2d}/{nw:<3} | [{r['comp_term_wilson'][0]*100:.1f}%, {r['comp_term_wilson'][1]*100:.1f}%]   | {r['comp_term_mbb']['display']:<26} | {comp_t_zf:<20} | {r['policy_status']}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Component Reserve [Intrahorizon Peak]':<42} | {r['comp_peak_cov']*100:5.1f}% | {r['comp_peak_exc']:2d}/{nw:<3} | [{r['comp_peak_wilson'][0]*100:.1f}%, {r['comp_peak_wilson'][1]*100:.1f}%]   | {r['comp_peak_mbb']['display']:<26} | {comp_p_zf:<20} | {r['policy_status']}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Canonical Reserve (72h) [Terminal Outflow]':<42} | {r['canon_term_cov']*100:5.1f}% | {r['canon_term_exc']:2d}/{nw:<3} | [{r['canon_term_wilson'][0]*100:.1f}%, {r['canon_term_wilson'][1]*100:.1f}%]   | {r['canon_term_mbb']['display']:<26} | {canon_t_zf:<20} | {r['policy_status']}")
+        print(f"{h:2d} Hours  | N={nw:<10} | {'Canonical Reserve (72h) [Intrahorizon Peak]':<42} | {r['canon_peak_cov']*100:5.1f}% | {r['canon_peak_exc']:2d}/{nw:<3} | [{r['canon_peak_wilson'][0]*100:.1f}%, {r['canon_peak_wilson'][1]*100:.1f}%]   | {r['canon_peak_mbb']['display']:<26} | {canon_p_zf:<20} | {r['policy_status']}")
+        print("-" * 165)
 
-    print("\n" + "=" * 155)
+    print("\n" + "=" * 165)
     print("TABLE 3: EXPANDED FULL-HOLDOUT EVALUATION (Daily step=24h, N=321 origins: 1000..8680)")
-    print("MBB configuration: B=2,000, seed=42. Block lengths in daily observations: 6h=1 obs (24h), 24h=1 obs (24h), 72h=3 obs (72h overlap)")
-    print("=" * 155)
-    print(f"{'Horizon':<8} | {'Origins (N)':<12} | {'Metric / Scope':<36} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
-    print("-" * 155)
+    print("MBB configuration: B=2,000, seed=42. Block lengths in daily observations: 6h=1 obs (24h ref), 24h=1 obs (24h ref), 72h=3 obs (72h structural overlap)")
+    print("=" * 165)
+    print(f"{'Horizon':<8} | {'Origins (N)':<12} | {'Metric / Scope':<42} | {'Cov%':<7} | {'Exc':<6} | {'Wilson 95% Ref CI':<19} | {'MBB 95% Bound':<26} | {'Zero-Failure Bound':<20} | {'Status'}")
+    print("-" * 165)
     daily_blocks = {6: 1, 24: 1, 72: 3}
     for h in [6, 24, 72]:
         sub = expanded_df[expanded_df["horizon_hours"] == h]
@@ -562,86 +677,119 @@ def main() -> int:
         pt_w = wilson_score_interval(n_sub - pt_exc, n_sub)
         pt_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_robust_point"], dtype=float), block_length=b_daily)
         pt_zf = f">={pt_mbb['rule_of_three_bound']*100:.1f}%" if pt_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Point Flow Forecast (t+h)':<36} | {pt_cov*100:5.1f}% | {pt_exc:2d}/{n_sub:<3} | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Point Flow Forecast (t+h)':<42} | {pt_cov*100:5.1f}% | {pt_exc:2d}/{n_sub:<3} | [{pt_w[0]*100:.1f}%, {pt_w[1]*100:.1f}%]   | {pt_mbb['display']:<26} | {pt_zf:<20} | {sub['point_reliability_status'].iloc[0]}")
 
-        # 2. Raw cumulative flow
+        # 2. Raw cumulative flow (Terminal)
         cum_exc = int(sub["exceeded_raw_cumulative"].sum())
         cum_cov = (n_sub - cum_exc) / n_sub
         cum_w = wilson_score_interval(n_sub - cum_exc, n_sub)
         cum_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_raw_cumulative"], dtype=float), block_length=b_daily)
         cum_zf = f">={cum_mbb['rule_of_three_bound']*100:.1f}%" if cum_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Raw Cumulative Forecast (t,t+h]':<36} | {cum_cov*100:5.1f}% | {cum_exc:2d}/{n_sub:<3} | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Raw Cumulative Forecast (t,t+h] [Terminal]':<42} | {cum_cov*100:5.1f}% | {cum_exc:2d}/{n_sub:<3} | [{cum_w[0]*100:.1f}%, {cum_w[1]*100:.1f}%]   | {cum_mbb['display']:<26} | {cum_zf:<20} | {sub['cumulative_reliability_status'].iloc[0]}")
 
-        # 3. Component reserve
-        comp_exc = int(sub["exceeded_component_reserve"].sum())
-        comp_cov = (n_sub - comp_exc) / n_sub
-        comp_w = wilson_score_interval(n_sub - comp_exc, n_sub)
-        comp_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_component_reserve"], dtype=float), block_length=b_daily)
-        comp_zf = f">={comp_mbb['rule_of_three_bound']*100:.1f}%" if comp_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Component Reserve (h-isolated)':<36} | {comp_cov*100:5.1f}% | {comp_exc:2d}/{n_sub:<3} | [{comp_w[0]*100:.1f}%, {comp_w[1]*100:.1f}%]   | {comp_mbb['display']:<26} | {comp_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        # 3. Component Reserve vs Terminal
+        comp_t_exc = int(sub["component_reserve_vs_terminal_exceeded"].sum())
+        comp_t_cov = (n_sub - comp_t_exc) / n_sub
+        comp_t_w = wilson_score_interval(n_sub - comp_t_exc, n_sub)
+        comp_t_mbb = moving_block_bootstrap_ci(np.array(~sub["component_reserve_vs_terminal_exceeded"], dtype=float), block_length=b_daily)
+        comp_t_zf = f">={comp_t_mbb['rule_of_three_bound']*100:.1f}%" if comp_t_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Component Reserve [Terminal Outflow]':<42} | {comp_t_cov*100:5.1f}% | {comp_t_exc:2d}/{n_sub:<3} | [{comp_t_w[0]*100:.1f}%, {comp_t_w[1]*100:.1f}%]   | {comp_t_mbb['display']:<26} | {comp_t_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
 
-        # 4. Canonical production reserve
-        canon_exc = int(sub["exceeded_canonical_reserve"].sum())
-        canon_cov = (n_sub - canon_exc) / n_sub
-        canon_w = wilson_score_interval(n_sub - canon_exc, n_sub)
-        canon_mbb = moving_block_bootstrap_ci(np.array(~sub["exceeded_canonical_reserve"], dtype=float), block_length=b_daily)
-        canon_zf = f">={canon_mbb['rule_of_three_bound']*100:.1f}%" if canon_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Canonical Multi-Horizon Reserve (72h)':<36} | {canon_cov*100:5.1f}% | {canon_exc:2d}/{n_sub:<3} | [{canon_w[0]*100:.1f}%, {canon_w[1]*100:.1f}%]   | {canon_mbb['display']:<26} | {canon_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+        # 4. Component Reserve vs Peak
+        comp_p_exc = int(sub["component_reserve_vs_peak_exceeded"].sum())
+        comp_p_cov = (n_sub - comp_p_exc) / n_sub
+        comp_p_w = wilson_score_interval(n_sub - comp_p_exc, n_sub)
+        comp_p_mbb = moving_block_bootstrap_ci(np.array(~sub["component_reserve_vs_peak_exceeded"], dtype=float), block_length=b_daily)
+        comp_p_zf = f">={comp_p_mbb['rule_of_three_bound']*100:.1f}%" if comp_p_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Component Reserve [Intrahorizon Peak]':<42} | {comp_p_cov*100:5.1f}% | {comp_p_exc:2d}/{n_sub:<3} | [{comp_p_w[0]*100:.1f}%, {comp_p_w[1]*100:.1f}%]   | {comp_p_mbb['display']:<26} | {comp_p_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
 
-        # 5. Operational Cash Shortfall (with 15h repo lockup)
-        shortfall_cnt = int(sub["cash_shortfall_post_sweep"].sum())
-        shortfall_cov = (n_sub - shortfall_cnt) / n_sub
-        sf_w = wilson_score_interval(n_sub - shortfall_cnt, n_sub)
-        sf_mbb = moving_block_bootstrap_ci(np.array(~sub["cash_shortfall_post_sweep"], dtype=float), block_length=b_daily)
-        sf_zf = f">={sf_mbb['rule_of_three_bound']*100:.1f}%" if sf_mbb["is_degenerate"] else "N/A (>0 exc)"
-        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Operational Cash Path Sufficiency':<36} | {shortfall_cov*100:5.1f}% | {shortfall_cnt:2d}/{n_sub:<3} | [{sf_w[0]*100:.1f}%, {sf_w[1]*100:.1f}%]   | {sf_mbb['display']:<26} | {sf_zf:<20} | OPERATIONAL_PATH")
-        print("-" * 155)
+        # 5. Canonical Multi-Horizon Reserve vs Terminal
+        canon_t_exc = int(sub["canonical_reserve_vs_terminal_exceeded"].sum())
+        canon_t_cov = (n_sub - canon_t_exc) / n_sub
+        canon_t_w = wilson_score_interval(n_sub - canon_t_exc, n_sub)
+        canon_t_mbb = moving_block_bootstrap_ci(np.array(~sub["canonical_reserve_vs_terminal_exceeded"], dtype=float), block_length=b_daily)
+        canon_t_zf = f">={canon_t_mbb['rule_of_three_bound']*100:.1f}%" if canon_t_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Canonical Reserve (72h) [Terminal Outflow]':<42} | {canon_t_cov*100:5.1f}% | {canon_t_exc:2d}/{n_sub:<3} | [{canon_t_w[0]*100:.1f}%, {canon_t_w[1]*100:.1f}%]   | {canon_t_mbb['display']:<26} | {canon_t_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+
+        # 6. Canonical Multi-Horizon Reserve vs Peak
+        canon_p_exc = int(sub["canonical_reserve_vs_peak_exceeded"].sum())
+        canon_p_cov = (n_sub - canon_p_exc) / n_sub
+        canon_p_w = wilson_score_interval(n_sub - canon_p_exc, n_sub)
+        canon_p_mbb = moving_block_bootstrap_ci(np.array(~sub["canonical_reserve_vs_peak_exceeded"], dtype=float), block_length=b_daily)
+        canon_p_zf = f">={canon_p_mbb['rule_of_three_bound']*100:.1f}%" if canon_p_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Canonical Reserve (72h) [Intrahorizon Peak]':<42} | {canon_p_cov*100:5.1f}% | {canon_p_exc:2d}/{n_sub:<3} | [{canon_p_w[0]*100:.1f}%, {canon_p_w[1]*100:.1f}%]   | {canon_p_mbb['display']:<26} | {canon_p_zf:<20} | {sub['policy_reliability_status'].iloc[0]}")
+
+        # 7. Actual Decision Simulation Cash Path
+        act_sf_cnt = int(sub["actual_decision_cash_shortfall"].sum())
+        act_sf_cov = (n_sub - act_sf_cnt) / n_sub
+        act_w = wilson_score_interval(n_sub - act_sf_cnt, n_sub)
+        act_mbb = moving_block_bootstrap_ci(np.array(~sub["actual_decision_cash_shortfall"], dtype=float), block_length=b_daily)
+        act_zf = f">={act_mbb['rule_of_three_bound']*100:.1f}%" if act_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Actual Decision Policy Path Sufficiency':<42} | {act_sf_cov*100:5.1f}% | {act_sf_cnt:2d}/{n_sub:<3} | [{act_w[0]*100:.1f}%, {act_w[1]*100:.1f}%]   | {act_mbb['display']:<26} | {act_zf:<20} | ACTUAL_ORCHESTRATOR")
+
+        # 8. Counterfactual Stress Scenario (100% Surplus Placed into 15h Repo)
+        cf_sf_cnt = int(sub["counterfactual_cash_shortfall"].sum())
+        cf_sf_cov = (n_sub - cf_sf_cnt) / n_sub
+        cf_w = wilson_score_interval(n_sub - cf_sf_cnt, n_sub)
+        cf_mbb = moving_block_bootstrap_ci(np.array(~sub["counterfactual_cash_shortfall"], dtype=float), block_length=b_daily)
+        cf_zf = f">={cf_mbb['rule_of_three_bound']*100:.1f}%" if cf_mbb["is_degenerate"] else "N/A (>0 exc)"
+        print(f"{h:2d} Hours  | N={n_sub:<10} | {'Counterfactual 15h Repo Sweep Stress Path':<42} | {cf_sf_cov*100:5.1f}% | {cf_sf_cnt:2d}/{n_sub:<3} | [{cf_w[0]*100:.1f}%, {cf_w[1]*100:.1f}%]   | {cf_mbb['display']:<26} | {cf_zf:<20} | COUNTERFACTUAL_REPO")
+        print("-" * 165)
 
     # -------------------------------------------------------------------------
     # PRINT DOCUMENTED SENSITIVITY ANALYSIS TABLES
     # -------------------------------------------------------------------------
-    print("\n" + "=" * 145)
+    print("\n" + "=" * 165)
     print("SENSITIVITY ANALYSIS 1: ROLLING-ORIGIN BACKTEST (N=200, hourly stride)")
     print("Evaluates Moving Block Bootstrap (B=2,000, seed=42) across block lengths b in [1, 2, 6, 12, 18, 24, 36, 72] hourly observations")
-    print("=" * 145)
+    print("=" * 165)
     roll_candidate_blocks = [1, 2, 6, 12, 18, 24, 36, 72]
-    header_str = f"{'Horizon':<8} | {'Metric':<32} | " + " | ".join([f"b={b:2d} ({b:2d}h)" for b in roll_candidate_blocks])
+    header_str = f"{'Horizon':<8} | {'Metric':<36} | " + " | ".join([f"b={b:2d} ({b:2d}h)" for b in roll_candidate_blocks])
     print(header_str)
     print("-" * len(header_str))
     for h in horizons:
         sub = rolling_df[rolling_df["horizon_hours"] == h]
-        ind_comp = np.array(~sub["exceeded_component_reserve"], dtype=float)
-        ind_canon = np.array(~sub["exceeded_canonical_reserve"], dtype=float)
+        ind_comp_term = np.array(~sub["component_reserve_vs_terminal_exceeded"], dtype=float)
+        ind_comp_peak = np.array(~sub["component_reserve_vs_peak_exceeded"], dtype=float)
+        ind_canon_term = np.array(~sub["canonical_reserve_vs_terminal_exceeded"], dtype=float)
+        ind_canon_peak = np.array(~sub["canonical_reserve_vs_peak_exceeded"], dtype=float)
 
-        sens_comp = evaluate_block_sensitivity(ind_comp, roll_candidate_blocks)
-        sens_canon = evaluate_block_sensitivity(ind_canon, roll_candidate_blocks)
+        sens_comp_term = evaluate_block_sensitivity(ind_comp_term, roll_candidate_blocks)
+        sens_comp_peak = evaluate_block_sensitivity(ind_comp_peak, roll_candidate_blocks)
+        sens_canon_term = evaluate_block_sensitivity(ind_canon_term, roll_candidate_blocks)
+        sens_canon_peak = evaluate_block_sensitivity(ind_canon_peak, roll_candidate_blocks)
 
-        comp_str = f"{h:2d} Hours  | {'Component Reserve':<32} | " + " | ".join([sens_comp[b]["display"] for b in roll_candidate_blocks])
-        canon_str = f"{h:2d} Hours  | {'Canonical Reserve (72h)':<32} | " + " | ".join([sens_canon[b]["display"] for b in roll_candidate_blocks])
-        print(comp_str)
-        print(canon_str)
+        print(f"{h:2d} Hours  | {'Component Reserve [Terminal]':<36} | " + " | ".join([sens_comp_term[b]["display"] for b in roll_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Component Reserve [Peak]':<36} | " + " | ".join([sens_comp_peak[b]["display"] for b in roll_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Terminal]':<36} | " + " | ".join([sens_canon_term[b]["display"] for b in roll_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Peak]':<36} | " + " | ".join([sens_canon_peak[b]["display"] for b in roll_candidate_blocks]))
         print("-" * len(header_str))
 
-    print("\n" + "=" * 145)
+    print("\n" + "=" * 165)
     print("SENSITIVITY ANALYSIS 2: EXPANDED DAILY BACKTEST (N=321, daily stride=24h)")
     print("Evaluates Moving Block Bootstrap (B=2,000, seed=42) across block lengths b in [1, 2, 3, 5, 7, 14, 18, 30] daily observations")
-    print("=" * 145)
+    print("b=1 is an independent-resampling reference baseline; b=3 is the structural 72h window overlap; b=7/14/30 reflect multi-week persistence.")
+    print("=" * 165)
     daily_candidate_blocks = [1, 2, 3, 5, 7, 14, 18, 30]
-    header_str_daily = f"{'Horizon':<8} | {'Metric':<32} | " + " | ".join([f"b={b:2d} ({b*24:3d}h)" for b in daily_candidate_blocks])
+    header_str_daily = f"{'Horizon':<8} | {'Metric':<36} | " + " | ".join([f"b={b:2d} ({b*24:3d}h)" for b in daily_candidate_blocks])
     print(header_str_daily)
     print("-" * len(header_str_daily))
     for h in [6, 24, 72]:
         sub = expanded_df[expanded_df["horizon_hours"] == h]
-        ind_comp = np.array(~sub["exceeded_component_reserve"], dtype=float)
-        ind_canon = np.array(~sub["exceeded_canonical_reserve"], dtype=float)
+        ind_comp_term = np.array(~sub["component_reserve_vs_terminal_exceeded"], dtype=float)
+        ind_comp_peak = np.array(~sub["component_reserve_vs_peak_exceeded"], dtype=float)
+        ind_canon_term = np.array(~sub["canonical_reserve_vs_terminal_exceeded"], dtype=float)
+        ind_canon_peak = np.array(~sub["canonical_reserve_vs_peak_exceeded"], dtype=float)
 
-        sens_comp = evaluate_block_sensitivity(ind_comp, daily_candidate_blocks)
-        sens_canon = evaluate_block_sensitivity(ind_canon, daily_candidate_blocks)
+        sens_comp_term = evaluate_block_sensitivity(ind_comp_term, daily_candidate_blocks)
+        sens_comp_peak = evaluate_block_sensitivity(ind_comp_peak, daily_candidate_blocks)
+        sens_canon_term = evaluate_block_sensitivity(ind_canon_term, daily_candidate_blocks)
+        sens_canon_peak = evaluate_block_sensitivity(ind_canon_peak, daily_candidate_blocks)
 
-        comp_str = f"{h:2d} Hours  | {'Component Reserve':<32} | " + " | ".join([sens_comp[b]["display"] for b in daily_candidate_blocks])
-        canon_str = f"{h:2d} Hours  | {'Canonical Reserve (72h)':<32} | " + " | ".join([sens_canon[b]["display"] for b in daily_candidate_blocks])
-        print(comp_str)
-        print(canon_str)
+        print(f"{h:2d} Hours  | {'Component Reserve [Terminal]':<36} | " + " | ".join([sens_comp_term[b]["display"] for b in daily_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Component Reserve [Peak]':<36} | " + " | ".join([sens_comp_peak[b]["display"] for b in daily_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Terminal]':<36} | " + " | ".join([sens_canon_term[b]["display"] for b in daily_candidate_blocks]))
+        print(f"{h:2d} Hours  | {'Canonical Reserve (72h) [Peak]':<36} | " + " | ".join([sens_canon_peak[b]["display"] for b in daily_candidate_blocks]))
         print("-" * len(header_str_daily))
 
     return 0

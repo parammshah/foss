@@ -682,5 +682,55 @@ def test_distinguish_input_calibration_reserve_sufficiency_and_cash_shortfall():
     assert cash_shortfall_with_buffer is False  # Cash shortfall prevented despite forecast exceedance!
 
 
+def test_terminal_vs_peak_cumulative_outflow_intrahorizon_divergence():
+    """Regression test proving that terminal-flow coverage can differ from peak-outflow coverage,
+    and that a path-wise liquidity check detects earlier intrahorizon cash shortfalls
+    that terminal checks miss.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+
+    # Synthetic cash-flow sequence over 6 hours:
+    # Hour 1: +$10M net withdrawal (Cum = $10M)
+    # Hour 2: +$5M net withdrawal  (Cum = $15M -> PEAK!)
+    # Hour 3: -$5M net withdrawal  (Cum = $10M)
+    # Hour 4: -$4M net withdrawal  (Cum = $6M)
+    # Hour 5: -$3M net withdrawal  (Cum = $3M)
+    # Hour 6: -$2M net withdrawal  (Cum = $1M -> TERMINAL!)
+    hourly_net_outflows = [10_000_000.0, 5_000_000.0, -5_000_000.0, -4_000_000.0, -3_000_000.0, -2_000_000.0]
+    cum_series = np.cumsum(hourly_net_outflows)
+
+    terminal_outflow = cum_series[-1]  # $1,000,000.0
+    peak_outflow = np.max(cum_series)   # $15,000,000.0
+    assert terminal_outflow == 1_000_000.0
+    assert peak_outflow == 15_000_000.0
+
+    # Tested reserve sized at $8,000,000.0
+    tested_reserve = 8_000_000.0
+
+    # 1. Terminal vs Peak Exceedance divergence:
+    terminal_exceeded = bool(terminal_outflow > tested_reserve)  # False ($1M <= $8M)
+    peak_exceeded = bool(peak_outflow > tested_reserve)          # True ($15M > $8M)
+    assert terminal_exceeded is False
+    assert peak_exceeded is True
+
+    # 2. Path-wise cash simulation starting with $8M cleared cash (after surplus deployed):
+    starting_cash = 8_000_000.0
+    shortfall_timestamps = []
+
+    for t_idx, cum_flow in enumerate(cum_series):
+        avail_cash = starting_cash - cum_flow
+        t_stamp = (as_of + timedelta(hours=t_idx + 1)).isoformat()
+        if avail_cash < 0:
+            shortfall_timestamps.append(t_stamp)
+
+    # At hour 1: cash = $8M - $10M = -$2M (shortfall!)
+    # At hour 2: cash = $8M - $15M = -$7M (shortfall!)
+    # At hour 6: cash = $8M - $1M = +$7M (terminal check says cash is positive!)
+    assert len(shortfall_timestamps) > 0
+    assert shortfall_timestamps[0] == (as_of + timedelta(hours=1)).isoformat()
+    assert (starting_cash - terminal_outflow) > 0  # Terminal cash is positive!
+
+
+
 
 
