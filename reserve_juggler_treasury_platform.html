@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>(reserve*juggler) — Treasury Command &amp; Liquidity Choreography</title>
+  <meta name="description" content="Autonomous two-sided cash flow forecasting, 15-hour overnight repo protection, and penalty arbitrage." />
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- GSAP 3.12 Core -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+
+  <!-- Modular Stylesheets -->
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/components.css?v=3" />
+  <link rel="stylesheet" href="css/platform.css" />
+</head>
+
+<body class="min-h-screen flex flex-col selection:bg-[#00E5FF] selection:text-[#07090E] ambient-bg">
+
+  <!-- ================= MASTER HEADER ================= -->
+  <header class="h-16 border-b flex items-center justify-between px-4 md:px-6 sticky top-0 z-40 glass-header" style="border-color: var(--border-color);">
+    <div class="flex items-center gap-4">
+      <button onclick="toggleMobileNav()" class="lg:hidden curved-btn p-2" title="Toggle Navigation">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+
+      <!-- BRAND LOGO -->
+      <a href="index.html" class="flex items-center gap-1.5 cursor-pointer select-none group text-decoration-none">
+        <span class="font-mono text-lg muted-text">(</span>
+        <span class="font-extrabold text-xl tracking-tight heading-text">reserve</span>
+        <span class="font-mono text-lg transition-transform duration-500 group-hover:rotate-180" style="color: var(--cyan-primary);">*</span>
+        <span class="font-extrabold text-xl tracking-tight heading-text">juggler</span>
+        <span class="font-mono text-lg muted-text">)</span>
+        <span class="ml-2 pill-badge font-bold pill-badge-cyan">
+          Core
+        </span>
+      </a>
+
+      <!-- Quick Link to Landing Page with Currency Stream -->
+      <a href="index.html" class="hidden sm:inline-flex items-center gap-1.5 text-xs font-mono secondary-text hover:text-cyan-400 pl-3 border-l" style="border-color: var(--border-color);" title="Return to Landing Page with Currency Stream">
+        <span>&larr;</span>
+        <span>Landing Page (Currency Stream)</span>
+      </a>
+    </div>
+
+    <!-- SIMULATION STEPPER CONTROLS -->
+    <div class="hidden lg:flex items-center gap-3">
+      <div class="px-3 py-1.5 border text-xs font-mono flex items-center gap-2.5 rounded-xl" style="border-color: var(--border-color); background-color: var(--bg-secondary);">
+        <span class="muted-text">Ledger UTC:</span>
+        <span id="simClockDisplay" class="font-bold primary-text">2026-06-15 16:00</span>
+        <span id="simStepBadge" class="pill-badge pill-badge-cyan font-bold">H-5920</span>
+      </div>
+
+      <button onclick="toggleAutoPlay()" id="autoPlayBtn" class="curved-btn">
+        <span id="autoPlayDot" class="w-2 h-2 rounded-full bg-slate-500"></span>
+        <span id="autoPlayLabel">Auto-Stream</span>
+      </button>
+
+      <!-- DYNAMIC GRAPH ANIMATED STEPPERS -->
+      <div class="flex items-center rounded-xl overflow-hidden border" style="border-color: var(--border-color);">
+        <button onclick="advanceSimulationStep(1)" class="curved-btn border-0 rounded-none py-1.5 px-3" title="Step forward 1 hour with smooth animation">
+          +1h
+        </button>
+        <button onclick="advanceSimulationStep(6)" class="curved-btn border-0 border-l rounded-none py-1.5 px-3" style="border-color: var(--border-color);" title="Step forward 6 hours with smooth animation">
+          +6h
+        </button>
+        <button onclick="advanceSimulationStep(24)" class="curved-btn border-0 border-l rounded-none py-1.5 px-3 font-bold" style="border-color: var(--border-color); color: var(--cyan-primary);" title="Step forward 24 hours with smooth animation">
+          +24h &rarr;
+        </button>
+      </div>
+    </div>
+
+    <!-- RIGHT CONTROLS -->
+    <div class="flex items-center gap-3">
+      <!-- Distinctive Recognizable Demo Flow Button (Electric Indigo Gradient) -->
+      <button onclick="openPsWalkthroughModal()" class="demo-flow-btn py-1.5 px-3.5 text-xs rounded-xl flex items-center gap-1.5 shadow-md" title="Interactive Problem Statement Treasury Lifecycle Walkthrough">
+        <span class="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
+        <span>Demo Flow</span>
+      </button>
+
+      <!-- Sim Theatre Quick Launcher -->
+      <button onclick="openSimulationModal('repo_sweep')" class="curved-btn hidden lg:flex items-center gap-1.5" title="Launch Real-Time Sim Theatre [S]">
+        <span>Sim Theatre</span>
+        <span class="text-[9px] px-1 py-0.2 rounded-md border" style="border-color: var(--border-color);">S</span>
+      </button>
+
+      <button onclick="openShortcutsModal()" class="curved-btn hidden sm:flex items-center gap-1.5" title="Shortcuts [?]">
+        <span class="text-[9px] px-1.5 py-0.2 rounded-md border" style="border-color: var(--border-color);">?</span>
+        <span>Shortcuts</span>
+      </button>
+
+      <!-- Segmented Light/Dark Mode Toggle (Default: Light Active, Zero Emojis) -->
+      <div class="theme-toggle-segmented" role="radiogroup" aria-label="Theme Selection">
+        <button type="button" onclick="setAppTheme('light')" id="themeBtnLight" class="theme-seg-btn active" title="Light Mode">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" stroke-width="2"></circle><path stroke-linecap="round" stroke-width="2" d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path></svg>
+          <span>Light</span>
+        </button>
+        <button type="button" onclick="setAppTheme('dark')" id="themeBtnDark" class="theme-seg-btn" title="Dark Mode">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+          <span>Dark</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ================= MAIN BODY ================= -->
+  <div class="flex-1 flex relative">
+
+    <!-- CURVED SIDEBAR -->
+    <aside id="sidebarNav" class="w-64 border-r flex-shrink-0 flex flex-col justify-between z-30 fixed lg:static inset-y-0 left-0 transform -translate-x-full lg:translate-x-0 transition-transform duration-200 p-4 select-none glass-header" style="border-color: var(--border-color);">
+      <div class="space-y-4">
+
+        <!-- FLOW PULSE MINI WAVE -->
+        <div class="curved-card p-3.5">
+          <div class="flex items-center justify-between text-[11px] font-mono mb-1.5">
+            <span class="secondary-text flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+              Flow Pulse
+            </span>
+            <span class="font-bold font-mono" style="color: var(--cyan-primary);" id="sidebarFlowRate">$21.4M/hr</span>
+          </div>
+          <canvas id="sidebarWaveCanvas" width="220" height="34" class="w-full h-8 block"></canvas>
+          <div class="flex justify-between items-center text-[10px] font-mono mt-1 pt-1.5 border-t muted-text" style="border-color: var(--border-color);">
+            <span>Band: &plusmn;1.4&sigma;</span>
+            <span class="text-emerald-500 font-bold">Net +$1.84M</span>
+          </div>
+        </div>
+
+        <!-- NAVIGATION PILLS -->
+        <nav class="space-y-1.5 text-xs" id="navList">
+          <button onclick="switchView('overview')" data-nav="overview" class="nav-tab-pill active w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
+              <span>Command Overview</span>
+            </div>
+            <span class="text-[10px] font-mono font-bold" style="color: var(--cyan-primary);">6 KPIs</span>
+          </button>
+
+          <button onclick="switchView('forecasts')" data-nav="forecasts" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/></svg>
+              <span>Quantile Forecasts</span>
+            </div>
+            <span class="text-[10px] font-mono muted-text">99.5%</span>
+          </button>
+
+          <button onclick="switchView('portfolio')" data-nav="portfolio" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"/></svg>
+              <span>4-Tier Portfolio</span>
+            </div>
+            <span class="text-[10px] font-mono muted-text">$160M</span>
+          </button>
+
+          <button onclick="switchView('nba')" data-nav="nba" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              <span>Next Best Action</span>
+            </div>
+            <span id="navNbaBadge" class="pill-badge pill-badge-cyan font-bold">1 Action</span>
+          </button>
+
+          <button onclick="switchView('stress')" data-nav="stress" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+              <span>SVB Stress Lab</span>
+            </div>
+            <span class="text-[10px] font-mono text-amber-500 font-bold">Shock</span>
+          </button>
+
+          <button onclick="switchView('audit')" data-nav="audit" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+              <span>Auditable Ledger</span>
+            </div>
+            <span class="text-[10px] font-mono muted-text">12 Logs</span>
+          </button>
+
+          <button onclick="switchView('settings')" data-nav="settings" class="nav-tab-pill w-full flex items-center justify-between px-3.5 py-2.5 text-left">
+            <div class="flex items-center gap-2.5 pl-2">
+              <svg class="w-4 h-4 opacity-75" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              <span>Governance &amp; Policy</span>
+            </div>
+            <span class="text-[10px] font-mono muted-text">Config</span>
+          </button>
+        </nav>
+      </div>
+
+      <!-- BOTTOM PROTOCOL BADGE -->
+      <div class="pt-4 border-t" style="border-color: var(--border-color);">
+        <div class="curved-card p-3 text-[11px] font-mono">
+          <div class="flex items-center justify-between">
+            <span class="muted-text">Engine:</span>
+            <span class="font-bold heading-text">V2.4 Autonomous</span>
+          </div>
+          <div class="flex items-center justify-between mt-1">
+            <span class="muted-text">Policy:</span>
+            <span class="text-emerald-500 font-bold">SEC 2a-7 Bound</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ================= MAIN VIEWPORT ================= -->
+    <main class="flex-1 p-5 md:p-8 overflow-y-auto max-w-[1440px] mx-auto w-full">
+
+      <!-- ================= VIEW 1: OVERVIEW ================= -->
+      <section id="view-overview" class="view-section active space-y-6">
+
+        <!-- HERO COMMAND BANNER -->
+        <div class="curved-card p-6 md:p-8 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+          <div class="space-y-3 max-w-2xl">
+            <div class="text-xs font-mono flex items-center gap-2 secondary-text">
+              <span class="pill-badge pill-badge-cyan font-bold">Live Telemetry</span>
+              <span>Treasury Command &amp; Liquidity Choreography</span>
+            </div>
+
+            <div class="flex flex-wrap items-baseline gap-3 pt-1">
+              <h1 class="text-3xl md:text-4xl font-extrabold tracking-tight heading-text">
+                Autonomous Reserve Intelligence
+              </h1>
+
+              <!-- CIPHER CAPSULE (3D Flip Animation on Click) -->
+              <div class="font-mono text-base px-3 py-1 border select-none cursor-pointer flex items-center gap-1.5 rounded-xl transition-colors" style="border-color: var(--border-cyan); background-color: var(--bg-secondary);" onclick="triggerStatusCycle()" title="Click to cycle status telemetry">
+                <span class="muted-text">(</span>
+                <span id="fhenixCipherWord" class="font-bold" style="color: var(--cyan-primary);">yield:4.89%</span>
+                <span class="muted-text">*</span>
+                <span id="fhenixCipherTail" class="font-bold heading-text">OK</span>
+                <span class="muted-text">)</span>
+              </div>
+            </div>
+
+            <p class="text-sm secondary-text leading-relaxed font-normal">
+              Continuous two-sided cash flow forecasting, 15-hour overnight repo protection, and penalty arbitrage across <strong class="font-mono font-bold primary-text">$160.01M</strong> in multi-tier vault reserves.
+            </p>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-3">
+            <button onclick="openSimulationModal('night_sweep')" class="curved-btn-primary">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+              <span>Launch Sim Theatre</span>
+            </button>
+
+            <button onclick="advanceSimulationStep(1)" class="curved-btn font-bold" style="border-color: var(--cyan-primary); color: var(--cyan-primary);">
+              <span>Step +1h &rarr;</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 6 FINANCIAL METRIC CARDS (HIGH CONTRAST + SUBTLE HOVER FLOAT UP-AND-DOWN) -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5" id="kpiTileGrid">
+
+          <!-- KPI 1: AVAILABLE CASH -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Tier 0 Cash ($24.81M): immediate liquid checking reserve.')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">01 // Available Cash</div>
+                <div id="kpiAvailableCash" class="text-2xl md:text-3xl font-extrabold font-mono mt-1 heading-text">$24,810,500</div>
+              </div>
+              <span class="pill-badge font-bold">Tier 0</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">Checking Balance</span>
+              <span class="font-mono text-emerald-500 font-bold" id="kpiCashDelta">+$1.42M (+6.1%)</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span>Floor Coverage: 136.3%</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Inspect &rsaquo;</span>
+            </div>
+          </div>
+
+          <!-- KPI 2: PROTECTED RESERVE -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Protected Reserve ($18.20M): 15-hour overnight VaR 99.5% cushion.')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">02 // Protected Reserve</div>
+                <div id="kpiProtectedReserve" class="text-2xl md:text-3xl font-extrabold font-mono mt-1 heading-text">$18,200,000</div>
+              </div>
+              <span class="pill-badge pill-badge-cyan font-bold">VaR 99.5%</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">Night-Vision Cushion</span>
+              <span class="font-mono primary-text font-bold">17:00–08:00 UTC</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span class="text-emerald-500 font-bold">Deficit: $0</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Audit &rsaquo;</span>
+            </div>
+          </div>
+
+          <!-- KPI 3: INVESTABLE SURPLUS -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Investable Surplus ($6.61M): ready for 17:00 UTC repo sweep.')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">03 // Investable Surplus</div>
+                <div id="kpiSurplus" class="text-2xl md:text-3xl font-extrabold font-mono mt-1" style="color: var(--cyan-primary);">$6,610,500</div>
+              </div>
+              <span class="pill-badge pill-badge-cyan font-bold">Sweep Ready</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">Overnight Sweep Yield</span>
+              <span class="font-mono text-emerald-500 font-bold">5.30% APY</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span>Cutoff in: 58 mins</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Auto-Sweep &rsaquo;</span>
+            </div>
+          </div>
+
+          <!-- KPI 4: SAFETY SCORE -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Treasury Safety Score: 94/100 (Optimal).')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">04 // Safety Score (TSS)</div>
+                <div class="text-2xl md:text-3xl font-extrabold font-mono mt-1 text-emerald-500">
+                  94 <span class="text-sm secondary-text font-normal">/ 100</span>
+                </div>
+              </div>
+              <span class="pill-badge pill-badge-emerald font-bold">Optimal</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">24h Velocity</span>
+              <span class="font-mono text-emerald-500 font-bold">+2.1 pts</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span>SLA: 100% On-Time</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Factors &rsaquo;</span>
+            </div>
+          </div>
+
+          <!-- KPI 5: ANNUAL NET RETURN -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Annual Net Return ($6.84M): blended 4.89% APY across $160M portfolio.')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">05 // Annual Net Return</div>
+                <div class="text-2xl md:text-3xl font-extrabold font-mono mt-1 heading-text">$6,842,190</div>
+              </div>
+              <span class="pill-badge font-bold">Blended</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">Net Portfolio Yield</span>
+              <span class="font-mono text-emerald-500 font-bold">4.89% APY</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span>vs. All-Cash: +$6.84M</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Tiers &rsaquo;</span>
+            </div>
+          </div>
+
+          <!-- KPI 6: STRESS SURVIVAL -->
+          <div class="curved-card p-5 flex flex-col justify-between cursor-pointer" onclick="selectCurvedCard(this, 'Stress Survival Horizon: 72h+ sustained under 3.0x payday withdrawal run.')">
+            <div class="flex items-start justify-between">
+              <div>
+                <div class="text-xs font-mono secondary-text uppercase tracking-wide font-medium">06 // Stress Survival</div>
+                <div class="text-2xl md:text-3xl font-extrabold font-mono mt-1 text-emerald-500">72h+ Horizon</div>
+              </div>
+              <span class="pill-badge pill-badge-emerald font-bold">Passed</span>
+            </div>
+            <div class="mt-3 flex items-center justify-between text-xs">
+              <span class="secondary-text">SVB Run Tolerance</span>
+              <span class="font-mono primary-text font-bold">3.0x Payday Shock</span>
+            </div>
+            <div class="mt-4 pt-3 border-t flex items-center justify-between text-[11px] font-mono muted-text" style="border-color: var(--border-color);">
+              <span>Uncovered Gap: $0</span>
+              <span class="font-bold" style="color: var(--cyan-primary);">Stress Lab &rsaquo;</span>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- MAIN QUANTILE GRAPH SECTION -->
+        <div class="curved-card p-6 space-y-4">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b pb-4" style="border-color: var(--border-color);">
+            <div>
+              <div class="text-xs font-mono secondary-text flex items-center gap-2">
+                <span class="pill-badge pill-badge-cyan font-bold">Conformal VaR 99.5%</span>
+                <span>Two-Sided Liquidity Trajectory</span>
+              </div>
+              <h2 class="text-xl font-bold heading-text mt-1">
+                Cash Flow Forecasting &amp; 15-Hour Overnight Sweep Window
+              </h2>
+            </div>
+
+            <!-- Horizon Toggles -->
+            <div class="flex items-center gap-2 font-mono text-xs">
+              <span class="muted-text mr-1">Horizon:</span>
+              <button onclick="setChartHorizon(24)" data-horizon="24" class="horizon-btn curved-btn py-1 px-3 active">24h</button>
+              <button onclick="setChartHorizon(48)" data-horizon="48" class="horizon-btn curved-btn py-1 px-3">48h</button>
+              <button onclick="setChartHorizon(72)" data-horizon="72" class="horizon-btn curved-btn py-1 px-3">72h</button>
+            </div>
+          </div>
+
+          <!-- Dynamic Graph Spline Canvas -->
+          <div class="chart-container">
+            <canvas id="liquidityCanvas" class="w-full h-full block"></canvas>
+          </div>
+
+          <div class="flex flex-wrap items-center justify-between text-xs font-mono secondary-text pt-2 border-t" style="border-color: var(--border-color);">
+            <div class="flex items-center gap-4">
+              <span class="flex items-center gap-1.5">
+                <span class="w-2.5 h-2.5 rounded-full" style="background-color: var(--cyan-primary);"></span>
+                Expected Cash Spline
+              </span>
+              <span class="flex items-center gap-1.5">
+                <span class="w-2.5 h-2.5 rounded-sm" style="background-color: var(--cyan-glow);"></span>
+                VaR 99.5% Confidence Ribbon
+              </span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="muted-text">Model:</span>
+              <span class="primary-text font-bold">Bayesian Quantile Regressor</span>
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ================= VIEW 2: FORECASTS ================= -->
+      <section id="view-forecasts" class="view-section space-y-6">
+        <div class="curved-card p-6 space-y-4">
+          <h2 class="text-xl font-bold heading-text">Two-Sided Conformal Quantile Forecasts</h2>
+          <p class="text-xs secondary-text">
+            Forecasts client incoming wires and accounts payable disbursements independently to isolate asymmetric liquidity squeezes.
+          </p>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+            <div class="curved-card p-4">
+              <div class="text-xs font-mono muted-text">Expected Inflows (24h)</div>
+              <div class="text-2xl font-bold font-mono mt-1 text-emerald-500">+$21,400,000</div>
+              <div class="text-[11px] secondary-text mt-1">Confidence: 99.5% Conformal</div>
+            </div>
+            <div class="curved-card p-4">
+              <div class="text-xs font-mono muted-text">Expected Outflows (24h)</div>
+              <div class="text-2xl font-bold font-mono mt-1 text-rose-500">-$19,560,000</div>
+              <div class="text-[11px] secondary-text mt-1">Peak: 12:00 UTC Payroll Run</div>
+            </div>
+            <div class="curved-card p-4">
+              <div class="text-xs font-mono muted-text">Projected Net Delta</div>
+              <div class="text-2xl font-bold font-mono mt-1" style="color: var(--cyan-primary);">+$1,840,000</div>
+              <div class="text-[11px] secondary-text mt-1">Autonomous Surplus Sweep Ready</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 3: 4-TIER PORTFOLIO ================= -->
+      <section id="view-portfolio" class="view-section space-y-6">
+        <div class="curved-card p-6 space-y-4">
+          <div class="flex items-center justify-between border-b pb-4" style="border-color: var(--border-color);">
+            <div>
+              <h2 class="text-xl font-bold heading-text">4-Tier Capital Reserve Allocation</h2>
+              <p class="text-xs secondary-text mt-1">Total Vault Reserves: $160,010,000 across 4 choreographed liquidity tiers.</p>
+            </div>
+            <span class="pill-badge pill-badge-cyan font-bold">Blended 4.89% APY</span>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="curved-card p-4">
+              <span class="pill-badge font-bold">Tier 0</span>
+              <div class="text-xs font-mono secondary-text mt-2">Checking Cash</div>
+              <div class="text-xl font-bold font-mono heading-text mt-1">$24,810,500</div>
+              <div class="text-[11px] text-emerald-500 mt-2 font-bold">0.00% APY (Immediate)</div>
+            </div>
+            <div class="curved-card p-4">
+              <span class="pill-badge pill-badge-cyan font-bold">Tier 1</span>
+              <div class="text-xs font-mono secondary-text mt-2">Overnight Repo</div>
+              <div class="text-xl font-bold font-mono mt-1" style="color: var(--cyan-primary);">$6,610,500</div>
+              <div class="text-[11px] font-bold mt-2" style="color: var(--cyan-primary);">5.30% APY (15h Lock)</div>
+            </div>
+            <div class="curved-card p-4">
+              <span class="pill-badge pill-badge-gold font-bold">Tier 2</span>
+              <div class="text-xs font-mono secondary-text mt-2">30-Day T-Bills</div>
+              <div class="text-xl font-bold font-mono heading-text mt-1" style="color: var(--gold-accent);">$48,589,000</div>
+              <div class="text-[11px] text-amber-500 mt-2 font-bold">4.95% APY (Weekly Roll)</div>
+            </div>
+            <div class="curved-card p-4">
+              <span class="pill-badge font-bold">Tier 3</span>
+              <div class="text-xs font-mono secondary-text mt-2">Strategic Treasury</div>
+              <div class="text-xl font-bold font-mono heading-text mt-1">$80,000,000</div>
+              <div class="text-[11px] text-blue-400 mt-2 font-bold">4.80% APY (Core Prime)</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 4: NEXT BEST ACTION ================= -->
+      <section id="view-nba" class="view-section space-y-6">
+        <div class="curved-card p-6 md:p-8 space-y-6">
+          <div class="flex items-center justify-between border-b pb-4" style="border-color: var(--border-color);">
+            <div>
+              <div class="text-xs font-mono pill-badge pill-badge-gold font-bold mb-2">Arbitrage Opportunity</div>
+              <h2 class="text-2xl font-bold heading-text">Intraday Overdraft Bridge Facility</h2>
+              <p class="text-xs secondary-text mt-1">Autonomous penalty avoidance recommendation for 06:00 UTC liquidity crunch.</p>
+            </div>
+            <span id="nbaStatusBadge" class="pill-badge pill-badge-cyan font-bold">Pending Review</span>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="curved-card p-5 space-y-2">
+              <div class="text-xs font-mono muted-text">Alternative A: Liquidate Term Paper</div>
+              <div class="text-xl font-bold font-mono text-rose-500">-$50,000.00 Penalty</div>
+              <p class="text-[11px] secondary-text">Early break penalty on Tier 2 30-Day Sovereign Note.</p>
+            </div>
+            <div class="curved-card p-5 space-y-2">
+              <div class="text-xs font-mono muted-text">Alternative B: 2h Intraday Overdraft</div>
+              <div class="text-xl font-bold font-mono text-emerald-500">-$273.97 Interest</div>
+              <p class="text-[11px] secondary-text">2-hour bridge facility repaid upon 08:00 UTC repo maturity.</p>
+            </div>
+            <div class="curved-card p-5 space-y-2 border-2" style="border-color: var(--cyan-primary);">
+              <div class="text-xs font-mono font-bold" style="color: var(--cyan-primary);">Net Arbitrage Alpha</div>
+              <div class="text-xl font-bold font-mono" style="color: var(--cyan-primary);">+$49,726.03 Saved</div>
+              <p class="text-[11px] secondary-text">Net capital preserved by algorithmic bridge staging.</p>
+            </div>
+          </div>
+
+          <div class="pt-4 flex items-center gap-4">
+            <button id="approveNbaBtn" onclick="approveNBA()" class="curved-btn-primary py-3 px-6 text-xs font-bold uppercase font-mono">
+              Approve 2-Hour Bridge Facility ($273.97)
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 5: SVB STRESS LAB ================= -->
+      <section id="view-stress" class="view-section space-y-6">
+        <div class="curved-card p-6 md:p-8 space-y-6">
+          <div class="flex items-center justify-between border-b pb-4" style="border-color: var(--border-color);">
+            <div>
+              <div class="text-xs font-mono pill-badge pill-badge-emerald font-bold mb-1">Contagion Lab</div>
+              <h2 class="text-2xl font-bold heading-text">SVB 72-Hour Bank Run Stress Testing</h2>
+            </div>
+            <div class="text-right">
+              <span class="text-xs font-mono muted-text">Survival Horizon:</span>
+              <div class="text-xl font-bold font-mono text-emerald-500">72h+ Horizon</div>
+            </div>
+          </div>
+
+          <!-- Controls -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="space-y-2">
+              <div class="flex justify-between text-xs font-mono">
+                <span class="secondary-text">Withdrawal Surge Multiplier:</span>
+                <span id="stressSurgeVal" class="font-bold heading-text">1.0x</span>
+              </div>
+              <input type="range" id="stressSurgeSlider" min="1.0" max="4.0" step="0.1" value="1.0" oninput="updateStressLab()" />
+            </div>
+            <div class="space-y-2">
+              <div class="flex justify-between text-xs font-mono">
+                <span class="secondary-text">Fed Rate Shock:</span>
+                <span id="stressYieldVal" class="font-bold heading-text">+0 bps</span>
+              </div>
+              <input type="range" id="stressYieldSlider" min="0" max="500" step="25" value="0" oninput="updateStressLab()" />
+            </div>
+          </div>
+
+          <!-- Presets -->
+          <div class="flex flex-wrap gap-2 text-xs font-mono">
+            <span class="muted-text py-1.5 mr-2">Presets:</span>
+            <button onclick="applyStressPreset(3.2, 250)" class="curved-btn py-1 px-3">SVB 2023 Contagion (3.2x, +250bps)</button>
+            <button onclick="applyStressPreset(2.4, 75)" class="curved-btn py-1 px-3">Payday Crunch (2.4x, +75bps)</button>
+            <button onclick="applyStressPreset(1.0, 0)" class="curved-btn py-1 px-3">Baseline (1.0x, 0bps)</button>
+          </div>
+
+          <!-- Canvas -->
+          <div class="w-full h-56 rounded-xl border relative" style="border-color: var(--border-color); background-color: var(--bg-card);">
+            <canvas id="stressCanvas" class="w-full h-full block"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 6: AUDITABLE LEDGER ================= -->
+      <section id="view-audit" class="view-section space-y-6">
+        <div class="curved-card p-6 space-y-4">
+          <div class="flex items-center justify-between border-b pb-4" style="border-color: var(--border-color);">
+            <div>
+              <h2 class="text-xl font-bold heading-text">Deterministic Decision Audit Ledger</h2>
+              <p class="text-xs secondary-text mt-1">SEC 2a-7 compliant cryptographic state logs.</p>
+            </div>
+            <button onclick="exportAuditCSV()" class="curved-btn py-1.5 px-3">Export CSV</button>
+          </div>
+
+          <div class="overflow-x-auto text-xs font-mono">
+            <table class="w-full text-left">
+              <thead>
+                <tr class="border-b secondary-text" style="border-color: var(--border-color);">
+                  <th class="py-2">Decision ID</th>
+                  <th class="py-2">Timestamp (UTC)</th>
+                  <th class="py-2">Action Type</th>
+                  <th class="py-2">Amount</th>
+                  <th class="py-2">Cost</th>
+                  <th class="py-2 text-right">Net Value</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-white/5">
+                <tr>
+                  <td class="py-3 font-bold" style="color: var(--cyan-primary);">DEC-8904</td>
+                  <td class="py-3 muted-text">2026-06-15 06:00</td>
+                  <td class="py-3">BRIDGE_ARBITRAGE</td>
+                  <td class="py-3">$10,000,000</td>
+                  <td class="py-3 text-emerald-500">$273.97</td>
+                  <td class="py-3 text-right font-bold text-emerald-500">+$49,726.03</td>
+                </tr>
+                <tr>
+                  <td class="py-3 font-bold" style="color: var(--cyan-primary);">DEC-8903</td>
+                  <td class="py-3 muted-text">2026-06-14 17:00</td>
+                  <td class="py-3">NIGHT_VISION_SWEEP</td>
+                  <td class="py-3">$6,610,500</td>
+                  <td class="py-3">$0.00</td>
+                  <td class="py-3 text-right font-bold text-emerald-500">+$599.12 / night</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VIEW 7: GOVERNANCE ================= -->
+      <section id="view-settings" class="view-section space-y-6">
+        <div class="curved-card p-6 space-y-4">
+          <h2 class="text-xl font-bold heading-text">Governance, Policy &amp; Security Thresholds</h2>
+          <p class="text-xs secondary-text">Configure algorithmic bounds, human-in-the-loop triggers, and custodian connectivity.</p>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 text-xs font-mono">
+            <div class="curved-card p-4 space-y-2">
+              <div class="font-bold heading-text">Auto-Sweep Threshold</div>
+              <div class="secondary-text">Sweep cash when checking surplus exceeds $5,000,000.</div>
+              <span class="pill-badge pill-badge-cyan font-bold">Enabled</span>
+            </div>
+            <div class="curved-card p-4 space-y-2">
+              <div class="font-bold heading-text">Emergency Contagion Circuit Breaker</div>
+              <div class="secondary-text">Halt automated sweeps if bank CDS widens by >50 bps.</div>
+              <span class="pill-badge pill-badge-emerald font-bold">Active Shield</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ================= HIGH-FIDELITY SIMULATION THEATRE COCKPIT ================= -->
+  <div id="simTheatreOverlay" class="fixed inset-0 z-50 hidden items-center justify-center p-3 sm:p-6 modal-overlay">
+    <div class="curved-card p-5 sm:p-7 max-w-5xl w-full max-h-[94vh] flex flex-col space-y-4 overflow-y-auto">
+      
+      <!-- Top Bar -->
+      <div class="flex items-start justify-between border-b pb-3" style="border-color: var(--border-color);">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="pill-badge pill-badge-cyan font-bold text-[10px]">Real-Time Sim Theatre</span>
+            <span class="text-xs font-mono text-emerald-500 font-bold flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+              60 FPS Physics Active
+            </span>
+          </div>
+          <h3 class="text-lg sm:text-xl font-bold heading-text mt-0.5">Multi-Tier Autonomous Liquidity Simulation Cockpit</h3>
+          <p class="text-xs secondary-text">Conformal VaR 99.5% &bull; Dynamic Particle Flow &bull; Real-time Fluid Dynamics</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="closeSimulationModal()" class="curved-btn py-1 px-3 text-xs font-bold" title="Exit [ESC]">&times; Exit [ESC]</button>
+        </div>
+      </div>
+
+      <!-- Top Telemetry Strip -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 p-3 rounded-xl border text-xs font-mono" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Simulated Time</span>
+          <span id="simClockHud" class="font-bold text-sm heading-text">17:00 UTC</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Active Scenario</span>
+          <span id="simScenarioName" class="font-bold text-xs" style="color: var(--cyan-primary);">17:00 Repo Sweep</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Overnight Yield Captured</span>
+          <span id="simHudYield" class="font-bold text-sm text-emerald-500">+$0</span>
+        </div>
+        <div>
+          <span class="text-[10px] muted-text uppercase tracking-wider block">Penalties Dodged</span>
+          <span id="simHudPenalties" class="font-bold text-sm text-amber-500">+$0</span>
+        </div>
+      </div>
+
+      <!-- Interactive Multi-Tier Canvas Fluid Simulation -->
+      <div class="w-full h-72 rounded-xl border relative overflow-hidden" style="border-color: var(--border-color); background-color: var(--bg-card);">
+        <canvas id="simTheatreCanvas" class="w-full h-full block"></canvas>
+      </div>
+
+      <!-- Scenario Injector & Simulation Controls Bar -->
+      <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-3 rounded-xl border" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div class="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+          <span class="text-[10px] uppercase font-bold muted-text mr-1">Inject Scenario:</span>
+          <button onclick="window.simTheatreInstance.triggerScenario('repo_sweep')" class="curved-btn py-1 px-2.5 text-[11px] font-bold hover:border-cyan-500" title="17:00 UTC Central Bank Sweep">
+            17:00 Sweep
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('midnight_shock')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-rose-500 border-rose-500/40 hover:border-rose-500" title="02:00 UTC Midnight Withdrawal Spike">
+            Midnight Shock
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('repo_settle')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-emerald-500 border-emerald-500/40 hover:border-emerald-500" title="08:00 UTC Repo Release">
+            08:00 Settle
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('rate_shock')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-amber-500 border-amber-500/40 hover:border-amber-500" title="Sovereign Bond Yield Shock (+45 bps)">
+            Rate Shock
+          </button>
+          <button onclick="window.simTheatreInstance.triggerScenario('svb_run')" class="curved-btn py-1 px-2.5 text-[11px] font-bold text-rose-600 border-rose-600/40 hover:border-rose-600" title="3.2x SVB Run & Waterfall Liquidation">
+            SVB Run 3.2x
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2 self-end sm:self-auto text-xs font-mono">
+          <span class="text-[10px] uppercase font-bold muted-text">Speed:</span>
+          <button onclick="window.simTheatreInstance.setSpeed(1)" id="simSpeed1" class="curved-btn py-0.5 px-2 text-[11px] font-bold bg-cyan-500/20 text-cyan-400">1x</button>
+          <button onclick="window.simTheatreInstance.setSpeed(5)" id="simSpeed5" class="curved-btn py-0.5 px-2 text-[11px]">5x</button>
+          <button onclick="window.simTheatreInstance.setSpeed(20)" id="simSpeed20" class="curved-btn py-0.5 px-2 text-[11px]">20x</button>
+        </div>
+      </div>
+
+      <!-- Real-Time Decision Execution Stream -->
+      <div class="space-y-1.5 p-3 rounded-xl border" style="border-color: var(--border-color); background: var(--bg-card);">
+        <div class="flex items-center justify-between text-[10px] font-mono uppercase tracking-wider muted-text">
+          <span>Autonomous Engine Decision Stream &bull; Live Telemetry Feed:</span>
+          <span class="text-emerald-500 font-bold">14ms Execution SLA Active</span>
+        </div>
+        <div id="simDecisionList" class="space-y-1 max-h-24 overflow-y-auto pr-1">
+          <div class="flex items-start gap-2 py-1 text-[11px] font-mono">
+            <span class="font-bold text-cyan-500">[17:00:00]</span>
+            <span class="secondary-text">Ready for simulation. Select a scenario above to test autonomous decisions.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer Action Links -->
+      <div class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2 border-t" style="border-color: var(--border-color);">
+        <button onclick="closeSimulationModal(); openPsWalkthroughModal();" class="curved-btn py-2 px-3 text-xs font-mono font-bold flex items-center gap-1.5" style="color: var(--cyan-primary);">
+          <span>&larr; Open Problem Statement Treasury Walkthrough</span>
+        </button>
+        <button onclick="closeSimulationModal(); if(window.showToast) showToast('Simulation state synchronized with live dashboard.');" class="curved-btn-primary py-2 px-5 text-xs font-mono font-bold uppercase">
+          Commit &amp; Sync Dashboard &rarr;
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ================= SHORTCUTS MODAL ================= -->
+  <div id="shortcutsModal" class="fixed inset-0 z-50 hidden items-center justify-center p-4 modal-overlay">
+    <div class="curved-card p-6 max-w-md w-full space-y-4">
+      <div class="flex items-center justify-between border-b pb-3" style="border-color: var(--border-color);">
+        <h3 class="text-sm font-bold heading-text uppercase">Institutional Shortcuts</h3>
+        <button onclick="closeShortcutsModal()" class="curved-btn py-0.5 px-2 font-bold">&times;</button>
+      </div>
+      <div class="space-y-2 text-xs font-mono secondary-text">
+        <div class="flex justify-between py-1.5 border-b" style="border-color: var(--border-color);">
+          <span>Switch Views:</span>
+          <span class="primary-text font-bold">[1] to [7]</span>
+        </div>
+        <div class="flex justify-between py-1.5 border-b" style="border-color: var(--border-color);">
+          <span>Step Simulation (+1h):</span>
+          <span class="primary-text font-bold">[Space]</span>
+        </div>
+        <div class="flex justify-between py-1.5 border-b" style="border-color: var(--border-color);">
+          <span>Toggle Theme:</span>
+          <span class="primary-text font-bold">[T]</span>
+        </div>
+        <div class="flex justify-between py-1.5 border-b" style="border-color: var(--border-color);">
+          <span>Launch Sim Theatre:</span>
+          <span class="primary-text font-bold">[S]</span>
+        </div>
+      </div>
+      <button onclick="closeShortcutsModal()" class="curved-btn-primary w-full justify-center py-2.5 text-xs uppercase font-bold">
+        Dismiss
+      </button>
+    </div>
+  </div>
+
+  <!-- ================= TOAST NOTIFICATION ================= -->
+  <div id="toastBox" class="fixed bottom-6 right-6 z-50 hidden px-4 py-3 border text-xs font-mono glass-header shadow-2xl flex items-center gap-3 rounded-xl" style="border-color: var(--cyan-primary); color: var(--text-primary); max-width: 360px;">
+    <span class="w-2 h-2 rounded-full pulse-dot" style="background-color: var(--cyan-primary);"></span>
+    <span id="toastMsg" class="flex-1 font-bold"></span>
+  </div>
+
+  <!-- Modular Scripts -->
+  <script src="js/simulations.js"></script>
+  <script src="js/sim-theatre.js"></script>
+  <script src="js/ps-walkthrough.js?v=4"></script>
+  <script src="js/platform.js"></script>
+</body>
+</html>

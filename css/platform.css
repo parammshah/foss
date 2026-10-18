@@ -1,0 +1,85 @@
+/* =========================================================
+   RESERVE*JUGGLER PLATFORM STYLES — PLATFORM.CSS
+   Dashboard Grid, Canvas Charts, Hotkey Bar & Modals
+   ========================================================= */
+
+/* Ambient subtle background gradient */
+.ambient-bg {
+  background-image: 
+    radial-gradient(circle at 12% 10%, rgba(0, 229, 255, 0.05) 0%, transparent 45%),
+    radial-gradient(circle at 88% 90%, rgba(56, 189, 248, 0.04) 0%, transparent 50%);
+}
+
+:root[data-theme="light"] .ambient-bg {
+  background-image: 
+    radial-gradient(circle at 12% 10%, rgba(0, 136, 163, 0.05) 0%, transparent 45%),
+    radial-gradient(circle at 88% 90%, rgba(2, 132, 199, 0.04) 0%, transparent 50%);
+}
+
+/* Sidebar Canvas Mini-Wave */
+#sidebarWaveCanvas {
+  filter: drop-shadow(0 2px 6px var(--cyan-glow));
+}
+
+/* Platform View Transition */
+.view-section {
+  display: none;
+  animation: viewFadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.view-section.active {
+  display: block;
+}
+
+@keyframes viewFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Chart Canvas Container */
+.chart-container {
+  position: relative;
+  width: 100%;
+  height: 380px;
+}
+
+/* Active Horizon Button */
+.horizon-btn.active {
+  background-color: var(--cyan-primary) !important;
+  color: #05070B !important;
+  font-weight: 700;
+  box-shadow: 0 2px 10px var(--cyan-glow);
+}
+
+/* Stress Lab Preset Buttons */
+.preset-btn.active {
+  border-color: var(--cyan-primary) !important;
+  color: var(--cyan-primary) !important;
+  background-color: var(--cyan-subtle) !important;
+}
+
+/* Pulse Node on Charts */
+.chart-pulse-ring {
+  animation: chartPulse 1.8s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+@keyframes chartPulse {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.8;
+  }
+  50% {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+}
