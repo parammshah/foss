@@ -230,11 +230,119 @@ def test_target_specific_reliability_classification_separation():
     assert pt_6h.point_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
     assert pt_6h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
 
-    # 24h: Point is validated (>95% single-hour coverage), BUT cumulative is conditionally calibrated fallback!
+    # 24h: Both point and cumulative are conditionally calibrated fallback
     pt_24h = bundle.get_point(24)
-    assert pt_24h.point_reliability_status == "EMPIRICALLY_VALIDATED"
+    assert pt_24h.point_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
     assert pt_24h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
-    assert pt_24h.cumulative_reliability_status != pt_24h.point_reliability_status
+
+    # 72h: Both point and cumulative are conditionally calibrated fallback
+    pt_72h = bundle.get_point(72)
+    assert pt_72h.point_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert pt_72h.cumulative_reliability_status == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+
+def test_identical_evidence_status_consistency():
+    """Verify that targets with identical empirical evidence receive consistent reliability status,
+    and any divergence between 1h and 6h/24h is strictly governed by documented target-specific rules:
+    - 1h achieves >= 95% population coverage under direct unbuffered conformal calibration.
+    - 6h requires a 1.55x heuristic buffer because raw conformal quantiles underperform due to diurnal clustering.
+    - Multi-hour cumulative targets are analytical proxy heuristics (sqrt(h) scaling) subject to serial drift.
+    """
+    reconciler = ORScenarioReconciler()
+    for q in [2.5, 10.0, 25.0, 50.0, 75.0, 90.0, 97.5]:
+        reconciler.deposit_residual_quantiles[q] = 0.0
+        reconciler.withdrawal_residual_quantiles[q] = 0.0
+    reconciler.raw_net_outflow_conformal_quantiles = {50.0: 0.0, 95.0: 0.0, 99.0: 0.0}
+    reconciler.net_outflow_residual_quantiles = {50.0: 0.0, 95.0: 0.0, 99.0: 0.0}
+
+    # Rule 1: Degraded calibration sample size (< 150) forces DEGRADED for all targets
+    reconciler.calibration_sample_size = 100
+    reconciler.calibration_is_reliable = False
+    res_degraded_1h = reconciler.reconcile_point(
+        pred_deposit=100.0,
+        pred_withdrawal=100.0,
+        horizon_hours=1,
+    )
+    res_degraded_6h = reconciler.reconcile_point(
+        pred_deposit=100.0,
+        pred_withdrawal=100.0,
+        horizon_hours=6,
+    )
+    assert res_degraded_1h["point_reliability_status"] == "DEGRADED"
+    assert res_degraded_1h["cumulative_reliability_status"] == "DEGRADED"
+    assert res_degraded_6h["point_reliability_status"] == "DEGRADED"
+    assert res_degraded_6h["cumulative_reliability_status"] == "DEGRADED"
+
+    # Rule 2: Sufficient calibration (>=150) distinguishes 1h direct calibration from multi-hour fallbacks
+    reconciler.calibration_sample_size = 250
+    reconciler.calibration_is_reliable = True
+    res_1h = reconciler.reconcile_point(
+        pred_deposit=100.0,
+        pred_withdrawal=100.0,
+        horizon_hours=1,
+    )
+    res_6h = reconciler.reconcile_point(
+        pred_deposit=100.0,
+        pred_withdrawal=100.0,
+        horizon_hours=6,
+    )
+    # 1h is EMPIRICALLY_VALIDATED because raw conformal quantiles cover >=95% without heuristic multipliers
+    assert res_1h["point_reliability_status"] == "EMPIRICALLY_VALIDATED"
+    assert res_1h["cumulative_reliability_status"] == "EMPIRICALLY_VALIDATED"
+
+    # 6h receives CONDITIONALLY_CALIBRATED_FALLBACK because it relies on a 1.55x heuristic buffer
+    assert res_6h["point_reliability_status"] == "CONDITIONALLY_CALIBRATED_FALLBACK"
+    assert res_6h["cumulative_reliability_status"] == "CONDITIONALLY_CALIBRATED_FALLBACK"
+
+
+def test_sustained_72h_multi_day_outflow_protection():
+    """Verify that sustained 72-hour customer net deficit locks investable surplus to $0.00
+    and enforces conservative reserve safeguards even when 72h forecasts are in fallback status.
+    """
+    as_of = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
+    opening_cash = 60_000_000.0
+
+    # 72 hours of persistent customer outflows ($1M/hr net deficit = $72M total demand)
+    points_72h = []
+    for h in [1, 6, 24, 48, 72]:
+        points_72h.append(
+            ForecastPoint(
+                timestamp=(as_of + timedelta(hours=h)).isoformat(),
+                forecast_horizon=float(h),
+                deposit_point_forecast=500_000.0,
+                withdrawal_point_forecast=1_500_000.0,
+                deposit_p10=300_000.0,
+                deposit_p90=700_000.0,
+                withdrawal_p10=1_200_000.0,
+                withdrawal_p90=2_000_000.0,
+                net_outflow_p95=2_000_000.0,
+                cumulative_net_outflow_p95=float(h) * 1_200_000.0,
+                is_cumulative=False,
+                point_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+                cumulative_reliability_status="CONDITIONALLY_CALIBRATED_FALLBACK",
+            )
+        )
+
+    bundle = ForecastBundle(
+        forecast_id="BUN-72H-SUSTAINED",
+        generated_at=as_of.isoformat(),
+        point_forecasts=points_72h,
+        is_cumulative=False,
+    )
+
+    state = TreasuryState(
+        timestamp=as_of,
+        operational_cash_usd=opening_cash,
+        obligations=[],
+    )
+
+    assessment = assess_liquidity_reserve(state, bundle, use_calibrated_net_quantile=True)
+
+    # 72h cumulative deficit demand is $72 * 1.2M = $86.4M, far exceeding $60M cash
+    assert assessment.conservative_net_deficit >= 70_000_000.0
+    assert assessment.total_required_reserve >= opening_cash
+    assert assessment.eligible_investable_surplus == 0.0
+
 
 
 def test_adversarial_clustered_large_outflows_reserve_protection():

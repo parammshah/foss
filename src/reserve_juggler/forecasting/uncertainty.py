@@ -190,11 +190,9 @@ class ORScenarioReconciler:
         elif horizon_hours == 1:
             point_rel_status = "EMPIRICALLY_VALIDATED"
             cum_rel_status = "EMPIRICALLY_VALIDATED"
-        elif horizon_hours == 6:
-            point_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
-            cum_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
         else:
-            point_rel_status = "EMPIRICALLY_VALIDATED"
+            # Multi-hour point flows exhibit diurnal undercoverage (h=6) or regime variance (h>=24)
+            point_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
             # Cumulative horizons > 1h are analytical proxy heuristics subject to multi-hour serial drift
             cum_rel_status = "CONDITIONALLY_CALIBRATED_FALLBACK"
 
